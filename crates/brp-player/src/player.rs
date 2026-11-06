@@ -49,6 +49,9 @@ pub struct Player {
     pub field_rate: bool,
     /// Field of `current` on screen (0 = first in time).
     pub field: u8,
+    pub fx: crate::effects::Effects,
+    /// History pictures the active effects need (set by the window each frame).
+    pub fx_warmup: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +99,8 @@ impl Player {
             deint_mode: DeintMode::Auto,
             field_rate: true,
             field: 0,
+            fx: Default::default(),
+            fx_warmup: 0,
         }
     }
 
@@ -128,6 +133,8 @@ impl Player {
                 self.opened_at = Some(t);
                 self.first_frame_logged = false;
                 self.load_audio(path);
+                // Effects depend on the source (transfer, size): re-send the chain.
+                self.fx.dirty = true;
                 self.play();
             }
             Err(e) => {
@@ -352,6 +359,40 @@ impl Player {
         self.field_rate && self.deint_method().is_some()
     }
 
+    /// Deterministic position of the picture on screen: frame, or 2*frame+field when
+    /// showing fields. Consecutive values = consecutive pictures.
+    pub fn seq(&self) -> i64 {
+        let f = self.shown.as_ref().map_or(self.current, |f| f.index());
+        if self.field_rate_active() { f * 2 + self.field as i64 } else { f }
+    }
+
+    /// The `n` pictures before the one on screen (oldest first) that are decoded:
+    /// (frame, prev, next, seq, second field). Used to rebuild effect history.
+    #[allow(clippy::type_complexity)]
+    pub fn history(&self, n: u32) -> Vec<(Arc<VideoFrame>, Option<Arc<VideoFrame>>, Option<Arc<VideoFrame>>, i64, bool)> {
+        let Some(src) = &self.source else { return Vec::new() };
+        let fields = self.field_rate_active();
+        let seq = self.seq();
+        let mut out = Vec::new();
+        for s in (seq - n as i64..seq).filter(|&s| s >= 0) {
+            let (frame, second) = if fields { (s.div_euclid(2), s.rem_euclid(2) == 1) } else { (s, false) };
+            if let Some(f) = src.get(frame) {
+                out.push((f, src.get(frame - 1), src.get(frame + 1), s, second));
+            }
+        }
+        out
+    }
+
+    /// Transfer of the source, for shaders' linearize().
+    pub fn transfer(&self) -> brp_render::Transfer {
+        match self.source.as_ref().map(|s| s.info.color.transfer) {
+            Some(brp_media::Transfer::Pq) => brp_render::Transfer::Pq,
+            Some(brp_media::Transfer::Hlg) => brp_render::Transfer::Hlg,
+            Some(brp_media::Transfer::Linear) => brp_render::Transfer::Linear,
+            _ => brp_render::Transfer::Sdr,
+        }
+    }
+
     /// Decoded neighbours of the frame on screen (for deinterlacing).
     pub fn neighbours(&self) -> (Option<Arc<VideoFrame>>, Option<Arc<VideoFrame>>) {
         match (&self.source, &self.shown) {
@@ -438,6 +479,11 @@ impl Player {
         if deint && !self.playing {
             let n = self.current;
             waiting |= (n > 0 && src.get(n - 1).is_none()) || (n < self.last_frame() && src.get(n + 1).is_none());
+        }
+        // Stateful effects after a jump: keep redrawing until their history is decoded.
+        if self.fx_warmup > 0 && !self.playing {
+            let want = (self.fx_warmup as i64).min(self.seq()) as usize;
+            waiting |= self.history(self.fx_warmup).len() < want;
         }
         let pick = exact.or_else(|| {
             // While waiting: during playback hold the current picture (drop late frames);

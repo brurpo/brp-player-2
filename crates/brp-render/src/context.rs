@@ -181,11 +181,19 @@ impl GpuContext {
             let prio = [1.0f32];
             let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
+            // User shaders use storage images like r16f (extended formats).
+            let supported = instance.get_physical_device_features(physical);
+            // User shaders also use textureGatherOffset(s) (mpv nlmeans), which needs
+            // shaderImageGatherExtended; without it results are undefined.
+            let base = vk::PhysicalDeviceFeatures::default()
+                .shader_storage_image_extended_formats(supported.shader_storage_image_extended_formats != 0)
+                .shader_image_gather_extended(supported.shader_image_gather_extended != 0);
             let device = instance.create_device(
                 physical,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
                     .enabled_extension_names(&dev_exts)
+                    .enabled_features(&base)
                     .push_next(&mut f13),
                 None,
             )?;

@@ -1,0 +1,22 @@
+#version 450
+// Effect chain: decoded planes -> normalised LUMA (r) / CHROMA (rg) textures,
+// the values mpv shaders expect when hooking LUMA or CHROMA.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D a;   // Y, or U
+layout(set = 0, binding = 1) uniform sampler2D b;   // unused, or V
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform PC {
+    int chroma;     // 0: LUMA from a; 1: CHROMA from (a, b)
+    float norm;     // sample -> code / max
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (p.x >= size.x || p.y >= size.y) return;
+    float x = texelFetch(a, p, 0).r * pc.norm;
+    vec4 v = pc.chroma == 1 ? vec4(x, texelFetch(b, p, 0).r * pc.norm, 0.0, 1.0) : vec4(x, 0.0, 0.0, 1.0);
+    imageStore(dst, p, v);
+}

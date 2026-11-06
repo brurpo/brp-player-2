@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod effects;
 mod i18n;
 mod icons;
 mod instance;
@@ -70,6 +71,20 @@ impl App {
         let t_window = self.start.elapsed();
         // Open the media first: its first frame decodes while the GPU driver sets up.
         let mut player = Player::new();
+        // --fx=A.glsl,B.glsl : start with these effects from the shader library.
+        if let Some(list) = std::env::args().find_map(|a| a.strip_prefix("--fx=").map(str::to_string)) {
+            let lib = effects::library();
+            for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                match lib.iter().find(|p| p.file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))) {
+                    Some(p) => {
+                        if let Err(e) = player.fx.add(p) {
+                            log::error!("--fx {name}: {e:#}");
+                        }
+                    }
+                    None => log::error!("--fx: {name} not found in {:?}", effects::shader_dirs()),
+                }
+            }
+        }
         if let Some(f) = file {
             player.open(&f);
             if let Some(m) = std::env::args().find_map(|a| a.strip_prefix("--deint=").map(str::to_string)) {
@@ -198,11 +213,46 @@ impl Win {
                     self.window.set_fullscreen(None);
                     self.ui.fullscreen = false;
                 }
+                Action::FxBrowse => {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("GLSL shader", &["glsl"]).pick_file() {
+                        if let Err(e) = self.player.fx.import(&p) {
+                            log::error!("import shader: {e:#}");
+                        }
+                    }
+                }
+                Action::FxSavePreset => {
+                    let dir = effects::user_shader_dir().join("presets");
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Some(p) = rfd::FileDialog::new().set_directory(&dir).add_filter("BRP effects preset", &["json"]).set_file_name("preset.json").save_file() {
+                        if let Err(e) = self.player.fx.save_preset(&p) {
+                            log::error!("save preset: {e:#}");
+                        }
+                    }
+                }
+                Action::FxLoadPreset => {
+                    let dir = effects::user_shader_dir().join("presets");
+                    if let Some(p) = rfd::FileDialog::new().set_directory(&dir).add_filter("BRP effects preset", &["json"]).pick_file() {
+                        match self.player.fx.load_preset(&p) {
+                            Ok(missing) if !missing.is_empty() => log::warn!("{}: {}", self.ui.lang.t("fx_preset_missing"), missing.join(", ")),
+                            Ok(_) => {}
+                            Err(e) => log::error!("load preset: {e:#}"),
+                        }
+                    }
+                }
             }
         }
 
+        // Effect chain changes and background shader compiles.
+        if self.player.fx.dirty {
+            self.renderer.set_effects(&self.player.fx.specs(), self.player.transfer());
+            self.player.fx.dirty = false;
+        }
+        let fx_changed = self.renderer.poll_effects();
+        self.player.fx_warmup = self.renderer.effect_warmup();
+        self.ui.fx_status = self.renderer.effect_status();
+
         // Pick up seeks made by the UI this frame.
-        let waiting = self.player.tick();
+        let waiting = self.player.tick() || fx_changed || self.ui.fx_status.iter().any(|(_, s)| *s == brp_render::EffectStatus::Compiling);
 
         let title = match &self.player.source {
             Some(s) => format!("{} — BRP Player", s.info.file_name),
@@ -217,6 +267,8 @@ impl Win {
             log::error!("egui textures: {e}");
         }
         let frame = self.player.shown.clone();
+        let warm = self.player.fx_warmup;
+        let hist = if warm > 0 { self.player.history(warm) } else { Vec::new() };
         let deint_method = self.player.deint_method();
         let (prev, next) = if deint_method.is_some() { self.player.neighbours() } else { (None, None) };
         let video = match (&frame, &self.player.source) {
@@ -230,6 +282,12 @@ impl Win {
                 }),
                 prev: prev.as_deref(),
                 next: next.as_deref(),
+                seq: self.player.seq(),
+                history: hist
+                    .iter()
+                    .map(|(f, p, n, s, second)| brp_render::HistoryFrame { frame: f, prev: p.as_deref(), next: n.as_deref(), seq: *s, second_field: *second })
+                    .collect(),
+                target: (((rect[2] - rect[0]).abs().round() as u32).max(1), ((rect[3] - rect[1]).abs().round() as u32).max(1)),
                 frame: f,
                 color: src.info.color,
                 rect,
@@ -312,6 +370,14 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::Resized(s) => {
                 w.renderer.resize(s.width, s.height);
+                w.window.request_redraw();
+            }
+            WindowEvent::DroppedFile(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("glsl")) => {
+                // A shader: add it to the chain (copied into the user shader folder).
+                match w.player.fx.import(&path) {
+                    Ok(_) => w.ui.show_fx = true,
+                    Err(e) => log::error!("import shader: {e:#}"),
+                }
                 w.window.request_redraw();
             }
             WindowEvent::DroppedFile(path) => {

@@ -293,6 +293,17 @@ Not covered yet (would be good to add later): **a DXV3-alpha file made by CVExpl
 - Field-rate output (50i → 50p) with field-by-field stepping, or frame rate; mode and output in Settings; a badge in the bottom bar shows the active method; `--deint=off|auto|best|nnedi|bwdif`.
 - Project license: GPL-3.0-or-later; dev FFmpeg switched to the GPL 7.1 build (has `nnedi`, x264/x265 for export).
 
+### Milestone 3 (shader engine) — working, one open issue
+
+- **Parser + codegen** (`brp-render/src/usershader/`): mpv/libplacebo format (HOOK, BIND, SAVE, WIDTH/HEIGHT/WHEN RPN, COMPONENTS, COMPUTE, TEXTURE/STORAGE, PARAM float/int/uint/DEFINE, our `TEMPORAL_WARMUP`). Every pass runs as a compute shader with the libplacebo environment (`NAME_raw/_pos/_size/_pt/_mul/_rot/_off/_tex/_texOff/_gather`, stage-name aliases, `frame`, `random`, `input_size`, `target_size`, `linearize`). Params live in a uniform buffer (no recompile on slider moves); constant-expression users fall back to consts.
+- **Compile check**: `cargo run -p brp-render --release --example shadercheck -- shaders` → all 26 shipped shaders compile (261 passes). Of the 29 old files, 3 were broken in the files themselves (`MB.glsl`, `_test_mb.glsl`, `_test_temporal2.glsl`); mpv rejects them too.
+- **Effect chain** (`effects.rs`): planes → LUMA/CHROMA hooks → MAIN (merge) → MAIN/RGB hooks → display. Background compiles, per-effect persistent storage textures, shared output (a stateful shader never processes a picture twice).
+- **Temporal determinism**: after any jump the history is cleared and the previous pictures are replayed silently (default 2, `//!TEMPORAL_WARMUP n`), including deinterlacing; `frame` counts from the reset (0 = no history, as in libplacebo); `random` is a hash of the picture number. Paused frames are reused, not recomputed.
+- **UI**: Effects panel (fx icon): add from library (`<exe>/shaders`, `%APPDATA%\BRP Player\shaders`) or browse, drop a `.glsl` on the window, enable, reorder, remove, undo/redo (Ctrl+Z/Y), parameter sliders, R/G/B triples as colour pickers, `(cat: …)` groups, presets (JSON, by parameter name). `--fx=A.glsl,B.glsl` starts with effects.
+- **Motion blur rewritten** (`shaders/MB.glsl`): block-matching motion vs. the previous frame + blur along the vector, history stored in a separate pass.
+- **Verified against libplacebo** (FFmpeg `libplacebo` filter, same frames): Gaussian blur, spatial denoiser, Invert match; Painterly, Edges, Glow, FSRCNN (WHEN logic) look right; nlmeans CHROMA path matches.
+- **Open issue — `Builtin_Temporal_Denoiser.glsl`**: its MAIN (RGB) path denoises strongly in BRP with cyan fringes at edges, while libplacebo barely changes the image. Not resolved. Findings so far: the file hooks CHROMA + MAIN but only enables temporal mode for LUMA, so it is not temporal in practice (in mpv either); it shares r16f history textures between CHROMA (packed uint) and MAIN (RGB). Next step: an offline effect runner to diff pass outputs numerically against libplacebo.
+
 ### Startup (release build, this machine)
 
 | Step | Time |

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     copy_nnedi_weights();
+    copy_shaders();
     let Ok(ff) = std::env::var("FFMPEG_DIR") else { return };
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // OUT_DIR = target/<profile>/build/<pkg>/out
@@ -32,6 +33,24 @@ fn copy_nnedi_weights() {
         let dst = profile_dir.join("nnedi3_weights.bin");
         if std::fs::metadata(&dst).map(|m| m.len()).ok() != std::fs::metadata(&src).map(|m| m.len()).ok() {
             let _ = std::fs::copy(&src, &dst);
+        }
+    }
+}
+
+/// Bundled effects (repo `shaders/`) go to `<exe dir>/shaders`.
+fn copy_shaders() {
+    let src = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../shaders");
+    println!("cargo:rerun-if-changed={}", src.display());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let Some(profile_dir) = out.ancestors().nth(3) else { return };
+    let dst = profile_dir.join("shaders");
+    let _ = std::fs::create_dir_all(&dst);
+    if let Ok(entries) = std::fs::read_dir(&src) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "glsl") {
+                let _ = std::fs::copy(&p, dst.join(p.file_name().unwrap()));
+            }
         }
     }
 }

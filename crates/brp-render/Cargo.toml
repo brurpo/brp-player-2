@@ -11,6 +11,8 @@ ash.workspace = true
 ash-window.workspace = true
 raw-window-handle.workspace = true
 gpu-allocator.workspace = true
+shaderc.workspace = true
+crossbeam-channel.workspace = true
 egui.workspace = true
 egui-ash-renderer.workspace = true
 brp-media = { path = "../brp-media" }

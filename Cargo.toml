@@ -24,6 +24,7 @@ egui-ash-renderer = { version = "0.13", features = ["gpu-allocator"] }
 ffmpeg-sys-next = "9"
 cpal = "0.18"
 rtrb = "0.4"
+shaderc = { version = "0.10", features = ["prefer-static-linking"] }
 interprocess = "2"
 rfd = "0.17"
 

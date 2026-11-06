@@ -15,6 +15,8 @@ fn main() {
         ("nnedi3.comp", "nnedi3.comp", &[]),
         ("nnedi3.comp", "nnedi3_fast.comp", &["-DFAST"]),
         ("bwdif.comp", "bwdif.comp", &[]),
+        ("planes.comp", "planes.comp", &[]),
+        ("merge.comp", "merge.comp", &[]),
     ];
     for (file, name, defines) in shaders {
         let src = PathBuf::from("shaders").join(file);

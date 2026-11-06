@@ -15,12 +15,18 @@ pub enum Action {
     Open,
     ToggleFullscreen,
     ExitFullscreen,
+    FxBrowse,
+    FxSavePreset,
+    FxLoadPreset,
 }
 
 pub struct UiState {
     pub lang: Lang,
     pub show_info: bool,
     pub show_settings: bool,
+    pub show_fx: bool,
+    pub fx_status: Vec<(u64, brp_render::EffectStatus)>,
+    fx_library: Vec<std::path::PathBuf>,
     /// Output devices, listed when Settings opens.
     audio_devices: Vec<String>,
     pub locked: bool,
@@ -42,6 +48,9 @@ impl UiState {
             lang: Lang::default(),
             show_info: false,
             show_settings: false,
+            show_fx: false,
+            fx_status: Vec::new(),
+            fx_library: Vec::new(),
             audio_devices: Vec::new(),
             locked: false,
             last_activity: Instant::now(),
@@ -163,6 +172,13 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState, px: [f32; 2]) 
                         if icon_button(ui, &s.icons, "folder_expanded", l.t("open"), false).clicked() {
                             actions.push(Action::Open);
                         }
+                        let fx_on = p.fx.any_enabled();
+                        if icon_button(ui, &s.icons, "fx_enabled", l.t("effects"), s.show_fx || fx_on).clicked() {
+                            s.show_fx = !s.show_fx;
+                            if s.show_fx {
+                                s.fx_library = crate::effects::library();
+                            }
+                        }
                         if icon_button(ui, &s.icons, "config", l.t("settings"), s.show_settings).clicked() {
                             s.show_settings = !s.show_settings;
                             if s.show_settings {
@@ -243,6 +259,9 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState, px: [f32; 2]) 
     if s.show_settings {
         settings_window(ctx, p, s);
     }
+    if s.show_fx {
+        effects_window(ctx, p, s, &mut actions);
+    }
     if s.show_info {
         info_window(ctx, p, s);
     }
@@ -254,6 +273,12 @@ fn keyboard(ctx: &egui::Context, p: &mut Player, s: &mut UiState, actions: &mut 
         return;
     }
     ctx.input(|i| {
+        if i.modifiers.command && i.key_pressed(Key::Z) {
+            p.fx.undo();
+        }
+        if i.modifiers.command && i.key_pressed(Key::Y) {
+            p.fx.redo();
+        }
         let shift = i.modifiers.shift;
         let big = if shift { 10 } else { 1 };
         if i.key_pressed(Key::Space) || i.key_pressed(Key::K) {
@@ -621,5 +646,205 @@ fn settings_window(ctx: &egui::Context, p: &mut Player, s: &mut UiState) {
         });
     if !open {
         s.show_settings = false;
+    }
+}
+
+fn effects_window(ctx: &egui::Context, p: &mut Player, s: &mut UiState, actions: &mut Vec<Action>) {
+    use crate::effects::{clean_desc, param_views, ParamView};
+    use brp_render::usershader::ParamKind;
+    let l = s.lang;
+    let mut open = true;
+    egui::Window::new(l.t("effects"))
+        .open(&mut open)
+        .anchor(Align2::LEFT_TOP, Vec2::new(12.0, 48.0))
+        .default_width(380.0)
+        .resizable(true)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            // Toolbar.
+            ui.horizontal(|ui| {
+                let mut add: Option<std::path::PathBuf> = None;
+                egui::ComboBox::from_id_salt("fx_add").selected_text(l.t("fx_add")).width(170.0).show_ui(ui, |ui| {
+                    for path in &s.fx_library {
+                        let name = path.file_stem().map(|n| n.to_string_lossy().replace('_', " ")).unwrap_or_default();
+                        if ui.selectable_label(false, name).clicked() {
+                            add = Some(path.clone());
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(false, l.t("fx_browse")).clicked() {
+                        actions.push(Action::FxBrowse);
+                    }
+                });
+                if let Some(path) = add {
+                    if let Err(e) = p.fx.add(&path) {
+                        log::error!("add effect: {e:#}");
+                    }
+                }
+                ui.menu_button(l.t("fx_presets"), |ui| {
+                    if ui.button(l.t("fx_save")).clicked() {
+                        actions.push(Action::FxSavePreset);
+                        ui.close();
+                    }
+                    if ui.button(l.t("fx_load")).clicked() {
+                        actions.push(Action::FxLoadPreset);
+                        ui.close();
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(!p.fx.list.is_empty(), egui::Button::new(l.t("fx_clear"))).clicked() {
+                        p.fx.clear();
+                    }
+                    if ui.add_enabled(p.fx.can_redo(), egui::Button::new("↷")).on_hover_text("Ctrl+Y").clicked() {
+                        p.fx.redo();
+                    }
+                    if ui.add_enabled(p.fx.can_undo(), egui::Button::new("↶")).on_hover_text("Ctrl+Z").clicked() {
+                        p.fx.undo();
+                    }
+                });
+            });
+            ui.separator();
+
+            if p.fx.list.is_empty() {
+                ui.label(RichText::new(l.t("fx_empty")).weak());
+                return;
+            }
+            // Chain. action: (id, -1 up / +1 down / 0 remove / 2 toggle)
+            let mut action: Option<(u64, i32)> = None;
+            for e in &p.fx.list {
+                let id = e.spec.id;
+                let status = s.fx_status.iter().find(|(i, _)| *i == id).map(|(_, st)| st.clone());
+                ui.horizontal(|ui| {
+                    let mut en = e.spec.enabled;
+                    if ui.checkbox(&mut en, "").changed() {
+                        action = Some((id, 2));
+                    }
+                    let selected = p.fx.selected == Some(id);
+                    let mut text = RichText::new(&e.name);
+                    if !e.spec.enabled {
+                        text = text.weak();
+                    }
+                    if ui.selectable_label(selected, text).clicked() {
+                        p.fx.selected = Some(id);
+                    }
+                    match &status {
+                        Some(brp_render::EffectStatus::Compiling) => {
+                            ui.add(egui::Spinner::new().size(12.0)).on_hover_text(l.t("fx_compiling"));
+                        }
+                        Some(brp_render::EffectStatus::Error(msg)) => {
+                            ui.label(RichText::new("⚠").color(Color32::from_rgb(230, 90, 80))).on_hover_text(msg);
+                        }
+                        _ => {}
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✖").on_hover_text(l.t("fx_remove")).clicked() {
+                            action = Some((id, 0));
+                        }
+                        if ui.small_button("▼").clicked() {
+                            action = Some((id, 1));
+                        }
+                        if ui.small_button("▲").clicked() {
+                            action = Some((id, -1));
+                        }
+                    });
+                });
+            }
+            match action {
+                Some((id, 0)) => p.fx.remove(id),
+                Some((id, 2)) => {
+                    p.fx.checkpoint();
+                    if let Some(e) = p.fx.list.iter_mut().find(|e| e.spec.id == id) {
+                        e.spec.enabled = !e.spec.enabled;
+                    }
+                    p.fx.dirty = true;
+                }
+                Some((id, d)) => p.fx.move_by(id, d as isize),
+                None => {}
+            }
+
+            // Parameters of the selected effect.
+            let Some(sel) = p.fx.selected else { return };
+            let Some(idx) = p.fx.list.iter().position(|e| e.spec.id == sel) else { return };
+            let file = p.fx.list[idx].spec.file.clone();
+            if file.params.is_empty() {
+                return;
+            }
+            ui.separator();
+            let before = p.fx.list.clone();
+            let mut changed = false;
+            let mut started = false;
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for (cat, views) in param_views(&file) {
+                    let mut body = |ui: &mut egui::Ui| {
+                        egui::Grid::new(("fx_params", sel, cat.clone())).num_columns(2).spacing(Vec2::new(10.0, 6.0)).show(ui, |ui| {
+                            for v in &views {
+                                let values = &mut p.fx.list[idx].spec.params;
+                                match v {
+                                    ParamView::Single(i) => {
+                                        let pd = &file.params[*i];
+                                        ui.label(&pd.name).on_hover_text(clean_desc(&pd.desc));
+                                        let (lo, hi) = (pd.min.unwrap_or(0.0), pd.max.unwrap_or(1.0));
+                                        let r = match pd.kind {
+                                            ParamKind::Float => ui.add(egui::Slider::new(&mut values[*i], lo..=hi).max_decimals(3)),
+                                            _ if lo == 0.0 && hi == 1.0 => {
+                                                let mut b = values[*i] >= 0.5;
+                                                let r = ui.checkbox(&mut b, "");
+                                                values[*i] = b as i32 as f64;
+                                                r
+                                            }
+                                            _ => {
+                                                let mut n = values[*i].round() as i64;
+                                                let r = ui.add(egui::Slider::new(&mut n, lo as i64..=hi as i64));
+                                                values[*i] = n as f64;
+                                                r
+                                            }
+                                        };
+                                        let r = r.on_hover_text(clean_desc(&pd.desc));
+                                        started |= r.drag_started() || (r.changed() && !r.dragged());
+                                        changed |= r.changed();
+                                    }
+                                    ParamView::Color { label, idx: [r, g, b] } => {
+                                        ui.label(label).on_hover_text(clean_desc(&file.params[*r].desc));
+                                        let mut c = [values[*r] as f32, values[*g] as f32, values[*b] as f32];
+                                        let resp = ui.color_edit_button_rgb(&mut c);
+                                        if resp.changed() {
+                                            values[*r] = c[0] as f64;
+                                            values[*g] = c[1] as f64;
+                                            values[*b] = c[2] as f64;
+                                            changed = true;
+                                        }
+                                        started |= resp.clicked();
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    };
+                    match &cat {
+                        Some(c) => {
+                            egui::CollapsingHeader::new(c).id_salt(("fx_cat", sel, c.clone())).default_open(true).show(ui, &mut body);
+                        }
+                        None => body(ui),
+                    }
+                }
+                ui.add_space(4.0);
+                if ui.button(l.t("fx_reset")).clicked() {
+                    p.fx.list[idx].spec.params = file.params.iter().map(|q| q.default).collect();
+                    started = true;
+                    changed = true;
+                }
+            });
+            if started {
+                // One undo step per drag / click, holding the state before the change.
+                let after = std::mem::replace(&mut p.fx.list, before);
+                p.fx.checkpoint();
+                p.fx.list = after;
+            }
+            if changed {
+                p.fx.dirty = true;
+            }
+        });
+    if !open {
+        s.show_fx = false;
     }
 }

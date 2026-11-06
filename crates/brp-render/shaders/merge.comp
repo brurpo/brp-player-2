@@ -1,0 +1,45 @@
+#version 450
+// Effect chain: planes (or LUMA/CHROMA textures) -> MAIN, i.e. RGB in the source's
+// transfer (not linearised), at luma resolution. Same maths as video.frag.
+//  mode.x: 0 YUV, 1 packed RGBA;  mode.z: alpha;  misc.w: 1 = inputs are LUMA (r) +
+//  CHROMA (rg) textures (already normalised), 0 = raw planes Y, U, V, A.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D t0;
+layout(set = 0, binding = 1) uniform sampler2D t1;
+layout(set = 0, binding = 2) uniform sampler2D t2;
+layout(set = 0, binding = 3) uniform sampler2D t3;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform PC {
+    vec4 rect;
+    vec4 m0;
+    vec4 m1;
+    vec4 m2;
+    vec4 off;
+    vec4 misc;
+    ivec4 mode;
+    ivec4 swz;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (p.x >= size.x || p.y >= size.y) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    vec3 rgb;
+    float alpha = 1.0;
+    if (pc.mode.x == 0) {
+        float n = pc.misc.w > 0.5 ? 1.0 : pc.misc.x;
+        float y = texelFetch(t0, p, 0).r * n;
+        vec2 c = pc.misc.w > 0.5 ? textureLod(t1, uv, 0.0).rg : vec2(textureLod(t1, uv, 0.0).r, textureLod(t2, uv, 0.0).r) * n;
+        vec3 yuv = vec3((y - pc.off.x) * pc.off.z, (c - pc.off.y) * pc.off.w);
+        rgb = vec3(dot(pc.m0.xyz, yuv), dot(pc.m1.xyz, yuv), dot(pc.m2.xyz, yuv));
+        if (pc.mode.z == 1) alpha = textureLod(t3, uv, 0.0).r * pc.misc.x;
+    } else {
+        vec4 s = texelFetch(t0, p, 0);
+        rgb = vec3(s[pc.swz.x], s[pc.swz.y], s[pc.swz.z]);
+        if (pc.swz.w >= 0) alpha = s[pc.swz.w];
+    }
+    imageStore(dst, p, vec4(rgb, alpha));
+}

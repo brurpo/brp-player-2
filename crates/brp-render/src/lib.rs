@@ -3,10 +3,12 @@
 mod color;
 mod context;
 mod deint;
+pub mod effects;
 mod frames;
 mod gpu;
 mod nnedi;
 pub mod offline;
+pub mod usershader;
 mod video;
 
 pub use color::{video_push, VideoPush};
@@ -19,6 +21,9 @@ use ash::vk;
 use brp_media::{ColorInfo, VideoFrame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use deint::Deinterlacer;
+use effects::EffectChain;
+pub use effects::{EffectSpec, EffectStatus};
+pub use usershader::Transfer;
 use frames::FrameCache;
 use gpu::{Graveyard, Staging};
 use video::VideoPass;
@@ -42,6 +47,22 @@ pub struct VideoDraw<'a> {
     pub deint: Option<DeintParams>,
     pub prev: Option<&'a VideoFrame>,
     pub next: Option<&'a VideoFrame>,
+    /// Deterministic position (frame, or 2*frame+field when showing fields); `frame`
+    /// in shaders, and consecutive values mean "next picture" for stateful effects.
+    pub seq: i64,
+    /// Pictures just before this one, oldest first, used to rebuild the history of
+    /// stateful effects after a jump.
+    pub history: Vec<HistoryFrame<'a>>,
+    /// Effect output size for OUTPUT in shader expressions (display or export size).
+    pub target: (u32, u32),
+}
+
+pub struct HistoryFrame<'a> {
+    pub frame: &'a VideoFrame,
+    pub prev: Option<&'a VideoFrame>,
+    pub next: Option<&'a VideoFrame>,
+    pub seq: i64,
+    pub second_field: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +77,10 @@ pub struct Renderer {
     egui: Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
     video: Option<VideoPass>,
     deint: Option<Deinterlacer>,
+    effects: Option<EffectChain>,
+    /// (chain key, seq) of the last processed picture, and its output.
+    chain_last: Option<(u64, i64)>,
+    chain_out: Option<effects::ChainOutput>,
     frame_cache: FrameCache,
     staging: Vec<Staging>,
     graveyard: Graveyard,
@@ -125,6 +150,7 @@ impl Renderer {
             let props = ctx.instance.get_physical_device_properties(ctx.physical);
             let integrated = props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU;
             let deint = Deinterlacer::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, find_nnedi_weights(), props.limits.max_compute_shared_memory_size, integrated)?;
+            let chain = EffectChain::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, props.limits.min_uniform_buffer_offset_alignment)?;
             let egui = egui_ash_renderer::Renderer::with_gpu_allocator(
                 (*ctx.allocator).clone(),
                 device.clone(),
@@ -145,6 +171,9 @@ impl Renderer {
                 egui: Some(egui),
                 video: Some(video),
                 deint: Some(deint),
+                effects: Some(chain),
+                chain_last: None,
+                chain_out: None,
                 frame_cache: FrameCache::new(12),
                 staging: (0..FRAMES_IN_FLIGHT).map(|_| Staging::new()).collect(),
                 graveyard: Graveyard::default(),
@@ -326,37 +355,163 @@ impl Renderer {
     fn prepare_video(&mut self, cb: vk::CommandBuffer, fi: usize, v: &VideoDraw<'_>) -> Result<Option<VideoPush>> {
         let device = self.ctx.device.clone();
         let alloc = (*self.ctx.allocator).clone();
-        let deint = v.deint.filter(|_| matches!(v.frame.layout, brp_media::FrameLayout::Yuv { .. }));
+        let yuv = matches!(v.frame.layout, brp_media::FrameLayout::Yuv { .. });
+        let deint = v.deint.filter(|_| yuv);
+        let chain_on = self.effects.as_ref().is_some_and(|c| c.has_active());
+
+        // Everything this draw may need on the GPU.
         let mut list: Vec<&VideoFrame> = vec![v.frame];
         if deint.is_some() {
             list.extend(v.prev);
             list.extend(v.next);
+        }
+        if chain_on {
+            for h in &v.history {
+                list.push(h.frame);
+                if deint.is_some() {
+                    list.extend(h.prev);
+                    list.extend(h.next);
+                }
+            }
         }
         let bytes = self.frame_cache.upload_size(v.source_id, &list);
         self.staging[fi].reset(&device, &alloc, bytes)?;
         for f in &list {
             self.frame_cache.ensure(&device, &alloc, cb, &mut self.staging[fi], &mut self.graveyard, self.frame_no, v.source_id, f)?;
         }
-        let cur_i = self.frame_cache.find((v.source_id, v.frame.index())).expect("just uploaded");
-        let find_or_cur = |f: Option<&VideoFrame>| f.and_then(|f| self.frame_cache.find((v.source_id, f.index()))).unwrap_or(cur_i);
-        let (views, layout) = match deint {
-            Some(params) => {
-                let (pi, ni) = (find_or_cur(v.prev), find_or_cur(v.next));
-                let fc = &self.frame_cache;
-                match self.deint.as_mut().unwrap().run(cb, fi, params, fc.get(pi), fc.get(cur_i), fc.get(ni), &mut self.graveyard, self.frame_no)? {
-                    Some(out) => (out, vk::ImageLayout::GENERAL),
-                    None => (fc.get(cur_i).views(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                }
-            }
-            None => (self.frame_cache.get(cur_i).views(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-        };
-        self.video.as_mut().unwrap().bind(fi, &views, layout, v.nearest);
 
         let (w, h) = (self.extent.width as f32, self.extent.height as f32);
+        let rect = [v.rect[0] / w * 2.0 - 1.0, v.rect[1] / h * 2.0 - 1.0, v.rect[2] / w * 2.0 - 1.0, v.rect[3] / h * 2.0 - 1.0];
+
+        if chain_on {
+            // Key: chain + source + how frames are prepared (+ output size for OUTPUT).
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut hs = std::collections::hash_map::DefaultHasher::new();
+                self.effects.as_ref().unwrap().key().hash(&mut hs);
+                v.source_id.hash(&mut hs);
+                deint.map(|d| (d.method as u8, d.tff, d.light)).hash(&mut hs);
+                v.target.hash(&mut hs);
+                // More history arriving (after a jump) must trigger a re-run.
+                v.history.len().hash(&mut hs);
+                hs.finish()
+            };
+            if self.chain_last != Some((key, v.seq)) || self.chain_out.is_none() {
+                self.effects.as_mut().unwrap().begin(fi)?;
+                let chain = self.effects.as_ref().unwrap();
+                let warm = chain.stateful() && self.chain_last != Some((key, v.seq - 1));
+                if warm {
+                    self.effects.as_mut().unwrap().reset_history();
+                    for hf in v.history.iter().filter(|hf| hf.seq < v.seq) {
+                        let d = deint.map(|d| DeintParams { second_field: hf.second_field, ..d });
+                        self.run_chain(cb, fi, v, hf.frame, hf.prev, hf.next, d, hf.seq)?;
+                    }
+                }
+                self.chain_out = self.run_chain(cb, fi, v, v.frame, v.prev, v.next, deint, v.seq)?;
+                self.chain_last = Some((key, v.seq));
+            }
+            if let Some(out) = &self.chain_out {
+                let view = out.view;
+                self.video.as_mut().unwrap().bind(fi, &[view], vk::ImageLayout::GENERAL, v.nearest);
+                let mut push = color::video_push(brp_media::FrameLayout::Rgba16, &v.color, 12.0);
+                if !v.frame.layout.has_alpha() {
+                    push.mode[2] = 0;
+                    push.swz[3] = -1;
+                }
+                push.misc[3] = (v.rotation / 90 % 4) as f32;
+                push.rect = rect;
+                return Ok(Some(push));
+            }
+        } else {
+            self.chain_last = None;
+            self.chain_out = None;
+        }
+
+        let (views, layout, _) = self.input_planes(cb, fi, v.source_id, v.frame, v.prev, v.next, deint)?;
+        self.video.as_mut().unwrap().bind(fi, &views, layout, v.nearest);
         let mut push = color::video_push(v.frame.layout, &v.color, 12.0);
         push.misc[3] = (v.rotation / 90 % 4) as f32;
-        push.rect = [v.rect[0] / w * 2.0 - 1.0, v.rect[1] / h * 2.0 - 1.0, v.rect[2] / w * 2.0 - 1.0, v.rect[3] / h * 2.0 - 1.0];
+        push.rect = rect;
         Ok(Some(push))
+    }
+
+    /// Planes of `frame` as the display or the effect chain sees them: from the frame
+    /// cache, or deinterlaced. Returns views, their layout and plane sizes.
+    #[allow(clippy::too_many_arguments)]
+    fn input_planes(
+        &mut self,
+        cb: vk::CommandBuffer,
+        fi: usize,
+        source: u64,
+        frame: &VideoFrame,
+        prev: Option<&VideoFrame>,
+        next: Option<&VideoFrame>,
+        deint: Option<DeintParams>,
+    ) -> Result<(Vec<vk::ImageView>, vk::ImageLayout, Vec<(u32, u32)>)> {
+        let cur_i = self.frame_cache.find((source, frame.index())).expect("uploaded");
+        let sizes: Vec<(u32, u32)> = self.frame_cache.get(cur_i).planes.iter().map(|p| (p.w, p.h)).collect();
+        let find_or_cur = |f: Option<&VideoFrame>| f.and_then(|f| self.frame_cache.find((source, f.index()))).unwrap_or(cur_i);
+        if let Some(params) = deint {
+            let (pi, ni) = (find_or_cur(prev), find_or_cur(next));
+            let fc = &self.frame_cache;
+            if let Some(out) = self.deint.as_mut().unwrap().run(cb, fi, params, fc.get(pi), fc.get(cur_i), fc.get(ni), &mut self.graveyard, self.frame_no)? {
+                return Ok((out, vk::ImageLayout::GENERAL, sizes));
+            }
+        }
+        Ok((self.frame_cache.get(cur_i).views(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, sizes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_chain(
+        &mut self,
+        cb: vk::CommandBuffer,
+        fi: usize,
+        v: &VideoDraw<'_>,
+        frame: &VideoFrame,
+        prev: Option<&VideoFrame>,
+        next: Option<&VideoFrame>,
+        deint: Option<DeintParams>,
+        seq: i64,
+    ) -> Result<Option<effects::ChainOutput>> {
+        let (views, layout, sizes) = self.input_planes(cb, fi, v.source_id, frame, prev, next, deint)?;
+        let cf = effects::ChainFrame {
+            planes: &views,
+            planes_layout: layout,
+            plane_sizes: &sizes,
+            layout: frame.layout,
+            color: v.color,
+            seq,
+            target: v.target,
+            input: (frame.width(), frame.height()),
+        };
+        self.effects.as_mut().unwrap().run(cb, fi, &cf)
+    }
+
+    /// Replace the effect chain (compiles new shaders in the background).
+    pub fn set_effects(&mut self, specs: &[EffectSpec], transfer: Transfer) {
+        let now = self.frame_no;
+        if let Some(c) = self.effects.as_mut() {
+            c.set_effects(specs, transfer, &mut self.graveyard, now);
+        }
+        self.chain_last = None;
+    }
+
+    /// Pick up finished shader compiles. True if the picture may change.
+    pub fn poll_effects(&mut self) -> bool {
+        let changed = self.effects.as_mut().is_some_and(|c| c.poll());
+        if changed {
+            self.chain_last = None;
+        }
+        changed
+    }
+
+    pub fn effect_status(&self) -> Vec<(u64, EffectStatus)> {
+        self.effects.as_ref().map(|c| c.status()).unwrap_or_default()
+    }
+
+    /// Pictures of history stateful effects need after a jump (0 if none).
+    pub fn effect_warmup(&self) -> u32 {
+        self.effects.as_ref().filter(|c| c.stateful()).map(|c| c.warmup()).unwrap_or(0)
     }
 
     /// Why NNEDI3 can't be used (weights missing/invalid), if so.
@@ -447,6 +602,7 @@ impl Drop for Renderer {
             self.egui = None;
             self.video = None;
             self.deint = None;
+            self.effects = None;
             let alloc = (*self.ctx.allocator).clone();
             self.frame_cache.destroy(&self.ctx.device, &alloc);
             for s in &mut self.staging {
