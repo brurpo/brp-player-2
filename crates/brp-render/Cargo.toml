@@ -1,0 +1,19 @@
+[package]
+name = "brp-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+gpu-allocator.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+brp-media = { path = "../brp-media" }
+
+[dev-dependencies]
+env_logger.workspace = true

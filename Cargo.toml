@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/brp-media", "crates/brp-render", "crates/brp-player"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+winit = "0.30"
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }
+egui-ash-renderer = { version = "0.13", features = ["gpu-allocator"] }
+ffmpeg-sys-next = "9"
+cpal = "0.18"
+rtrb = "0.4"
+interprocess = "2"
+rfd = "0.17"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2

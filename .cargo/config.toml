@@ -1,0 +1,7 @@
+# Machine-specific SDK locations (Windows dev box). Adjust per machine.
+# FFmpeg: GPL build (the project is GPL-3.0-or-later).
+[env]
+FFMPEG_DIR = "C:/Users/brurp/AppData/Local/Microsoft/WinGet/Packages/BtbN.FFmpeg.GPL.Shared.7.1_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1"
+LIBCLANG_PATH = "C:/Program Files/LLVM/bin"
+VULKAN_SDK = "C:/VulkanSDK/1.4.363.0"
+SHADERC_LIB_DIR = "C:/VulkanSDK/1.4.363.0/Lib"

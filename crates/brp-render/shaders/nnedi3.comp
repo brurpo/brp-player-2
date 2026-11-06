@@ -1,0 +1,217 @@
+#version 450
+// NNEDI3 field interpolation (port of FFmpeg vf_nnedi.c: "new" prescreener + predictor).
+// Writes a full plane: lines of the kept field are copied, the other field's lines are
+// predicted. One invocation per (x, line pair).
+//
+// Built twice:
+//  - generic: network size from push constants, weights read from the storage buffer;
+//  - FAST (-DFAST): network size fixed at compile time (FFmpeg default s32x4 / n32) and
+//    weights staged in shared memory, which matters a lot on integrated GPUs.
+
+#define WX 32
+#define WY 4
+#define MX 24              // horizontal margin (>= xdim/2 for 48-wide windows)
+#define TW (WX + 2 * MX)
+#define TH (WY + 5)        // kept-field rows needed for 6-row windows
+#define PRE 280            // prescreener floats
+
+layout(local_size_x = WX, local_size_y = WY) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;           // source plane (unorm)
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst;
+layout(set = 0, binding = 2) readonly buffer Weights { float w[]; };
+
+layout(push_constant) uniform PC {
+    ivec2 size;       // plane width, height
+    int keep;         // parity of the kept field lines (0 = even lines kept)
+    int xdim;
+    int ydim;
+    int nns;
+    int qual2;
+    int model;        // offset of the predictor in w[]
+    float to255;      // sample -> 0..255 domain
+} pc;
+
+#ifdef FAST
+#define XD 32
+#define YD 4
+#define NN 32
+#define NSIZE (XD * YD)
+#define FSZ (NN * NSIZE)
+// Neurons are staged in chunks so the weights fit in 32 KB of shared memory
+// (AMD, Intel, Apple); summation order is unchanged, so results stay exact.
+#define NC 16
+#define CSZ (NC * NSIZE)
+shared float sw[2 * CSZ + 2 * NC];   // chunk: softmax, elliott, softmax bias, elliott bias
+shared float spre[PRE];
+#define W_PRE(i) spre[i]
+#define W_SM(i) sw[i]
+#define W_EL(i) sw[CSZ + (i)]
+#define W_SMB(i) sw[2 * CSZ + (i)]
+#define W_ELB(i) sw[2 * CSZ + NC + (i)]
+#else
+#define XD pc.xdim
+#define YD pc.ydim
+#define NN pc.nns
+#define NSIZE (pc.xdim * pc.ydim)
+#define FSZ (pc.nns * NSIZE)
+#define NC pc.nns
+#define W_PRE(i) w[i]
+#define W_SM(i) w[qbase + (i)]
+#define W_EL(i) w[qbase + FSZ + (i)]
+#define W_SMB(i) w[qbase + 2 * FSZ + (i)]
+#define W_ELB(i) w[qbase + 2 * FSZ + NN + (i)]
+#endif
+
+shared float tile[TH][TW];
+
+// Kept-field row index -> plane line.
+int kept_rows() { return (pc.size.y - pc.keep + 1) / 2; }
+
+float fetch_kept(int x, int kr) {
+    int w = pc.size.x;
+    // FFmpeg pads 32 px by mirroring without repeating the edge pixel.
+    if (x < 0) x = -x - 1;
+    if (x >= w) x = 2 * w - 1 - x;
+    x = clamp(x, 0, w - 1);
+    kr = clamp(kr, 0, kept_rows() - 1);
+    int line = 2 * kr + pc.keep;
+    return texelFetch(src, ivec2(x, line), 0).r * pc.to255;
+}
+
+float elliott(float x) { return x / (1.0 + abs(x)); }
+
+#ifdef FAST
+// Stage neurons [ch*NC, ch*NC + NC) of quality pass q.
+void load_chunk(int q, int ch, int lin) {
+    int base = pc.model + q * (2 * FSZ + 2 * NN);
+    int n0 = ch * NC;
+    for (int i = lin; i < CSZ; i += WX * WY) {
+        sw[i] = w[base + n0 * NSIZE + i];
+        sw[CSZ + i] = w[base + FSZ + n0 * NSIZE + i];
+    }
+    for (int i = lin; i < NC; i += WX * WY) {
+        sw[2 * CSZ + i] = w[base + 2 * FSZ + n0 + i];
+        sw[2 * CSZ + NC + i] = w[base + 2 * FSZ + NN + n0 + i];
+    }
+}
+#endif
+
+void main() {
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    int lin = lid.y * WX + lid.x;
+    int x0 = int(gl_WorkGroupID.x) * WX;
+    int yy0 = int(gl_WorkGroupID.y) * WY;
+    // Kept row of tile row 0: three rows above the first missing line pair.
+    int kr_base = yy0 - 3 + (1 - pc.keep);
+
+    for (int i = lin; i < TH * TW; i += WX * WY) {
+        int ty = i / TW, tx = i % TW;
+        tile[ty][tx] = fetch_kept(x0 - MX + tx, kr_base + ty);
+    }
+#ifdef FAST
+    for (int i = lin; i < PRE; i += WX * WY) spre[i] = w[i];
+#endif
+    barrier();
+
+    // No early return: every invocation must reach the barriers below.
+    int x = x0 + lid.x;
+    int yy = yy0 + lid.y;
+    int y = 2 * yy + (1 - pc.keep);
+    bool in_x = x < pc.size.x;
+    bool live = in_x && y < pc.size.y;
+
+    int ykeep = 2 * yy + pc.keep;
+    if (in_x && ykeep < pc.size.y) {
+        imageStore(dst, ivec2(x, ykeep), vec4(texelFetch(src, ivec2(x, ykeep), 0).r));
+    }
+
+    // Tile row of the kept line just above the missing one (FFmpeg's "y-1"):
+    // keep=0: y-1 = 2*yy -> kept row yy; keep=1: y-1 = 2*yy-1 -> kept row yy-1.
+    int tr = (pc.keep == 0 ? yy : yy - 1) - kr_base;
+    int tc = lid.x + MX;
+
+    // ---- Prescreener ("new"): 16x4 window shared by groups of 4 pixels. ----
+    bool cubic = true;
+    if (live) {
+        int n = x & 3;
+        int gc = tc - n - 6;   // window column 0 = group start - 6
+        float s[4];
+        for (int k = 0; k < 4; k++) {
+            float acc = 0.0;
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 16; c++)
+                    acc += W_PRE(k * 64 + r * 16 + c) * tile[tr - 1 + r][gc + c];
+            s[k] = elliott(acc + W_PRE(256 + k) + 1e-20);
+        }
+        float s1 = 0.0;
+        for (int k = 0; k < 4; k++) s1 += W_PRE(260 + n * 4 + k) * s[k];
+        s1 += W_PRE(276 + n) + 1e-20;
+        cubic = s1 > 0.0;
+    }
+
+    // ---- Predictor: XD x YD window centred on the missing pixel. ----
+    int r0 = tr + 1 - YD / 2;          // first window row in the tile
+    int c0 = tc - (XD / 2 - 1);        // first window column
+    float m = 0.0, sd = 0.0, inv = 0.0;
+    bool predict = live && !cubic;
+    if (predict) {
+        float sum = 0.0, sum_sq = 0.0;
+        for (int r = 0; r < YD; r++)
+            for (int c = 0; c < XD; c++) {
+                float v = tile[r0 + r][c0 + c];
+                sum += v;
+                sum_sq += v * v;
+            }
+        m = sum / float(NSIZE);
+        float var = sum_sq / float(NSIZE) - m * m;
+        sd = var < 1.1920929e-7 ? 0.0 : sqrt(var);
+        inv = sd == 0.0 ? 0.0 : 1.0 / sd;
+    }
+
+    float acc_out = 0.0;
+    int passes = pc.qual2 != 0 ? 2 : 1;
+    for (int q = 0; q < passes; q++) {
+        float vsum = 0.0, wsum = 0.0;
+        for (int ch = 0; ch < NN / NC; ch++) {
+#ifdef FAST
+            barrier();
+            load_chunk(q, ch, lin);
+            barrier();
+#else
+            int qbase = pc.model + q * (2 * FSZ + 2 * NN);
+#endif
+            if (!predict) continue;
+            for (int nl = 0; nl < NC; nl++) {
+                float a = 0.0, b = 0.0;
+                int nn = nl;
+                int o = nl * NSIZE;
+                for (int r = 0; r < YD; r++)
+                    for (int c = 0; c < XD; c++) {
+                        float v = tile[r0 + r][c0 + c];
+                        int k = o + r * XD + c;
+                        a += W_SM(k) * v;
+                        b += W_EL(k) * v;
+                    }
+                a = a * inv + W_SMB(nn) + 1e-20;
+                b = b * inv + W_ELB(nn) + 1e-20;
+                float e = exp(clamp(a, -80.0, 80.0));
+                vsum += e * elliott(b);
+                wsum += e;
+            }
+        }
+        if (predict) acc_out += wsum > 1e-10 ? (5.0 * vsum) / wsum * sd + m : m;
+    }
+
+    if (live) {
+        float result;
+        if (cubic) {
+            // Cheap cubic where the prescreener says it's enough.
+            result = (-3.0 / 32.0) * tile[tr - 1][tc] + (19.0 / 32.0) * tile[tr][tc]
+                   + (19.0 / 32.0) * tile[tr + 1][tc] + (-3.0 / 32.0) * tile[tr + 2][tc];
+        } else {
+            result = acc_out / float(passes);
+        }
+        imageStore(dst, ivec2(x, y), vec4(clamp(result, 0.0, 255.0) / pc.to255));
+    }
+}
