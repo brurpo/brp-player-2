@@ -666,6 +666,14 @@ impl Writer {
             let mname = ffutil::opt_str((*fmt).name).unwrap_or_default();
             if mname.contains("mp4") || mname.contains("mov") {
                 dict_set(&mut opts, "movflags", "+faststart");
+                // HEVC as 'hvc1' (parameter sets in the header): Apple's players and
+                // editors open only that, FFmpeg's default 'hev1' they refuse.
+                for i in 0..(*oc).nb_streams as usize {
+                    let par = (*(*(*oc).streams.add(i))).codecpar;
+                    if (*par).codec_id == ff::AVCodecID::AV_CODEC_ID_HEVC {
+                        (*par).codec_tag = u32::from_le_bytes(*b"hvc1");
+                    }
+                }
             }
             if mname == "gif" {
                 dict_set(&mut opts, "loop", "0");
