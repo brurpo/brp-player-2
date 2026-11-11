@@ -91,7 +91,14 @@ impl Updater {
                     me.state.lock().component_error = Some(format!("{e:#}"));
                 }
                 match me.latest() {
-                    Ok(Some(r)) => me.state.lock().phase = Phase::Available(r),
+                    Ok(Some(r)) => {
+                        log::info!("update: {} available", r.version);
+                        me.state.lock().phase = Phase::Available(r);
+                        // Testing: install without the click.
+                        if std::env::var_os("BRP_UPDATE_AUTO").is_some() {
+                            me.install();
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => log::info!("update check: {e:#}"),
                 }
@@ -112,7 +119,9 @@ impl Updater {
         let url = format!("https://api.github.com/repos/{}/releases/latest", self.repo);
         let v: Value = serde_json::from_reader(get(&url)?.into_reader())?;
         let tag = v["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_string();
-        if !newer(&tag, env!("CARGO_PKG_VERSION")) {
+        // Testing: act as an older version.
+        let mine = std::env::var("BRP_UPDATE_PRETEND_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+        if !newer(&tag, &mine) {
             return Ok(None);
         }
         let asset = v["assets"].as_array().into_iter().flatten().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with("-windows-x64.zip")));
@@ -176,6 +185,10 @@ impl Updater {
                 let _ = std::fs::remove_dir_all(&work);
                 Ok(())
             })();
+            match &res {
+                Ok(()) => log::info!("update: {} installed", r.version),
+                Err(e) => log::warn!("update failed: {e:#}"),
+            }
             st.lock().phase = match res {
                 Ok(()) => Phase::Ready,
                 Err(e) => Phase::Failed(format!("{e:#}")),
