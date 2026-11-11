@@ -59,7 +59,7 @@ def tree_hash(files):
     return h.hexdigest()[:12]
 
 
-def write_zip(out, files, store_ext=(".bin", ".dll", ".exe", ".zip")):
+def write_zip(out, files, store_ext=(".bin", ".zip")):
     """files: [(name in zip, path)], deterministic order and timestamps."""
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tmp = out + ".tmp"
