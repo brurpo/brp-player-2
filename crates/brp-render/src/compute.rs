@@ -355,6 +355,32 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
 
+    /// A compute pipeline of the caller's own (not a `Kernel`): `images` (storage,
+    /// GENERAL) as set 0, `sets` as sets 1.., no push constants; then a barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_raw(&mut self, pipeline: vk::Pipeline, layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, images: &[vk::ImageView], sets: &[vk::DescriptorSet], groups: [u32; 3]) -> Result<()> {
+        let device = &self.compute.ctx.device;
+        unsafe {
+            device.cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            let layouts = [set_layout];
+            let set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.desc_pool).set_layouts(&layouts))?[0];
+            let infos: Vec<[vk::DescriptorImageInfo; 1]> = images.iter().map(|v| [vk::DescriptorImageInfo::default().image_view(*v).image_layout(vk::ImageLayout::GENERAL)]).collect();
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(info))
+                .collect();
+            device.update_descriptor_sets(&writes, &[]);
+            let mut all = vec![set];
+            all.extend_from_slice(sets);
+            device.cmd_bind_descriptor_sets(self.cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &all, &[]);
+            device.cmd_dispatch(self.cb, groups[0].max(1), groups[1].max(1), groups[2].max(1));
+            self.barrier();
+        }
+        self.dispatches += 1;
+        Ok(())
+    }
+
     /// Workgroups covering `n` (x, y, z) items with `kernel`'s workgroup size.
     pub fn groups(kernel: &Kernel, n: [u32; 3]) -> [u32; 3] {
         [n[0].div_ceil(kernel.local[0]), n[1].div_ceil(kernel.local[1]), n[2].div_ceil(kernel.local[2])]

@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod color;
+mod color_ui;
 mod effects;
 mod export;
 mod export_ui;
@@ -183,6 +185,15 @@ impl App {
         let start_fullscreen = self.wins.is_empty() && std::env::args().any(|a| a == "--fullscreen");
         // BRP_TEST_FX_MENU: the "Add effect" list open (checking the layout).
         ui.fx_add_open = std::env::var_os("BRP_TEST_FX_MENU").is_some();
+        // BRP_TEST_OCIO=1: OpenColorIO on for this run (the setting is not saved).
+        if std::env::var_os("BRP_TEST_OCIO").is_some() {
+            ui.ocio.enabled = true;
+        }
+        // BRP_TEST_OCIO_CONFIG=<file>: that config of one's own for this run (not saved).
+        if let Some(c) = std::env::var_os("BRP_TEST_OCIO_CONFIG") {
+            ui.settings.ocio_custom = Some(c.to_string_lossy().into_owned());
+            ui.ocio.set_custom(Some(c.into()));
+        }
         // BRP_TEST_BATCH=a;b : these files in the batch queue (checking the layout);
         // BRP_TEST_BATCH_START=1 starts it.
         if let Some(list) = std::env::var_os("BRP_TEST_BATCH") {
@@ -196,7 +207,8 @@ impl App {
                 ui.export.select_first(n);
             }
             if std::env::var_os("BRP_TEST_BATCH_START").is_some() {
-                ui.export.batch.start(player.fx.all_stages(), player.deint_mode, player.field_rate);
+                let ocio = ui.ocio_job();
+                ui.export.batch.start(player.fx.all_stages(), player.deint_mode, player.field_rate, ocio);
             }
         }
         // --show=info,settings,fx : open these popups at start.
@@ -208,6 +220,7 @@ impl App {
                     "fx" | "effects" => ui.set_shown(ui::PopupKind::Effects, true),
                     "export" => ui.set_shown(ui::PopupKind::Export, true),
                     "batch" => ui.set_shown(ui::PopupKind::Batch, true),
+                    "color" | "ocio" => ui.set_shown(ui::PopupKind::Color, true),
                     _ => {}
                 }
             }
@@ -437,6 +450,14 @@ impl Win {
         for a in actions {
             match a {
                 Action::Open => self.open_dialog(),
+                Action::OcioLoadConfig => {
+                    let pick = rfd::FileDialog::new().set_parent(&*self.window).set_title("OpenColorIO config").add_filter("OCIO config", &["ocio"]).pick_file();
+                    if let Some(p) = pick {
+                        self.ui.settings.ocio_custom = Some(p.to_string_lossy().into_owned());
+                        self.ui.settings_dirty = true;
+                        self.ui.ocio.set_custom(Some(p));
+                    }
+                }
                 Action::SetLayer(name) => {
                     self.player.set_layer(&name);
                     self.window.request_redraw();
@@ -543,6 +564,16 @@ impl Win {
                 log::info!("test: all effects {}", if want { "off" } else { "on" });
             }
         }
+        // BRP_TEST_OCIO_TOGGLE=off_secs:on_secs : OpenColorIO off, then on again (as the
+        // Color panel's switch, not saved), that long after start.
+        if let Some((off, on)) = std::env::var("BRP_TEST_OCIO_TOGGLE").ok().and_then(|v| v.split_once(':').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))) {
+            let t = start.elapsed().as_secs_f64();
+            let want_on = !(t >= off && t < on);
+            if want_on != self.ui.ocio.enabled && (t < on || !self.ui.ocio.enabled) && t >= off {
+                self.ui.ocio.enabled = want_on;
+                log::info!("test: OCIO {}", if want_on { "on" } else { "off" });
+            }
+        }
         // BRP_TEST_EXR_LAYER=secs:name : show that EXR layer that long after start (as
         // picking it from the layer chip).
         if let Some((at, name)) = std::env::var("BRP_TEST_EXR_LAYER").ok().and_then(|v| v.split_once(':').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.to_string())))) {
@@ -590,6 +621,26 @@ impl Win {
         }
         let renderer = self.renderer.as_mut().unwrap();
         renderer.set_backdrop(!self.popups.is_empty());
+
+        // OpenColorIO as the display transform (DESIGN.md §7d): off, or the conversion for
+        // this file and screen once built.
+        self.ui.screen_hdr = renderer.hdr_screen().is_some();
+        if let Some(e) = renderer.ocio_error() {
+            self.ui.ocio.error = Some(e.to_string());
+        }
+        if !self.ui.ocio.enabled {
+            renderer.set_ocio(None);
+            // Off: what the window had is gone (on again, it is sent again).
+            self.ui.ocio.window_off();
+        } else {
+            let screen = if self.ui.screen_hdr { brp_ocio::auto::Screen::Hdr } else { brp_ocio::auto::Screen::Sdr };
+            if let Some(setup) = self.ui.ocio.update(&self.ui.settings, self.player.source.as_ref().map(|s| &s.info), screen) {
+                renderer.set_ocio(Some(setup));
+            }
+            if self.ui.ocio.busy() {
+                self.window.request_redraw();
+            }
+        }
 
         // Effect chain changes and background shader compiles.
         if self.player.fx.dirty {

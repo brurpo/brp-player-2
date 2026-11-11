@@ -43,6 +43,8 @@ pub enum Action {
     /// Batch: add files, pick the output folder.
     BatchAddFiles,
     BatchFolder,
+    /// OCIO: pick a config file of one's own.
+    OcioLoadConfig,
     /// EXR: show this layer (by name).
     SetLayer(String),
     /// Show a file in the system's file browser.
@@ -58,10 +60,12 @@ pub enum PopupKind {
     Effects,
     Export,
     Batch,
+    /// OpenColorIO (DESIGN.md §7d).
+    Color,
 }
 
 impl PopupKind {
-    pub const ALL: [PopupKind; 5] = [PopupKind::Info, PopupKind::Settings, PopupKind::Effects, PopupKind::Export, PopupKind::Batch];
+    pub const ALL: [PopupKind; 6] = [PopupKind::Info, PopupKind::Settings, PopupKind::Effects, PopupKind::Export, PopupKind::Batch, PopupKind::Color];
 
     pub fn title_key(self) -> &'static str {
         match self {
@@ -70,6 +74,7 @@ impl PopupKind {
             PopupKind::Effects => "effects",
             PopupKind::Export => "export",
             PopupKind::Batch => "batch",
+            PopupKind::Color => "color",
         }
     }
 
@@ -81,6 +86,7 @@ impl PopupKind {
             PopupKind::Effects => 420.0,
             PopupKind::Export => 440.0,
             PopupKind::Batch => 900.0,
+            PopupKind::Color => 460.0,
         }
     }
 }
@@ -107,11 +113,18 @@ enum TlDrag {
 pub struct UiState {
     pub lang: Lang,
     pub settings: Settings,
+    /// OpenColorIO: on or off, the Color panel's choices (DESIGN.md §7d).
+    pub ocio: crate::color::Ocio,
     /// Settings changed: save them.
     pub settings_dirty: bool,
     pub show_info: bool,
     pub show_settings: bool,
     pub show_fx: bool,
+    pub show_color: bool,
+    /// The Color panel's (or Settings') OCIO picker whose tree is open.
+    pub ocio_open: Option<String>,
+    /// The window is on an HDR screen (set each frame; OCIO's Auto display).
+    pub screen_hdr: bool,
     pub show_export: bool,
     pub show_batch: bool,
     /// Export and batch export (see `export_ui`).
@@ -155,11 +168,15 @@ impl UiState {
         let mut s = UiState {
             icons: Icons::load(ctx),
             lang: settings.lang,
+            ocio: crate::color::Ocio::new(&settings),
             settings,
             settings_dirty: false,
             show_info: false,
             show_settings: false,
             show_fx: false,
+            show_color: false,
+            ocio_open: None,
+            screen_hdr: false,
             show_export: false,
             show_batch: false,
             export: Default::default(),
@@ -215,6 +232,7 @@ impl UiState {
             PopupKind::Effects => self.show_fx,
             PopupKind::Export => self.show_export,
             PopupKind::Batch => self.show_batch,
+            PopupKind::Color => self.show_color,
         }
     }
 
@@ -227,7 +245,7 @@ impl UiState {
                 }
                 PopupKind::Effects => self.fx_library = crate::effects::library(),
                 PopupKind::Export | PopupKind::Batch => crate::export::probe_hardware(),
-                PopupKind::Info => {}
+                PopupKind::Info | PopupKind::Color => {}
             }
         }
         match k {
@@ -236,6 +254,7 @@ impl UiState {
             PopupKind::Effects => self.show_fx = on,
             PopupKind::Export => self.show_export = on,
             PopupKind::Batch => self.show_batch = on,
+            PopupKind::Color => self.show_color = on,
         }
     }
 
@@ -453,7 +472,7 @@ fn cache_bar(painter: &egui::Painter, track: Rect, frames: &[i64], span: &dyn Fn
 }
 
 /// A small on/off switch (pill with a knob). Flips `on` when clicked.
-fn on_off_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+pub(crate) fn on_off_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let (rect, mut resp) = ui.allocate_exact_size(vec2(38.0, 20.0), Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -474,6 +493,13 @@ fn painted_button(ui: &mut egui::Ui, tip: &str, active: bool, paint: fn(&egui::P
     let (rect, resp, color) = button_frame(ui, tip, active);
     paint(ui.painter(), rect.center(), color);
     resp
+}
+
+/// Color: three overlapping circles.
+fn paint_color_icon(p: &egui::Painter, c: Pos2, color: Color32) {
+    for (dx, dy) in [(-3.2, -2.0), (3.2, -2.0), (0.0, 3.4)] {
+        p.circle_stroke(c + vec2(dx, dy), 5.0, Stroke::new(1.5, color));
+    }
 }
 
 /// Info: an "i" in a circle.
@@ -899,6 +925,9 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState) -> Vec<Action>
                         ring(ui, &r, ef);
                         if r.clicked() {
                             s.toggle(PopupKind::Export);
+                        }
+                        if painted_button(ui, l.t("color_tip"), s.show_color || s.ocio.enabled, paint_color_icon).clicked() {
+                            s.toggle(PopupKind::Color);
                         }
                         let fx_on = p.fx.any_enabled();
                         if painted_button(ui, l.t("effects"), s.show_fx || fx_on, paint_effects_icon).clicked() {
@@ -1846,6 +1875,7 @@ fn popup_contents(ui: &mut egui::Ui, k: PopupKind, p: &mut Player, s: &mut UiSta
         PopupKind::Effects => effects_contents(ui, p, s, actions),
         PopupKind::Export => crate::export_ui::export_contents(ui, p, s, actions),
         PopupKind::Batch => crate::export_ui::batch_contents(ui, p, s, actions),
+        PopupKind::Color => crate::color_ui::color_contents(ui, p, s, actions),
     }
 }
 
@@ -1934,6 +1964,9 @@ fn settings_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions
         });
         ui.end_row();
     });
+    ui.add_space(6.0);
+
+    crate::color_ui::settings_section(ui, s);
     ui.add_space(6.0);
 
     section(ui, l.t("sec_devices"));
@@ -2620,5 +2653,16 @@ fn add_effect_list(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions: 
     if let Some(k) = add_ai {
         p.fx.add_ai(k);
         s.fx_add_open = false;
+    }
+}
+
+impl UiState {
+    /// What an export takes of OpenColorIO (None: off, or its configs not loaded yet).
+    pub fn ocio_job(&self) -> Option<crate::export::OcioJob> {
+        if !self.ocio.enabled {
+            return None;
+        }
+        let lib = self.ocio.loaded()?;
+        Some(crate::export::OcioJob { lib, choices: self.ocio.choices(), settings: self.settings.clone() })
     }
 }

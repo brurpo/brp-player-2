@@ -25,10 +25,15 @@ pub fn compile_glsl(glsl: &str, name: &str) -> Result<Vec<u32>> {
 }
 
 fn compile_now(glsl: &str, name: &str) -> Result<Vec<u32>> {
-    COMPILER.with(|c| compile_with(c, glsl, name))
+    COMPILER.with(|c| compile_with(c, glsl, name, shaderc::ShaderKind::Compute))
 }
 
-fn compile_with(c: &shaderc::Compiler, glsl: &str, name: &str) -> Result<Vec<u32>> {
+/// A fragment shader, GLSL -> SPIR-V (cached like `compile_glsl`).
+pub fn compile_fragment(glsl: &str, name: &str) -> Result<Vec<u32>> {
+    crate::shader_cache::spirv(glsl, "fragment vulkan1.3 performance", || COMPILER.with(|c| compile_with(c, glsl, name, shaderc::ShaderKind::Fragment)))
+}
+
+fn compile_with(c: &shaderc::Compiler, glsl: &str, name: &str, kind: shaderc::ShaderKind) -> Result<Vec<u32>> {
     let mut opts = shaderc::CompileOptions::new().map_err(|e| anyhow!("shaderc options: {e}"))?;
     opts.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
     // Sources marked "// spirv: no-opt" skip spirv-opt: on fully unrolled code (the
@@ -37,7 +42,7 @@ fn compile_with(c: &shaderc::Compiler, glsl: &str, name: &str) -> Result<Vec<u32
     let level = if glsl.contains(NO_OPT) { shaderc::OptimizationLevel::Zero } else { shaderc::OptimizationLevel::Performance };
     opts.set_optimization_level(level);
     let art = c
-        .compile_into_spirv(glsl, shaderc::ShaderKind::Compute, name, "main", Some(&opts))
+        .compile_into_spirv(glsl, kind, name, "main", Some(&opts))
         .map_err(|e| anyhow!("{e}"))?;
     Ok(art.as_binary().to_vec())
 }

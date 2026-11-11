@@ -882,7 +882,21 @@ pub struct ExportJob {
     pub deint: DeintChoice,
     /// EXR: the layer to export (by name; None: the default one).
     pub layer: Option<String>,
+    /// OpenColorIO on: the export goes through OCIO's output for its format (DESIGN.md §7d).
+    pub ocio: Option<OcioJob>,
 }
+
+/// What an export needs of OCIO: the configs, the Color panel's choices, and the
+/// settings their "(Default)"s come from.
+#[derive(Clone)]
+pub struct OcioJob {
+    pub lib: Arc<brp_ocio::Library>,
+    pub choices: crate::color::OcioChoices,
+    pub settings: crate::settings::Settings,
+}
+
+/// Codecs that write still images (sRGB with OCIO's Auto output).
+const IMAGE_CODECS: &[&str] = &["png", "jpeg", "tiff", "gif", "webp", "bmp", "tga", "qoi"];
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum State {
@@ -1157,6 +1171,8 @@ pub struct Plan {
     /// Encoded on the GPU by our encoder (`encoder` is then one of `GPU_ENCODERS`).
     pub gpu: Option<brp_ai::gpuenc::Codec>,
     pub precoded: Option<encode::Precoded>,
+    /// OpenColorIO's output transform, when on.
+    pub ocio: Option<crate::color::ExportOcio>,
     /// The output size the codec requires (DNxHD).
     pub force_size: Option<(u32, u32)>,
 }
@@ -1190,7 +1206,28 @@ fn plan(job: &ExportJob, src: &Source, deint: Option<SourceDeint>, gpu_name: &st
     let alpha = s.alpha && s.alpha_possible();
     // HDR sources stay HDR when asked and the codec can hold it (10 bits or more);
     // otherwise they are tone mapped to SDR.
-    let keep_hdr = info.color.is_hdr() && !s.tonemap && s.hdr_possible();
+    // OpenColorIO (DESIGN.md §7d): the output is OCIO's for this format: linear for EXR,
+    // sRGB for still images, PQ/HLG for HDR kept HDR, Rec.709 for other video.
+    let ocio = match &job.ocio {
+        Some(o) => {
+            use brp_ocio::auto::Output;
+            let kind = if s.codec == "exr" {
+                Output::Linear
+            } else if IMAGE_CODECS.contains(&s.codec.as_str()) {
+                Output::Image
+            } else if info.color.is_hdr() && !s.tonemap && s.hdr_possible() {
+                if info.color.transfer == Transfer::Hlg { Output::Hlg } else { Output::Pq }
+            } else {
+                Output::SdrVideo
+            };
+            Some(crate::color::export_ocio(&o.lib, &o.choices, &o.settings, info, kind).map_err(crate::color::friendly)?)
+        }
+        None => None,
+    };
+    let keep_hdr = match &ocio {
+        Some(o) => matches!(o.encoding, brp_ocio::auto::Encoding::Pq | brp_ocio::auto::Encoding::Hlg) && s.hdr_possible(),
+        None => info.color.is_hdr() && !s.tonemap && s.hdr_possible(),
+    };
     let mut options: Vec<(String, String)> = fam.map(|f| f.options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()).unwrap_or_default();
     let mut profile = s.profile.clone();
     // Pixel format: chosen, or the codec's (alpha variant when asked), mapped onto
@@ -1337,7 +1374,17 @@ fn plan(job: &ExportJob, src: &Source, deint: Option<SourceDeint>, gpu_name: &st
     let src_c = info.color;
     let float_out = encoder == "exr";
     let sdr = ColorInfo { matrix: Matrix::Bt709, full_range: false, transfer: Transfer::Sdr, primaries: Primaries::Bt709 };
-    let (conv, mut color) = if float_out {
+    let (conv, mut color) = if let Some(o) = &ocio {
+        // OCIO made the output's encoding: tag the file with it.
+        use brp_ocio::auto::Encoding;
+        let c = match o.encoding {
+            Encoding::Pq => ColorInfo { matrix: Matrix::Bt2020Ncl, full_range: false, transfer: Transfer::Pq, primaries: Primaries::Bt2020 },
+            Encoding::Hlg => ColorInfo { matrix: Matrix::Bt2020Ncl, full_range: false, transfer: Transfer::Hlg, primaries: Primaries::Bt2020 },
+            Encoding::Linear => ColorInfo { matrix: Matrix::Rgb, full_range: true, transfer: Transfer::Linear, primaries: Primaries::Bt709 },
+            Encoding::Sdr => sdr,
+        };
+        (ColorConv::None, c)
+    } else if float_out {
         let conv = if src_c.transfer == Transfer::Linear { ColorConv::None } else { ColorConv::ToLinear { from: src_c.transfer, bt2020: src_c.primaries == Primaries::Bt2020 } };
         (conv, ColorInfo { transfer: Transfer::Linear, primaries: if src_c.is_hdr() { Primaries::Bt709 } else { src_c.primaries }, ..src_c })
     } else if src_c.is_hdr() && !keep_hdr {
@@ -1367,7 +1414,7 @@ fn plan(job: &ExportJob, src: &Source, deint: Option<SourceDeint>, gpu_name: &st
     let align = (a.max(sub.0), if s.codec == "cfhd" { sub.1 } else { a.max(sub.1) });
     let field_order = interlaced.then_some(s.tff);
     let (gpu, precoded) = if is_ours(&encoder) { gpu_codec(&encoder, &profile, &pix, &color, field_order, alpha)? } else { (None, None) };
-    Ok(Plan { encoder, pix_fmt: pix, filter, rate, subs, slow, total, range, align, alpha, conv, color, options, rate_control, muxer: c.muxer, path, sequence, conform, picture_rate, field_order, gpu, precoded, force_size })
+    Ok(Plan { encoder, pix_fmt: pix, filter, rate, subs, slow, total, range, align, alpha, conv, color, options, rate_control, muxer: c.muxer, path, sequence, conform, picture_rate, field_order, gpu, precoded, force_size, ocio })
 }
 
 /// Our GPU encoder's settings for a plan, and what the muxer needs to know.
@@ -1555,6 +1602,11 @@ fn run(job: &ExportJob, ctx: &Arc<GpuContext>, progress: &Mutex<Progress>, cance
     let reach = ai::Reach::of(&stages, deint.is_some());
     let (back, fwd) = reach.frames();
     let mut worker = Worker::default();
+    // OpenColorIO's output transform on the GPU, when on.
+    let ocio = p.ocio.as_ref().map(|o| brp_render::OcioCompute::new(ctx, &o.shader)).transpose()?;
+    if let Some(o) = &p.ocio {
+        log::info!("export: OCIO {}", o.label);
+    }
     let tm = Timing::new(&src, &p, &job.stack, back, fwd);
     let (in_f, out_f) = p.range;
     let first_tick = tm.first_tick;
@@ -1598,7 +1650,7 @@ fn run(job: &ExportJob, ctx: &Arc<GpuContext>, progress: &Mutex<Progress>, cance
         };
         let job_i = job_for(tick, fr);
         let mut made: Option<(Geometry, PackLayout)> = None;
-        let bytes = worker.export(&job_i, &samples, &mut |(w, h, _c)| {
+        let bytes = worker.export(&job_i, &samples, ocio.as_ref(), &mut |(w, h, _c)| {
             let (g, l) = match &geom {
                 Some((g, l)) => (*g, l.clone()),
                 None => {
@@ -1772,6 +1824,8 @@ pub struct Batch {
     next_id: u64,
     /// Stack and deinterlacing the queue was started with.
     snapshot: Option<(Vec<Stage>, DeintMode, bool)>,
+    /// OpenColorIO the queue was started with (None: off).
+    ocio: Option<OcioJob>,
 }
 
 impl Batch {
@@ -1788,7 +1842,8 @@ impl Batch {
 
     /// Start (or resume) the queue: each file with its own settings, through this
     /// effect stack.
-    pub fn start(&mut self, stack: Vec<Stage>, mode: DeintMode, field_rate: bool) {
+    pub fn start(&mut self, stack: Vec<Stage>, mode: DeintMode, field_rate: bool, ocio: Option<OcioJob>) {
+        self.ocio = ocio;
         for it in &mut self.items {
             if matches!(it.state, ItemState::Cancelled) {
                 it.state = ItemState::Waiting;
@@ -1850,7 +1905,7 @@ impl Batch {
         it.output = Some(output.clone());
         it.state = ItemState::Running;
         it.progress = 0.0;
-        let job = ExportJob { input: it.path.clone(), output, settings: s, stack, range: None, deint: DeintChoice::Detect { mode, field_rate }, layer: None };
+        let job = ExportJob { input: it.path.clone(), output, settings: s, stack, range: None, deint: DeintChoice::Detect { mode, field_rate }, layer: None, ocio: self.ocio.clone() };
         self.running = Some((next, start(job, ctx.clone())));
         true
     }
@@ -2063,7 +2118,7 @@ fn cli_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) -> 
         eprintln!("  {:?} {}/{} ({:.0}%), {:.1} fps{eta}", p.state, p.done, p.total, p.fraction() * 100.0, p.fps);
     };
     if let Some(out) = get("export") {
-        let job = ExportJob { input: inputs[0].clone(), output: out, settings, stack, range, deint: DeintChoice::Detect { mode, field_rate }, layer: get("layer") };
+        let job = ExportJob { input: inputs[0].clone(), output: out, settings, stack, range, deint: DeintChoice::Detect { mode, field_rate }, layer: get("layer"), ocio: ocio_from_args(args) };
         let r = start(job, ctx.clone());
         let mut last = Instant::now();
         // BRP_TEST_CANCEL_AFTER=secs: cancel then (checks that a cancelled export leaves no file).
@@ -2095,7 +2150,7 @@ fn cli_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) -> 
     for i in inputs {
         b.add(i);
     }
-    b.start(stack, mode, field_rate);
+    b.start(stack, mode, field_rate, ocio_from_args(args));
     let mut last = Instant::now();
     while b.poll(Some(&ctx)) {
         std::thread::sleep(Duration::from_millis(50));
@@ -2173,7 +2228,7 @@ fn verify_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) 
     };
     src.set_cache_limit(1 << 30);
     let deint = detect_deint(&src, mode, field_rate, &never);
-    let job = ExportJob { input: input.clone(), output: exported.clone(), settings: settings.clone(), stack: stack.clone(), range, deint: DeintChoice::Fixed(deint), layer };
+    let job = ExportJob { input: input.clone(), output: exported.clone(), settings: settings.clone(), stack: stack.clone(), range, deint: DeintChoice::Fixed(deint), layer, ocio: ocio_from_args(args) };
     let p = plan(&job, &src, deint, &ctx.device_name)?;
     let out_path = if p.sequence { sequence_pattern(&exported) } else { exported.clone() };
     let out = open_indexed(&out_path)?;
@@ -2255,6 +2310,16 @@ fn verify_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) 
         // (linear EXR to gamma 2.2, SDR to linear EXR), as `pack.rs` does.
         let mut r = r;
         let n = r.w * r.h;
+        // OCIO: the same conversion, on the CPU (checks the GPU's shader too).
+        if let Some(o) = &p.ocio {
+            let mut px: Vec<f32> = (0..n).flat_map(|k| [r.data[k], r.data[n + k], r.data[2 * n + k]]).collect();
+            o.cpu.apply(&mut px);
+            for k in 0..n {
+                for c in 0..3 {
+                    r.data[c * n + k] = px[k * 3 + c];
+                }
+            }
+        }
         match p.conv {
             ColorConv::LinearToGamma => r.data[..3 * n].iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0).powf(1.0 / 2.2)),
             ColorConv::ToLinear { from: Transfer::Sdr, .. } => r.data[..3 * n].iter_mut().for_each(|v| *v = v.max(0.0).powf(2.4)),
@@ -2433,4 +2498,33 @@ mod batch_tests {
         b.apply_panel(&none, &one);
         assert!(b.items[1].settings.interlaced);
     }
+}
+
+/// Command line: `--ocio` turns OpenColorIO on (each choice the settings' default, else
+/// Auto); `--ocio-input=<id>`, `--ocio-display=<id>`, `--ocio-view=<name>`,
+/// `--ocio-output=display:<id>|space:<id>` pick one; `--ocio-config=<file>` adds a config of one's own (ids as "maya:ACEScg", "ocio:ACEScg").
+fn ocio_from_args(args: &[String]) -> Option<OcioJob> {
+    use crate::color::Pick;
+    let get = |k: &str| args.iter().find_map(|a| a.strip_prefix(&format!("--{k}=")).map(str::to_string));
+    if !args.iter().any(|a| a == "--ocio" || a.starts_with("--ocio-")) {
+        return None;
+    }
+    let settings = crate::settings::Settings::load();
+    // The user's config: --ocio-config=<file>, else the one set in the player.
+    let custom = get("ocio-config").or(settings.ocio_custom.clone()).map(std::path::PathBuf::from);
+    let lib = Arc::new(brp_ocio::Library::load(&crate::color::config_dir(), custom.as_deref()));
+    let mut ch = crate::color::Ocio::new(&settings).choices();
+    if let Some(e) = get("ocio-input").and_then(|v| brp_ocio::Entry::from_id(&v)) {
+        ch.input = Pick::Manual(e);
+    }
+    if let Some(e) = get("ocio-display").and_then(|v| brp_ocio::Entry::from_id(&v)) {
+        ch.display = Pick::Manual(e);
+    }
+    if let Some(v) = get("ocio-view") {
+        ch.view = Pick::Manual(v);
+    }
+    if let Some(t) = get("ocio-output").and_then(|v| crate::color::output_from_id(&v)) {
+        ch.output = Pick::Manual(t);
+    }
+    Some(OcioJob { lib, choices: ch, settings })
 }

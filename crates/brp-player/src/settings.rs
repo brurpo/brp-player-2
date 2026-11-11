@@ -44,6 +44,16 @@ pub struct Settings {
     pub batch_effects: bool,
     /// Settings new batch files get.
     pub batch_defaults: Option<Value>,
+    /// OpenColorIO (DESIGN.md §7d): on or off (off unless turned on), and the defaults
+    /// the Color panel's "(Default)" choices use: entry ids ("maya:ACEScg"), a view name,
+    /// and the output as "display:<id>" or "space:<id>". None: no default (Auto).
+    pub ocio_enabled: bool,
+    pub ocio_input: Option<String>,
+    pub ocio_display: Option<String>,
+    pub ocio_view: Option<String>,
+    pub ocio_output: Option<String>,
+    /// A config file of the user's own (its entries say "(custom)").
+    pub ocio_custom: Option<String>,
 }
 
 impl Default for Settings {
@@ -66,6 +76,12 @@ impl Default for Settings {
             batch_preset: None,
             batch_effects: true,
             batch_defaults: None,
+            ocio_enabled: false,
+            ocio_input: None,
+            ocio_display: None,
+            ocio_view: None,
+            ocio_output: None,
+            ocio_custom: None,
         }
     }
 }
@@ -128,6 +144,12 @@ impl Settings {
             batch_preset: s("batch_preset"),
             batch_effects: b("batch_effects", true),
             batch_defaults: v.get("batch_defaults").cloned().filter(|x| x.is_object()),
+            ocio_enabled: b("ocio_enabled", false),
+            ocio_input: s("ocio_input"),
+            ocio_display: s("ocio_display"),
+            ocio_view: s("ocio_view"),
+            ocio_output: s("ocio_output"),
+            ocio_custom: s("ocio_custom"),
         }
     }
 
@@ -150,6 +172,12 @@ impl Settings {
             "batch_preset": self.batch_preset,
             "batch_effects": self.batch_effects,
             "batch_defaults": self.batch_defaults,
+            "ocio_enabled": self.ocio_enabled,
+            "ocio_input": self.ocio_input,
+            "ocio_display": self.ocio_display,
+            "ocio_view": self.ocio_view,
+            "ocio_output": self.ocio_output,
+            "ocio_custom": self.ocio_custom,
         });
         let p = path();
         if let Some(d) = p.parent() {

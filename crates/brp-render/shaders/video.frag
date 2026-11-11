@@ -8,6 +8,7 @@
 //          bit 1 = HDR output: write linear light, Rec.2020, 1.0 = SDR white, for
 //          the HDR composite (DESIGN.md §7b); m0.w = SDR white (nits), m1.w = the
 //          screen's peak (nits)
+//          bit 2 = raw output for OCIO (DESIGN.md §7d)
 
 layout(set = 0, binding = 0) uniform sampler2D t0;
 layout(set = 0, binding = 1) uniform sampler2D t1;
@@ -127,6 +128,12 @@ void main() {
         if (pc.swz.w >= 0) alpha = s[pc.swz.w];
     }
 
+    // OCIO (bit 2): the picture as decoded, in the file's own encoding, for the OCIO
+    // pass (alpha in a; the background is cleared to a = -1).
+    if ((pc.mode.w & 4) != 0) {
+        o_color = vec4(rgb, pc.mode.z == 1 ? clamp(alpha, 0.0, 1.0) : 1.0);
+        return;
+    }
     if ((pc.mode.w & 2) != 0) {
         o_color = vec4(hdr_out(rgb, alpha), 1.0);
         return;

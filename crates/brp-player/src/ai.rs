@@ -1327,13 +1327,30 @@ impl Worker {
     /// encoder. The same stages and caches as playback, so it matches the viewer.
     /// With two samples (interlaced output) they are the two fields' moments, in time
     /// order, woven into one frame.
-    pub(crate) fn export(&mut self, job: &Job, samples: &[Sample], spec: &mut dyn FnMut((usize, usize, usize)) -> anyhow::Result<brp_ai::pack::OutputSpec>) -> anyhow::Result<Vec<u8>> {
+    /// `ocio`: OpenColorIO's output transform, applied to each picture before it is
+    /// packed (DESIGN.md §7d).
+    pub(crate) fn export(&mut self, job: &Job, samples: &[Sample], ocio: Option<&Arc<brp_render::OcioCompute>>, spec: &mut dyn FnMut((usize, usize, usize)) -> anyhow::Result<brp_ai::pack::OutputSpec>) -> anyhow::Result<Vec<u8>> {
         let mut total = 0;
         self.run(job, |w, rec| {
             rec.label = format!("export {}:{}", job.pos.0, job.pos.1);
             let mut ts = Vec::with_capacity(samples.len());
             for s in samples {
-                ts.push(w.sample(rec, job, *s)?);
+                let t = w.sample(rec, job, *s)?;
+                let t = match ocio {
+                    Some(o) => {
+                        let gpu = w.gpu();
+                        let pic = gpu.tm.to_picture(rec, &t)?;
+                        let out = Picture::new(&gpu.compute, rec, t.w as u32, t.h as u32, t.c > 3)?;
+                        rec.keep(pic.clone());
+                        rec.keep(out.clone());
+                        o.record(rec, pic.view, out.view, t.w as u32, t.h as u32)?;
+                        let back = gpu.tm.from_image(rec, out.view, t.w, t.h, t.c)?;
+                        w.put(rec, t);
+                        back
+                    }
+                    None => t,
+                };
+                ts.push(t);
             }
             let s = spec((ts[0].w, ts[0].h, ts[0].c))?;
             if w.packer.is_none() {

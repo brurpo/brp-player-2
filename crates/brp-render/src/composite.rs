@@ -8,7 +8,7 @@ use crate::video::SCENE_FORMAT;
 use anyhow::Result;
 use ash::vk;
 
-const VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
+pub(crate) const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.frag.spv"));
 
 /// The layers, sized to the window (made again when it changes size).
@@ -75,7 +75,7 @@ impl CompositePass {
                 let words = ash::util::read_spv(&mut std::io::Cursor::new(code)).expect("spirv");
                 device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
             };
-            let (vs, fs) = (module(VERT)?, module(FRAG)?);
+            let (vs, fs) = (module(VERT_SPV)?, module(FRAG)?);
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(vs).name(c"main"),
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(fs).name(c"main"),

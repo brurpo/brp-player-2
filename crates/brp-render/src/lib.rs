@@ -10,6 +10,7 @@ mod frames;
 pub mod hdr;
 mod gpu;
 mod nnedi;
+pub mod ocio;
 pub mod offline;
 pub mod compute;
 pub mod offline_fx;
@@ -35,11 +36,31 @@ use effects::EffectChain;
 pub use effects::{EffectSpec, EffectStatus};
 pub use usershader::Transfer;
 pub use workspace::Space;
+pub use ocio::{OcioCompute, OcioShader, OcioTexture};
 use frames::FrameCache;
 use gpu::{Graveyard, Staging};
 use video::VideoPass;
 
 const FRAMES_IN_FLIGHT: usize = 2;
+
+/// OpenColorIO as the window's display transform (DESIGN.md §7d): the conversion from
+/// the file's colour space through the display and view, as GLSL from OpenColorIO.
+#[derive(Clone)]
+pub struct OcioSetup {
+    /// To the display's code values (SDR screens).
+    pub direct: ocio::OcioShader,
+    /// On to display-referred CIE-XYZ D65 (HDR screens: the window encodes HDR10).
+    pub xyz: ocio::OcioShader,
+    /// The display is HDR (PQ, HLG): its XYZ has 1.0 = 100 nits, not SDR white.
+    pub hdr_display: bool,
+    /// Identity of the conversion (a new one rebuilds the pass).
+    pub key: u64,
+}
+
+struct OcioState {
+    setup: OcioSetup,
+    pass: Option<ocio::OcioPass>,
+}
 
 /// What to draw for the video this frame.
 pub struct VideoDraw<'a> {
@@ -134,6 +155,9 @@ pub struct Renderer {
     layers: Option<composite::Layers>,
     /// The swapchain's format (`format` is the SDR one the UI is drawn in).
     swap_format: vk::Format,
+    /// OpenColorIO as the display transform (DESIGN.md §7d), when on.
+    ocio: Option<OcioState>,
+    ocio_error: Option<String>,
     ctx: Arc<GpuContext>,
 }
 
@@ -265,6 +289,8 @@ impl Renderer {
                 composite,
                 layers: None,
                 swap_format: format,
+                ocio: None,
+                ocio_error: None,
                 ctx,
             };
             let fp = ctx_props_features(&r.ctx, format);
@@ -279,6 +305,28 @@ impl Renderer {
             log::debug!("renderer: swapchain {:?}", ts.elapsed());
             Ok(r)
         }
+    }
+
+    /// OpenColorIO as the display transform (None: off, the built-in one). A new
+    /// conversion rebuilds the swapchain's passes (DESIGN.md §7d).
+    pub fn set_ocio(&mut self, setup: Option<OcioSetup>) {
+        if self.ocio.as_ref().map(|o| o.setup.key) == setup.as_ref().map(|s| s.key) {
+            return;
+        }
+        log::info!("OCIO in the window: {}", if setup.is_some() { "on" } else { "off" });
+        self.ocio = setup.map(|setup| OcioState { setup, pass: None });
+        self.ocio_error = None;
+        self.needs_rebuild = true;
+    }
+
+    /// Why OCIO cannot be shown, if so.
+    pub fn ocio_error(&self) -> Option<&str> {
+        self.ocio_error.as_deref()
+    }
+
+    /// The window is HDR (an HDR10 swapchain on an HDR screen).
+    pub fn hdr_screen(&self) -> Option<hdr::HdrScreen> {
+        self.hdr.filter(|_| self.hdr10_format.is_some())
     }
 
     /// Integrated GPU (shared memory with the CPU, usually much slower).
@@ -537,17 +585,24 @@ impl Renderer {
             for img in [scene.0, ui.0] {
                 gpu::image_barrier(&device, cb, img, (S::FRAGMENT_SHADER, A::NONE, L::UNDEFINED), (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::COLOR_ATTACHMENT_OPTIMAL));
             }
-            // Scene: the background (the clear colour as light) and the video.
+            // Scene: the background (the clear colour as light) and the video. With OCIO:
+            // the video as decoded (raw), the background marked with alpha -1.
+            let ocio = self.ocio.as_ref().and_then(|o| o.pass.as_ref()).is_some();
             let srgb = |e: f32| if e <= 0.04045 { e / 12.92 } else { ((e + 0.055) / 1.055).powf(2.4) };
             let c = self.clear_color;
-            let a = attach(scene.1, vk::AttachmentLoadOp::CLEAR, [srgb(c[0]), srgb(c[1]), srgb(c[2]), 1.0]);
+            let clear = if ocio { [0.0, 0.0, 0.0, -1.0] } else { [srgb(c[0]), srgb(c[1]), srgb(c[2]), 1.0] };
+            let a = attach(scene.1, vk::AttachmentLoadOp::CLEAR, clear);
             device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&a));
             device.cmd_set_viewport(cb, 0, &[viewport]);
             device.cmd_set_scissor(cb, 0, &[area]);
             if let Some(mut push) = video_push {
-                push.mode[3] |= 2;
-                push.m[0][3] = screen.sdr_nits;
-                push.m[1][3] = screen.peak_nits;
+                if ocio {
+                    push.mode[3] |= 4;
+                } else {
+                    push.mode[3] |= 2;
+                    push.m[0][3] = screen.sdr_nits;
+                    push.m[1][3] = screen.peak_nits;
+                }
                 self.video.as_ref().unwrap().draw(cb, fi, &push, true);
             }
             device.cmd_end_rendering(cb);
@@ -561,16 +616,27 @@ impl Renderer {
             for img in [scene.0, ui.0] {
                 gpu::image_barrier(&device, cb, img, (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::COLOR_ATTACHMENT_OPTIMAL), (S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::SHADER_READ_ONLY_OPTIMAL));
             }
-            let comp = self.composite.as_ref().unwrap();
-            comp.bind(fi, self.layers.as_ref().unwrap());
-            // Into the swapchain image, as HDR10.
+            // OCIO's light per unit of display-referred XYZ (HDR displays: 100 nits).
+            let (ocio_scale, ocio_xyz) = self.ocio.as_ref().map_or((1.0, false), |o| (if o.setup.hdr_display { 100.0 / screen.sdr_nits } else { 1.0 }, o.pass.as_ref().is_some_and(|p| p.xyz)));
+            let hdr_swap = self.swap_format != self.format;
+            match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+                Some(p) => p.bind(fi, self.layers.as_ref().unwrap()),
+                None => self.composite.as_ref().unwrap().bind(fi, self.layers.as_ref().unwrap()),
+            }
+            // Into the swapchain image (HDR10 on an HDR screen).
             let image = self.images[image_index];
             gpu::image_barrier(&device, cb, image, (S::COLOR_ATTACHMENT_OUTPUT, A::NONE, L::UNDEFINED), (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::COLOR_ATTACHMENT_OPTIMAL));
             let a = attach(self.views[image_index], vk::AttachmentLoadOp::DONT_CARE, [0.0; 4]);
             device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&a));
             device.cmd_set_viewport(cb, 0, &[viewport]);
             device.cmd_set_scissor(cb, 0, &[area]);
-            comp.draw(cb, fi, self.swap_format, false, screen.sdr_nits);
+            match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+                Some(p) => {
+                    let out = if !ocio_xyz { ocio::OcioOut::Direct } else if hdr_swap { ocio::OcioOut::Hdr10 } else { ocio::OcioOut::SdrFromXyz };
+                    p.draw(cb, fi, self.swap_format, out, screen.sdr_nits, ocio_scale, 12.0, self.clear_color);
+                }
+                None => self.composite.as_ref().unwrap().draw(cb, fi, self.swap_format, false, screen.sdr_nits),
+            }
             device.cmd_end_rendering(cb);
 
             // Popups' glass: an SDR picture of the window (as it would be on an SDR screen).
@@ -589,7 +655,13 @@ impl Renderer {
                 device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&a));
                 device.cmd_set_viewport(cb, 0, &[viewport]);
                 device.cmd_set_scissor(cb, 0, &[area]);
-                self.composite.as_ref().unwrap().draw(cb, fi, self.format, true, screen.sdr_nits);
+                match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+                    Some(p) => {
+                        let out = if ocio_xyz { ocio::OcioOut::SdrFromXyz } else { ocio::OcioOut::Direct };
+                        p.draw(cb, fi, self.format, out, screen.sdr_nits, ocio_scale, 12.0, self.clear_color);
+                    }
+                    None => self.composite.as_ref().unwrap().draw(cb, fi, self.format, true, screen.sdr_nits),
+                }
                 device.cmd_end_rendering(cb);
                 gpu::image_barrier(&device, cb, simg, (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::COLOR_ATTACHMENT_OPTIMAL), (S::BLIT, A::TRANSFER_READ, L::TRANSFER_SRC_OPTIMAL));
                 self.backdrop_imgs.as_ref().unwrap().capture(&device, cb, simg, self.extent);
@@ -869,7 +941,24 @@ impl Renderer {
             if extent.width == 0 || extent.height == 0 {
                 return Ok(());
             }
-            if hdr10.is_some() {
+            // OCIO: its pass for this swapchain (code values on SDR, XYZ on HDR screens).
+            let swap_format = self.swap_format;
+            let format = self.format;
+            if let Some(o) = self.ocio.as_mut() {
+                o.pass = None;
+                let xyz = hdr10.is_some();
+                match ocio::OcioPass::new(&self.ctx, if xyz { &o.setup.xyz } else { &o.setup.direct }, xyz, &[swap_format, format], FRAMES_IN_FLIGHT) {
+                    Ok(p) => {
+                        o.pass = Some(p);
+                        self.ocio_error = None;
+                    }
+                    Err(e) => {
+                        log::error!("OCIO pass: {e:#}");
+                        self.ocio_error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+            if hdr10.is_some() || self.ocio.as_ref().is_some_and(|o| o.pass.is_some()) {
                 self.layers = Some(composite::Layers::new(device, &self.ctx.allocator, self.format, extent.width, extent.height)?);
             }
             let mut count = caps.min_image_count + 1;
@@ -939,6 +1028,7 @@ impl Drop for Renderer {
             self.deint = None;
             self.effects = None;
             self.composite = None;
+            self.ocio = None;
             if let Some(l) = self.layers.take() {
                 l.destroy(&self.ctx.device, &self.ctx.allocator);
             }

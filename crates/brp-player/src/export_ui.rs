@@ -691,6 +691,7 @@ pub fn export_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actio
     const W: f32 = 236.0;
     s.export.load(&s.settings);
     export::probe_hardware();
+    let ocio_job = s.ocio_job();
     let Some(src_path) = p.source.as_ref().map(|s| s.info.path.clone()) else {
         ui.label(RichText::new(l.t("no_file")).weak());
         return;
@@ -774,6 +775,7 @@ pub fn export_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actio
                 range: (e.use_range && p.has_range()).then(|| (p.in_point, p.out_frame())),
                 deint: export::DeintChoice::Fixed(p.ai_source_deint()),
                 layer: p.source.as_ref().and_then(|s| s.info.layers.get(s.info.layer).map(|(n, _)| n.clone())),
+                ocio: ocio_job.clone(),
             };
             e.last = None;
             e.running = Some(export::start(job, p.ai.ctx.clone().unwrap()));
@@ -810,6 +812,7 @@ pub fn batch_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, action
     s.export.load(&s.settings);
     export::probe_hardware();
     let presets = all_presets(&s.export);
+    let ocio_job = s.ocio_job();
     let UiState { export: e, settings: cfg, settings_dirty: dirty, .. } = s;
     let busy = e.batch.active || e.batch.running().is_some();
     let items = &e.batch.items;
@@ -1067,7 +1070,7 @@ pub fn batch_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, action
             let b = egui::Button::new(RichText::new(text).strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(130.0, 28.0)).corner_radius(14.0);
             if ui.add_enabled(waiting > 0 && p.ai.ctx.is_some(), b).on_hover_text(l.t("batch_start_tip")).clicked() {
                 let stack = if e.batch_effects { p.fx.all_stages() } else { Vec::new() };
-                e.batch.start(stack, p.deint_mode, p.field_rate);
+                e.batch.start(stack, p.deint_mode, p.field_rate, ocio_job.clone());
                 e.batch_sel.clear();
             }
         }

@@ -352,12 +352,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "brp-ocio"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "cc",
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "brp-player"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "brp-ai",
  "brp-media",
+ "brp-ocio",
  "brp-render",
  "crossbeam-channel",
  "egui",

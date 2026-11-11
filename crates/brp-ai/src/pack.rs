@@ -144,6 +144,9 @@ vec4 fetch(int sx, int sy) {
     return s / max(cnt, 1.0);
 }
 float value(int comp, vec4 c) {
+    // Integer formats hold 0..1: clip the colour before it becomes Y'CbCr (a clipped
+    // luma with unclipped colour differences shifts the hue of bright colours).
+    if (p.FLT == 0) c.rgb = clamp(c.rgb, 0.0, 1.0);
     if (p.YUV != 0) {
         float kg = 1.0 - p.kr - p.kb;
         float Y = p.kr * c.r + kg * c.g + p.kb * c.b;

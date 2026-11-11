@@ -7,5 +7,6 @@
 ORT_CACHE_DIR = { value = "target/ort-cache", relative = true }
 FFMPEG_DIR = { value = "third_party/ffmpeg-lgpl/7.1", relative = true }
 LIBCLANG_PATH = "C:/Program Files/LLVM/bin"
+OCIO_DIR = { value = "third_party/ocio/2.5.2", relative = true }
 VULKAN_SDK = "C:/VulkanSDK/1.4.363.0"
 SHADERC_LIB_DIR = "C:/VulkanSDK/1.4.363.0/Lib"

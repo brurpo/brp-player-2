@@ -6,6 +6,7 @@ fn main() {
     copy_nnedi_weights();
     copy_shaders();
     copy_ai();
+    copy_ocio();
     let Ok(ff) = std::env::var("FFMPEG_DIR") else { return };
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // OUT_DIR = target/<profile>/build/<pkg>/out
@@ -95,4 +96,27 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
             copy_if_changed(&p, &dst.join(e.file_name()));
         }
     }
+}
+
+/// OpenColorIO (DESIGN.md §7d): its library next to the executable, and the Maya and
+/// Blender configs (`third_party/ocio-configs`, see tools/fetch_ocio_configs.ps1) in
+/// `<exe dir>/ocio`.
+fn copy_ocio() {
+    println!("cargo:rerun-if-env-changed=OCIO_DIR");
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let Some(profile_dir) = out.ancestors().nth(3) else { return };
+    if let Ok(dir) = std::env::var("OCIO_DIR") {
+        let bin = PathBuf::from(dir).join("bin");
+        if let Ok(entries) = std::fs::read_dir(&bin) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "dll") {
+                    copy_if_changed(&p, &profile_dir.join(p.file_name().unwrap()));
+                }
+            }
+        }
+    }
+    let configs = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../third_party/ocio-configs");
+    println!("cargo:rerun-if-changed={}", configs.display());
+    copy_tree(&configs, &profile_dir.join("ocio"));
 }

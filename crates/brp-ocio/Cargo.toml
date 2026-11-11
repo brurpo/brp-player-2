@@ -1,0 +1,15 @@
+[package]
+name = "brp-ocio"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# OpenColorIO (BSD-3, built by tools/build_ocio.ps1 into third_party/ocio/<version>,
+# OCIO_DIR in .cargo/config.toml) through a small C++ shim. DESIGN.md §7d.
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"

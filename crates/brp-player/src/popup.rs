@@ -63,6 +63,7 @@ impl PopupWin {
             PopupKind::Settings => (origin.x + ow - w as i32 - (40.0 * scale) as i32, top + (26.0 * scale) as i32),
             PopupKind::Export => (origin.x + ow - w as i32 - (80.0 * scale) as i32, top),
             PopupKind::Batch => (origin.x + (14.0 * scale) as i32, top + (40.0 * scale) as i32),
+            PopupKind::Color => (origin.x + ow - w as i32 - (60.0 * scale) as i32, top + (12.0 * scale) as i32),
         };
         let mut attrs = Window::default_attributes()
             .with_title(format!("BRP Player — {:?}", kind))
