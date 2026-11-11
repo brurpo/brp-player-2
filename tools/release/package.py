@@ -16,9 +16,9 @@ re-uses the Drive file of the last one that had it, so each Drive version folder
 holds what is new or changed (dist/drive/published.json remembers what was uploaded).
 
 The app zip holds what the app needs to start: brp-player.exe, FFmpeg's LGPL DLLs,
-the VC++ runtime, shaders, manifest.json, the licenses. Not in it (components,
+OpenColorIO's DLL, the VC++ runtime, shaders, manifest.json, the licenses. Not in it (components,
 downloaded on first start): the GPL ffmpeg.exe (x264/x265), the AI models, the NNEDI3
-weights (GPL) and the RVM model (GPL).
+weights (GPL), the RVM model (GPL) and the Maya/Blender OCIO configs.
 """
 import hashlib, json, os, re, shutil, sys, zipfile
 
@@ -35,6 +35,7 @@ FF_GPL = os.environ.get("BRP_FFMPEG_GPL_DIR") or os.path.join(
     "BtbN.FFmpeg.GPL.Shared.7.1_Microsoft.Winget.Source_8wekyb3d8bbwe",
     "ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1")
 FF_VERSION = "7.1.5-12"
+OCIO_SRC = os.path.join(ROOT, "third_party", "ocio", "src-2.5.2")
 DATE = (2026, 1, 1, 0, 0, 0)  # fixed zip timestamps: same content, same checksum
 
 
@@ -96,6 +97,8 @@ def components():
         files = walk(os.path.join(models, m), skip=lambda rel: rel.endswith(".safetensors"))
         out.append((f"models-{m}", f"models/{m}", files))
     out.append(("nnedi3", "nnedi3", [("nnedi3_weights.bin", os.path.join(ROOT, "crates", "brp-render", "assets", "nnedi3_weights.bin"))]))
+    # Maya's and Blender's OCIO configs ("(maya)", "(blender)" entries): ocio/{maya,blender}.
+    out.append(("ocio-configs", "ocio", walk(os.path.join(ROOT, "third_party", "ocio-configs"))))
     return out
 
 
@@ -151,6 +154,9 @@ def app():
     for n in os.listdir(os.path.join(FF_LGPL, "bin")):
         if n.endswith(".dll"):
             files.append((f"{top}/{n}", os.path.join(FF_LGPL, "bin", n)))
+    # OpenColorIO (BSD-3-Clause): the executable links it.
+    files.append((f"{top}/OpenColorIO_2_5.dll", os.path.join(REL, "OpenColorIO_2_5.dll")))
+    files.append((f"{top}/licenses/opencolorio/LICENSE", os.path.join(OCIO_SRC, "LICENSE")))
     for n in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
         files.append((f"{top}/{n}", os.path.join(os.environ["SystemRoot"], "System32", n)))
     for rel, p in walk(os.path.join(REL, "shaders")):
