@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "brp-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "brp-media"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "brp-player"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "brp-ai",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "brp-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -2371,7 +2371,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onnxref"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ort",

@@ -103,7 +103,7 @@ def drive():
     ver = version()
     pub_path = os.path.join(DIST, "drive", "published.json")
     published = json.load(open(pub_path)) if os.path.exists(pub_path) else {}
-    listing = []
+    listing, new = [], 0
     for name, d, files in components():
         cver = tree_hash(files)
         prev = published.get(name)
@@ -117,6 +117,7 @@ def drive():
         write_zip(out, files)
         e = {"name": name, "dir": d, "version": cver, "folder": folder, "file": fname, "sha256": sha256(out), "size": os.path.getsize(out)}
         listing.append(e)
+        new += 1
         print(f"{name}: {folder}/{fname} {e['size'] / 1e6:.0f} MB")
     json.dump(listing, open(os.path.join(DIST, "drive", "components.json"), "w"), indent=1)
     ids = os.path.join(DIST, "drive_ids.json")
@@ -124,7 +125,12 @@ def drive():
     for e in listing:
         known.setdefault(e["file"], "")
     json.dump(known, open(ids, "w"), indent=1)
-    print(f"\nUpload dist/{ASSETS}/v{ver}/ into the Drive folder {ASSETS} (new files only), then put their ids in {ids}")
+    if new:
+        print(f"
+Upload dist/{ASSETS}/v{ver}/ into the Drive folder {ASSETS} (new files only), then put their ids in {ids}")
+    else:
+        print("
+No component changed: nothing to upload to Drive.")
 
 
 def app():
