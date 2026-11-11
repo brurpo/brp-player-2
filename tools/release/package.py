@@ -4,8 +4,9 @@
   python tools/release/package.py app     # build the app zip (needs drive_ids.json)
 
 Everything goes to dist/:
-  dist/drive/v<version>/<component>-<cversion>.zip   upload these to Drive, into a
-                                                       folder named v<version>
+  dist/BRP_PLAYER_2_ASSETS/v<version>/<component>-<cversion>.zip
+                               upload into the Drive folder BRP_PLAYER_2_ASSETS (shared
+                               once, "anyone with the link"; versions inherit it)
   dist/drive/components.json   name, dir, version, file, sha256, size of every component
   dist/drive_ids.json          you fill in: component file name -> Drive file id
   dist/brp-player-<version>-windows-x64.zip            the GitHub release asset
@@ -25,6 +26,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DIST = os.path.join(ROOT, "dist")
 REL = os.path.join(ROOT, "target", "release")
 REPO = "brurpo/brp-player-2"
+# Drive: one folder shared once ("anyone with the link can view"); each release adds
+# a v<version> folder inside it, which inherits the sharing.
+ASSETS = "BRP_PLAYER_2_ASSETS"
 FF_LGPL = os.path.join(ROOT, "third_party", "ffmpeg-lgpl", "7.1")
 FF_GPL = os.environ.get("BRP_FFMPEG_GPL_DIR") or os.path.join(
     os.environ["LOCALAPPDATA"], "Microsoft", "WinGet", "Packages",
@@ -109,7 +113,7 @@ def drive():
             continue
         folder = f"v{ver}"
         fname = f"{name}-{cver}.zip"
-        out = os.path.join(DIST, "drive", folder, fname)
+        out = os.path.join(DIST, ASSETS, folder, fname)
         write_zip(out, files)
         e = {"name": name, "dir": d, "version": cver, "folder": folder, "file": fname, "sha256": sha256(out), "size": os.path.getsize(out)}
         listing.append(e)
@@ -120,7 +124,7 @@ def drive():
     for e in listing:
         known.setdefault(e["file"], "")
     json.dump(known, open(ids, "w"), indent=1)
-    print(f"\nUpload new files under dist/drive/v{ver}/ to Drive folder v{ver}, then put their ids in {ids}")
+    print(f"\nUpload dist/{ASSETS}/v{ver}/ into the Drive folder {ASSETS} (new files only), then put their ids in {ids}")
 
 
 def app():
