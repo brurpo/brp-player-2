@@ -126,11 +126,9 @@ def drive():
         known.setdefault(e["file"], "")
     json.dump(known, open(ids, "w"), indent=1)
     if new:
-        print(f"
-Upload dist/{ASSETS}/v{ver}/ into the Drive folder {ASSETS} (new files only), then put their ids in {ids}")
+        print(f"Upload dist/{ASSETS}/v{ver}/ into the Drive folder {ASSETS} (new files only), then put their ids in {ids}")
     else:
-        print("
-No component changed: nothing to upload to Drive.")
+        print("No component changed: nothing to upload to Drive.")
 
 
 def app():
