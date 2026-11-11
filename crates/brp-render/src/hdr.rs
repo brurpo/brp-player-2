@@ -102,3 +102,30 @@ fn query(_hwnd: isize) -> Option<HdrScreen> {
     // Other systems: not detected yet (BRP_HDR=1 forces it where the surface allows).
     None
 }
+
+/// Ask Windows to give this process's GPU work priority over other programs' (a
+/// training run or a render in the background), so the window stays smooth while
+/// the GPU is shared. BRP_GPU_PRIORITY=0 leaves it normal.
+pub fn raise_gpu_priority() {
+    #[cfg(windows)]
+    {
+        if std::env::var("BRP_GPU_PRIORITY").is_ok_and(|v| v == "0") {
+            return;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn D3DKMTSetProcessSchedulingPriorityClass(process: isize, class: i32) -> i32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+        }
+        // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH (REALTIME needs administrator rights).
+        let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(GetCurrentProcess(), 4) };
+        if status == 0 {
+            log::info!("GPU scheduling priority: high");
+        } else {
+            log::info!("GPU scheduling priority: not raised ({status:#x})");
+        }
+    }
+}

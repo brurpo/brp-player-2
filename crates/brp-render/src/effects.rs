@@ -480,6 +480,50 @@ impl EffectChain {
         h.finish()
     }
 
+    /// Identity of the enabled effects and their settings, compiled or not (the
+    /// effect cache keeps the whole stack's pictures under it).
+    pub fn spec_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.transfer.hash(&mut h);
+        let mut any = false;
+        for e in self.effects.iter().filter(|e| e.spec.enabled) {
+            any = true;
+            e.spec.id.hash(&mut h);
+            for p in &e.spec.params {
+                p.to_bits().hash(&mut h);
+            }
+        }
+        any.then(|| h.finish())
+    }
+
+    /// No enabled effect is still compiling: the output is the whole stack's.
+    pub fn complete(&self) -> bool {
+        !self.effects.iter().any(|e| e.spec.enabled && e.status == EffectStatus::Compiling)
+    }
+
+    /// Copy a chain picture (`src`, in `space`) into `dst` (a storage image of the
+    /// same size, RGBA16F, GENERAL), on frame slot `si`.
+    pub fn copy_into(&mut self, cb: vk::CommandBuffer, si: usize, src: (vk::ImageView, u32, u32), dst: vk::ImageView, space: Space, color: &ColorInfo) -> Result<()> {
+        let sc = SourceColor::of(color);
+        let set = self.alloc_set(si, self.space_pipe.set_layout)?;
+        self.write_image(set, 0, src.0, vk::ImageLayout::GENERAL, false);
+        self.write_image(set, 1, dst, vk::ImageLayout::GENERAL, true);
+        let mut push = [0u8; 32];
+        for (i, v) in sc.words(space, space).iter().enumerate() {
+            push[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        push[16..20].copy_from_slice(&sc.peak.to_le_bytes());
+        let d = &self.device;
+        unsafe {
+            d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.space_pipe.pipeline);
+            d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.space_pipe.layout, 0, &[set], &[]);
+            d.cmd_push_constants(cb, self.space_pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+            d.cmd_dispatch(cb, src.1.div_ceil(16), src.2.div_ceil(16), 1);
+        }
+        Ok(())
+    }
+
     /// The image behind a chain texture view (for readback).
     pub fn image_of(&self, view: vk::ImageView) -> Option<vk::Image> {
         self.images.iter().find(|p| p.img.view == view).map(|p| p.img.image)

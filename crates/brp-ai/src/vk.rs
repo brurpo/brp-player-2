@@ -2572,6 +2572,10 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
+/// Layers recorded by all nets, and the most layers per submission (`Net::set_flush_limit`).
+static LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUSH_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A network loaded on the GPU.
 pub struct Net {
     compute: Arc<Compute>,
@@ -2899,6 +2903,18 @@ impl Net {
         self.flush_every.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Layers recorded by every net so far (to measure GPU time per layer).
+    pub fn layers_recorded() -> u64 {
+        LAYERS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every net also submits after at most this many layers (0: no limit). The
+    /// viewer keeps each submission short so the window's own frames get the GPU in
+    /// between (a long submission holds them back: the window stutters).
+    pub fn set_flush_limit(n: usize) {
+        FLUSH_LIMIT.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }
@@ -2928,7 +2944,16 @@ impl Net {
         }
         let wanted: Vec<usize> = outputs.iter().map(|n| self.blobs.get(*n).copied().with_context(|| format!("no blob {n}"))).collect::<Result<_>>()?;
         let mut left = self.readers.clone();
-        let flush_every = self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
+        // BRP_FLUSH_LIMIT=n: as if the viewer had set that limit (tests).
+        let limit = match FLUSH_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => std::env::var("BRP_FLUSH_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            l => l,
+        };
+        let flush_every = match (self.flush_every.load(std::sync::atomic::Ordering::Relaxed), limit) {
+            (0, l) | (l, 0) => l,
+            (n, l) => n.min(l),
+        };
+        LAYERS.fetch_add(self.layers.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // Debugging (BRP_NN_SYNC): wait for the GPU before each layer, so a fault names
         // the layer (a device lost after it points at work outside the nets).
         let sync = std::env::var_os("BRP_NN_SYNC").is_some();

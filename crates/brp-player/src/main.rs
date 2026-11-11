@@ -161,6 +161,7 @@ impl App {
             None => brp_render::GpuInstance::new()?,
         };
         let renderer = Renderer::new(inst, &*window, size.width, size.height, gpu.as_deref())?;
+        renderer.set_waker(redraw_waker(&window));
         log::info!("startup: window {:?}, renderer {:?} ({})", t_window, self.start.elapsed(), renderer.gpu_name());
 
         let egui_ctx = egui::Context::default();
@@ -177,6 +178,7 @@ impl App {
         // Decoders on the GPU (DXV, ProRes): registered before any file opens.
         brp_media::gpudec::set_factory(Some(brp_render::gpudec::factory(&renderer.gpu())));
         player.ai.ctx = Some(renderer.gpu());
+        brp_render::hdr::raise_gpu_priority();
         warm::start(&renderer.gpu());
         if self.wins.is_empty() && std::env::args().any(|a| a == "--lock") {
             ui.locked = true;
@@ -267,6 +269,16 @@ impl App {
             }
         }
     }
+}
+
+/// For a renderer's waiting thread: draw `window` again (see `brp_render::wake`).
+pub(crate) fn redraw_waker(window: &Arc<Window>) -> brp_render::wake::Waker {
+    let w = Arc::downgrade(window);
+    Arc::new(move || {
+        if let Some(w) = w.upgrade() {
+            w.request_redraw();
+        }
+    })
 }
 
 /// Show a file (or the folder of an image sequence) in the file browser.
@@ -411,7 +423,9 @@ impl Win {
         self.player.ai.ctx = None;
         self.renderer = None;
         let size = self.window.inner_size();
-        let make = |pick: Option<&str>| brp_render::GpuInstance::new().and_then(|i| Renderer::new(i, &*self.window, size.width, size.height, pick));
+        let make = |pick: Option<&str>| {
+            brp_render::GpuInstance::new().and_then(|i| Renderer::new(i, &*self.window, size.width, size.height, pick)).inspect(|r| r.set_waker(redraw_waker(&self.window)))
+        };
         let renderer = match make(name.as_deref()) {
             Ok(r) => {
                 self.ui.settings.gpu = name;
@@ -584,6 +598,22 @@ impl Win {
                 self.player.set_layer(&name);
             }
         }
+        // BRP_TEST_FX_SWEEP=from_secs:to_secs : move the first effect's first parameter
+        // every redraw in between (as dragging its slider).
+        if let Some((from, to)) = std::env::var("BRP_TEST_FX_SWEEP").ok().and_then(|v| v.split_once(':').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))) {
+            let t = start.elapsed().as_secs_f64();
+            if t >= from && t < to {
+                if let Some(e) = self.player.fx.list.first_mut() {
+                    if let Some(p) = e.spec.file.params.first() {
+                        let (lo, hi) = (p.min.unwrap_or(0.0), p.max.unwrap_or(1.0));
+                        let f = ((t - from) / 2.0).fract();
+                        e.spec.params[0] = lo + (hi - lo) * if f < 0.5 { f * 2.0 } else { 2.0 - f * 2.0 };
+                        self.player.fx.dirty = true;
+                    }
+                }
+                self.window.request_redraw();
+            }
+        }
         self.ui.maximized = self.window.is_maximized();
         let size = self.window.inner_size();
         let px = [size.width as f32, size.height as f32];
@@ -596,8 +626,24 @@ impl Win {
         });
         self.egui_state.handle_platform_output(&self.window, out.platform_output);
 
-        // Scrubbing shows raw frames; the frame let go on is processed.
+        // Scrubbing shows decoded frames (or pictures the effects made already); the
+        // frame let go on is processed.
         self.player.scrubbing = self.ui.scrubbing();
+        // BRP_TEST_SCRUB=from_secs:to_secs:first:frames : scrub back and forth over
+        // `frames` frames from `first` in between (as dragging the playhead).
+        let test_scrub = std::env::var("BRP_TEST_SCRUB").ok().and_then(|v| {
+            let p: Vec<f64> = v.split(':').filter_map(|x| x.parse().ok()).collect();
+            let t = start.elapsed().as_secs_f64();
+            (p.len() == 4 && t >= p[0] && t < p[1]).then(|| (p[2] as i64, p[3] as i64, ((t - p[0]) * 4.0) as i64 % (2 * p[3] as i64)))
+        });
+        if let Some((first, frames, i)) = test_scrub {
+            let f = first + if i < frames { i } else { 2 * frames - 1 - i };
+            self.player.scrubbing = true;
+            if self.player.current != f {
+                self.player.seek(f);
+            }
+            self.window.request_redraw();
+        }
         let ctx_before = self.egui_ctx.clone();
         self.apply_actions(actions, el);
         self.sync_popups(el);
@@ -645,6 +691,7 @@ impl Win {
         // Effect chain changes and background shader compiles.
         if self.player.fx.dirty {
             // Up to the last AI effect: background stages; after it: live shaders.
+            log::trace!("effect settings: {:?}", self.player.fx.list.iter().map(|e| &e.spec.params).collect::<Vec<_>>());
             let (stages, live) = self.player.fx.split();
             renderer.set_effects(&live, self.player.transfer());
             let transfer = self.player.transfer();
@@ -659,6 +706,19 @@ impl Win {
             self.player.sub = 0;
         }
         let fx_changed = renderer.poll_effects();
+        // The whole stack's pictures are kept under the AI part's key with the live
+        // effects' (and, without AI effects, the window's deinterlacing, which then
+        // comes before them).
+        let live = renderer.live_effects_key().map(|k| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut h);
+            if !self.player.ai.active() {
+                format!("{:?}", self.player.deint_method()).hash(&mut h);
+            }
+            h.finish()
+        });
+        self.player.ai.set_live(live);
         self.player.fx_warmup = renderer.effect_warmup();
         self.ui.fx_status = renderer.effect_status();
 
@@ -679,8 +739,42 @@ impl Win {
         }
         // AI picture when ready (it replaces the decoded frame; until then the decoded
         // frame is shown). The AI path deinterlaces its source itself, so none on top.
-        let ai_picture = self.player.ai_frame();
+        // Scrubbing: a picture of the whole stack already made is shown as it is; one
+        // of the AI part gets the live effects; else the decoded frame.
+        let scrub = self.player.scrub_picture();
+        let whole = scrub.as_ref().is_some_and(|s| s.1);
+        let ai_picture = match scrub {
+            Some((p, _)) => Some(p),
+            None => self.player.ai_frame(),
+        };
         let ai_size = ai_picture.as_ref().map(|p| (p.w, p.h));
+        // BRP_TEST_DUMP=secs:file : that long after start, write the effect picture of
+        // the frame on screen (from the RAM cache) as raw RGBA16F after a w,h header.
+        if let Some((at, path)) = std::env::var("BRP_TEST_DUMP").ok().and_then(|v| v.split_once(':').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.to_string())))) {
+            if start.elapsed().as_secs_f64() >= at && !self.ui.test_dumped {
+                if let Some((w, h, data)) = self.player.shown_pos().and_then(|p| self.player.ai.ram_picture(p)) {
+                    let mut out = Vec::with_capacity(8 + data.len());
+                    out.extend_from_slice(&w.to_le_bytes());
+                    out.extend_from_slice(&h.to_le_bytes());
+                    out.extend_from_slice(data);
+                    let _ = std::fs::write(&path, out);
+                    self.ui.test_dumped = true;
+                    log::info!("test: effect picture {:?} written ({w}x{h})", self.player.shown_pos());
+                }
+            }
+        }
+        if test_scrub.is_some() {
+            log::info!("test scrub: frame {} {}", self.player.current, if whole { "whole stack" } else if ai_picture.is_some() { "AI picture" } else { "decoded frame" });
+        }
+        // Keep what the live effects make of this picture (the whole stack's), unless
+        // it is not the one for this position (a decoded frame or another picture
+        // shown while the AI one is made).
+        let shown_pos = self.player.shown_pos();
+        let ai_exact = !self.player.ai.active() || (ai_picture.is_some() && (self.player.scrubbing || self.player.ai.exact() == shown_pos));
+        let capture = match (live, shown_pos) {
+            (Some(_), Some(pos)) if !whole && ai_exact && !(self.player.scrubbing && ai_picture.is_none()) => Some((self.player.ai.whole_key(), pos.0, pos.1)),
+            _ => None,
+        };
         let source_id = self.player.source_id;
         let frame = self.player.shown.clone();
         let warm = if ai_size.is_some() || self.player.scrubbing { 0 } else { self.player.fx_warmup };
@@ -711,11 +805,18 @@ impl Win {
                 nearest: self.player.pixel_exact(self.ui.video_area(px)),
                 rotation: src.info.rotation,
                 picture: ai_picture.clone(),
-                raw: self.player.scrubbing,
+                // Scrubbing shows decoded frames as they are, but a processed
+                // picture already made gets the rest of the effects as usual.
+                raw: (self.player.scrubbing && ai_picture.is_none()) || whole,
+                capture,
             }),
             _ => None,
         };
-        match renderer.render(video, &prims, out.pixels_per_point) {
+        let rendered = renderer.render(video, &prims, out.pixels_per_point);
+        for c in renderer.take_captures() {
+            self.player.ai.keep_captured(c);
+        }
+        match rendered {
             Ok(true) if !self.presented_once => {
                 self.presented_once = true;
                 log::info!("startup: first present {:?}", start.elapsed());

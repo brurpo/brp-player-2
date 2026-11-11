@@ -19,6 +19,7 @@ pub mod shader_cache;
 pub mod usershader;
 mod video;
 pub mod workspace;
+pub mod wake;
 
 pub use color::{video_push, VideoPush};
 pub use context::{GpuContext, GpuDevice, GpuInstance};
@@ -93,6 +94,40 @@ pub struct VideoDraw<'a> {
     /// Show the frame without the live effects (while scrubbing: only the frame the
     /// user stops on is processed).
     pub raw: bool,
+    /// Keep the picture the live effects make for this draw (the whole stack's), with
+    /// this tag: handed back by `take_captures` once the GPU has made it.
+    pub capture: Option<CaptureTag>,
+}
+
+/// The thread copying kept pictures' pixels out of their readback buffers (it ends
+/// when the renderer drops its side).
+#[allow(clippy::type_complexity)]
+fn capture_copier() -> (crossbeam_channel::Sender<(CaptureTag, Arc<compute::Picture>, compute::Buffer)>, crossbeam_channel::Receiver<(Captured, compute::Buffer)>) {
+    let (tx, rx) = crossbeam_channel::unbounded::<(CaptureTag, Arc<compute::Picture>, compute::Buffer)>();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let _ = std::thread::Builder::new().name("brp-fx-cache-copy".into()).spawn(move || {
+        for (tag, pic, mut buf) in rx {
+            let t = std::time::Instant::now();
+            let n = pic.byte_size() as usize;
+            let Some(data) = buf.mapped().map(|m| m[..n].to_vec()) else { continue };
+            log::trace!("effect cache: picture copied to RAM in {:?}", t.elapsed());
+            if done_tx.send((Captured { tag, pic, data }, buf)).is_err() {
+                break;
+            }
+        }
+    });
+    (tx, done_rx)
+}
+
+/// What a kept picture is: (stack key, frame, picture within the frame).
+pub type CaptureTag = (u64, i64, u8);
+
+/// A picture the live effects made, kept for the effect cache: on the GPU, and its
+/// pixels (RGBA16F, rows packed) for the RAM cache.
+pub struct Captured {
+    pub tag: CaptureTag,
+    pub pic: Arc<compute::Picture>,
+    pub data: Vec<u8>,
 }
 
 pub struct HistoryFrame<'a> {
@@ -113,6 +148,10 @@ struct Frame {
 pub struct Renderer {
     // Drop order matters: everything using the allocator before the context.
     egui: Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
+    /// Waits for the GPU instead of the window's thread (see `wake`).
+    waiter: wake::GpuWaiter,
+    /// egui textures to free once no frame in flight uses them.
+    free_later: Vec<egui::TextureId>,
     video: Option<VideoPass>,
     deint: Option<Deinterlacer>,
     effects: Option<EffectChain>,
@@ -127,6 +166,11 @@ pub struct Renderer {
     frames: Vec<Frame>,
     /// GPU pictures read by each frame in flight (kept until its fence).
     kept: Vec<Option<Arc<compute::Picture>>>,
+    /// Live effect pictures being kept, per frame in flight (picture, the buffer its
+    /// pixels are copied to); finished ones; spare buffers.
+    capturing: Vec<Vec<(CaptureTag, Arc<compute::Picture>, compute::Buffer)>>,
+    capture_copier: (crossbeam_channel::Sender<(CaptureTag, Arc<compute::Picture>, compute::Buffer)>, crossbeam_channel::Receiver<(Captured, compute::Buffer)>),
+    capture_bufs: Vec<compute::Buffer>,
     frame_index: usize,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
@@ -257,6 +301,8 @@ impl Renderer {
             log::debug!("renderer: pipelines {:?}", t0.elapsed());
             let mut r = Renderer {
                 egui: Some(egui),
+                waiter: wake::GpuWaiter::new(device.clone()),
+                free_later: Vec::new(),
                 video: Some(video),
                 deint: Some(deint),
                 effects: Some(chain),
@@ -267,6 +313,9 @@ impl Renderer {
                 graveyard: Graveyard::default(),
                 frame_no: 0,
                 kept: vec![None; FRAMES_IN_FLIGHT],
+                capturing: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
+                capture_copier: capture_copier(),
+                capture_bufs: Vec::new(),
                 frames,
                 frame_index: 0,
                 swapchain: vk::SwapchainKHR::null(),
@@ -381,15 +430,30 @@ impl Renderer {
                 egui.set_texture(self.ctx.queue, self.upload_pool, *id, d)?;
             }
         }
-        if !delta.free.is_empty() {
-            // Only this window's frames can use egui's textures: wait for those, not for
-            // the whole GPU (the AI worker's long submissions stalled every redraw).
-            unsafe { self.ctx.device.wait_for_fences(&self.frames.iter().map(|f| f.fence).collect::<Vec<_>>(), true, u64::MAX)? };
-            for id in &delta.free {
-                egui.free_texture(*id)?;
+        // Only this window's frames can use egui's textures: freed once those are
+        // done (not waited for here: see `wake`).
+        self.free_later.extend(delta.free.iter().copied());
+        self.free_textures()
+    }
+
+    fn free_textures(&mut self) -> Result<()> {
+        if self.free_later.is_empty() {
+            return Ok(());
+        }
+        let device = &self.ctx.device;
+        if self.frames.iter().all(|f| unsafe { device.get_fence_status(f.fence) }.unwrap_or(true)) {
+            let egui = self.egui.as_mut().unwrap();
+            for id in self.free_later.drain(..) {
+                egui.free_texture(id)?;
             }
         }
         Ok(())
+    }
+
+    /// Called from the waiting thread when the window should draw again (the GPU
+    /// finished what a skipped frame waited for).
+    pub fn set_waker(&self, w: wake::Waker) {
+        self.waiter.set_waker(w);
     }
 
     /// Draw one frame. Returns false if nothing was presented (minimised window).
@@ -412,18 +476,38 @@ impl Renderer {
         let device = self.ctx.device.clone();
         let fi = self.frame_index;
         let frame = self.frames[fi];
+        let t0 = std::time::Instant::now();
         unsafe {
-            device.wait_for_fences(&[frame.fence], true, u64::MAX)?;
+            // The GPU still works on this slot's last frame: skip this frame rather than
+            // wait (the window's thread would stop handling the mouse); drawn again
+            // once it is done.
+            if !device.get_fence_status(frame.fence)? {
+                self.waiter.wake_when(Some(frame.fence));
+                return Ok(false);
+            }
+            let t_fence = t0.elapsed();
             self.kept[fi] = None;
+            self.free_textures()?;
+            // Their pixels are copied out on a thread (~5 ms at 1080p).
+            for c in self.capturing[fi].drain(..) {
+                let _ = self.capture_copier.0.send(c);
+            }
             let (image_index, _suboptimal) =
-                match self.ctx.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, frame.image_available, vk::Fence::null()) {
+                match self.ctx.swapchain_fn.acquire_next_image(self.swapchain, 0, frame.image_available, vk::Fence::null()) {
                     Ok(r) => r,
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                         self.needs_rebuild = true;
                         return Ok(false);
                     }
+                    // No image free yet (the screen has not shown the last ones): again
+                    // in a moment, not waiting here.
+                    Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                        self.waiter.wake_when(None);
+                        return Ok(false);
+                    }
                     Err(e) => return Err(e.into()),
                 };
+            let t_acquire = t0.elapsed();
             device.reset_fences(&[frame.fence])?;
             let cb = frame.cmd;
             device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
@@ -525,7 +609,9 @@ impl Renderer {
                 .semaphore(frame.image_available)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
             let signal = [vk::SemaphoreSubmitInfo::default().semaphore(render_done).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let t_record = t0.elapsed();
             let _q = self.ctx.lock_queue();
+            let t_lock = t0.elapsed();
             let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             device.queue_submit2(
                 self.ctx.queue,
@@ -543,6 +629,11 @@ impl Renderer {
                 Ok(false) => {}
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.needs_rebuild = true,
                 Err(e) => return Err(e.into()),
+            }
+            // A slow frame makes the window stutter. Waiting for the frame's fence:
+            // the GPU was busy (effects, or another program); see DESIGN.md §16.
+            if t0.elapsed().as_millis() > 30 {
+                log::debug!("slow render: GPU wait {t_fence:?}, acquire {:?}, record {:?}, queue {:?}, total {:?}", t_acquire - t_fence, t_record - t_acquire, t_lock - t_record, t0.elapsed());
             }
         }
         self.frame_index = (fi + 1) % FRAMES_IN_FLIGHT;
@@ -733,6 +824,9 @@ impl Renderer {
                 }
                 self.chain_out = self.run_chain(cb, fi, v, v.frame, v.prev, v.next, deint, v.seq)?;
                 self.chain_last = Some((key, v.seq));
+                if let Some(tag) = v.capture {
+                    self.capture(cb, fi, tag, v.frame.layout.has_alpha(), &v.color)?;
+                }
             }
             if let Some(out) = &self.chain_out {
                 let view = out.view;
@@ -757,6 +851,63 @@ impl Renderer {
         push.misc[3] = (v.rotation / 90 % 4) as f32;
         push.rect = rect;
         Ok(Some(push))
+    }
+
+    /// Keep the chain's output (the whole stack's picture) as `tag`: copied into a
+    /// picture of its own and, for the RAM cache, into a buffer read after the frame.
+    /// Not while an effect is still compiling (the picture would miss it).
+    fn capture(&mut self, cb: vk::CommandBuffer, fi: usize, tag: CaptureTag, alpha: bool, color: &ColorInfo) -> Result<()> {
+        let (Some(chain), Some(out)) = (self.effects.as_mut(), self.chain_out.as_ref()) else { return Ok(()) };
+        if !chain.complete() {
+            return Ok(());
+        }
+        let (src, space) = ((out.view, out.w, out.h), out.space);
+        let pic = compute::Picture::new_in(&self.ctx, cb, out.w, out.h, alpha)?;
+        chain.copy_into(cb, fi, src, pic.view, space, color)?;
+        let bytes = pic.byte_size();
+        let i = self.capture_bufs.iter().position(|b| b.size >= bytes);
+        let buf = match i {
+            Some(i) => self.capture_bufs.swap_remove(i),
+            None => compute::Buffer::new(&self.ctx, bytes, gpu_allocator::MemoryLocation::GpuToCpu, "effect cache copy")?,
+        };
+        let device = &self.ctx.device;
+        unsafe {
+            let m = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::SHADER_READ);
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&m)));
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: pic.w.max(1), height: pic.h.max(1), depth: 1 });
+            device.cmd_copy_image_to_buffer(cb, pic.image(), vk::ImageLayout::GENERAL, buf.buffer, &[region]);
+            let m = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ);
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&m)));
+        }
+        self.capturing[fi].push((tag, pic, buf));
+        Ok(())
+    }
+
+    /// Pictures kept by `VideoDraw::capture` that the GPU has finished.
+    pub fn take_captures(&mut self) -> Vec<Captured> {
+        let mut out = Vec::new();
+        while let Ok((c, buf)) = self.capture_copier.1.try_recv() {
+            out.push(c);
+            if self.capture_bufs.len() < 4 {
+                self.capture_bufs.push(buf);
+            }
+        }
+        out
+    }
+
+    /// Identity of the live effects (enabled, with their settings), if any.
+    pub fn live_effects_key(&self) -> Option<u64> {
+        self.effects.as_ref().and_then(|c| c.spec_key())
     }
 
     /// A GPU picture made by background effects: sampled directly (no upload, no
@@ -792,6 +943,9 @@ impl Renderer {
                 };
                 self.chain_out = self.effects.as_mut().unwrap().run(cb, fi, &cf)?;
                 self.chain_last = Some((key, v.seq));
+                if let Some(tag) = v.capture {
+                    self.capture(cb, fi, tag, pic.alpha, &v.color)?;
+                }
             }
             if let Some(out) = &self.chain_out {
                 view = out.view;
@@ -1023,6 +1177,7 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.wait_idle();
+            self.waiter.stop();
             self.egui = None;
             self.video = None;
             self.deint = None;

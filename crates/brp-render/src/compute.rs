@@ -277,7 +277,26 @@ pub struct Recorder<'a> {
     /// Profiling (BRP_GPU_PROFILE): timestamp after each dispatch, with its label.
     queries: Option<(vk::QueryPool, Vec<String>)>,
     pub label: String,
+    /// Asked at each `flush`: true stops the recording there (`Cancelled`), once the
+    /// parts already submitted have run.
+    pub cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Most `flush` submissions queued on the GPU at once (0: no limit). The GPU runs
+    /// both queues' work in the order it was submitted: with a lot queued, the
+    /// window's frames wait behind all of it. With one, a frame waits for one part.
+    pub max_queued: usize,
 }
+
+/// The error `Recorder::flush` returns when the work is no longer wanted.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 impl<'a> Recorder<'a> {
     pub fn new(compute: &'a Compute) -> Result<Recorder<'a>> {
@@ -297,7 +316,7 @@ impl<'a> Recorder<'a> {
             } else {
                 None
             };
-            Ok(Recorder { compute, pool, cb, desc_pool, dispatches: 0, keep: Vec::new(), submitted: Vec::new(), first_submit: None, queries, label: String::new() })
+            Ok(Recorder { compute, pool, cb, desc_pool, dispatches: 0, keep: Vec::new(), submitted: Vec::new(), first_submit: None, queries, label: String::new(), cancel: None, max_queued: 0 })
         }
     }
 
@@ -428,6 +447,11 @@ impl<'a> Recorder<'a> {
     /// buffer. Long work is split this way so no single submission runs long:
     /// Windows resets a GPU that does not respond for about 2 seconds.
     pub fn flush(&mut self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c()) {
+            // What was submitted may still use buffers the caller frees on the way out.
+            self.wait_submitted();
+            return Err(Cancelled.into());
+        }
         let ctx = &self.compute.ctx;
         let device = &ctx.device;
         unsafe {
@@ -444,6 +468,12 @@ impl<'a> Recorder<'a> {
             }
             self.submitted.push(fence);
             self.first_submit.get_or_insert_with(std::time::Instant::now);
+            while self.max_queued > 0 && self.submitted.len() > self.max_queued {
+                let f = self.submitted.remove(0);
+                let r = device.wait_for_fences(&[f], true, u64::MAX);
+                device.destroy_fence(f, None);
+                r?;
+            }
             self.cb = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0];
             device.begin_command_buffer(self.cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             // Later work sees what the earlier submissions wrote (same queue: a
@@ -585,6 +615,28 @@ impl Picture {
         );
         let view = img.view;
         Ok(Arc::new(Picture { ctx, img: Some(img), view, w, h, alpha }))
+    }
+
+    /// A new picture, its layout transition recorded in `cb` (outside a `Recorder`).
+    pub fn new_in(ctx: &Arc<GpuContext>, cb: vk::CommandBuffer, w: u32, h: u32, alpha: bool) -> Result<Arc<Picture>> {
+        let img = crate::gpu::create_image(
+            &ctx.device,
+            &ctx.allocator,
+            w.max(1),
+            h.max(1),
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            "picture",
+        )?;
+        crate::gpu::image_barrier(
+            &ctx.device,
+            cb,
+            img.image,
+            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::ImageLayout::UNDEFINED),
+            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ, vk::ImageLayout::GENERAL),
+        );
+        let view = img.view;
+        Ok(Arc::new(Picture { ctx: ctx.clone(), img: Some(img), view, w, h, alpha }))
     }
 
     pub fn image(&self) -> vk::Image {

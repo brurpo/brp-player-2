@@ -131,6 +131,9 @@ struct Frame {
 
 pub struct PopupRenderer {
     egui: Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
+    /// Waits for the GPU instead of the window's thread (see `wake`).
+    waiter: crate::wake::GpuWaiter,
+    free_later: Vec<egui::TextureId>,
     frames: Vec<Frame>,
     frame_index: usize,
     surface: vk::SurfaceKHR,
@@ -310,6 +313,8 @@ impl PopupRenderer {
             )?;
             let mut r = PopupRenderer {
                 egui: Some(egui),
+                waiter: crate::wake::GpuWaiter::new(device.clone()),
+                free_later: Vec::new(),
                 frames,
                 frame_index: 0,
                 surface,
@@ -359,16 +364,31 @@ impl PopupRenderer {
                     egui.set_texture(self.ctx.queue, self.upload_pool, *id, d)?;
                 }
             }
-            if !delta.free.is_empty() {
-                unsafe { self.ctx.device.wait_for_fences(&self.frames.iter().map(|f| f.fence).collect::<Vec<_>>(), true, u64::MAX)? };
-                for id in &delta.free {
-                    egui.free_texture(*id)?;
-                }
-            }
-            Ok(())
+            // Freed once no frame in flight uses them (not waited for here).
+            self.free_later.extend(delta.free.iter().copied());
+            self.free_textures()
         })();
         delta.clear();
         result
+    }
+
+    fn free_textures(&mut self) -> Result<()> {
+        if self.free_later.is_empty() {
+            return Ok(());
+        }
+        let device = &self.ctx.device;
+        if self.frames.iter().all(|f| unsafe { device.get_fence_status(f.fence) }.unwrap_or(true)) {
+            let egui = self.egui.as_mut().unwrap();
+            for id in self.free_later.drain(..) {
+                egui.free_texture(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Called from the waiting thread when the window should draw again.
+    pub fn set_waker(&self, w: crate::wake::Waker) {
+        self.waiter.set_waker(w);
     }
 
     /// Draw the glass and egui. Returns false when nothing was presented.
@@ -385,12 +405,21 @@ impl PopupRenderer {
         let device = self.ctx.device.clone();
         let fi = self.frame_index;
         unsafe {
-            device.wait_for_fences(&[self.frames[fi].fence], true, u64::MAX)?;
+            // Not waiting for the GPU on the window's thread (see `wake`).
+            if !device.get_fence_status(self.frames[fi].fence)? {
+                self.waiter.wake_when(Some(self.frames[fi].fence));
+                return Ok(false);
+            }
+            self.free_textures()?;
             let frame = self.frames[fi];
-            let (image_index, _) = match self.ctx.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, frame.image_available, vk::Fence::null()) {
+            let (image_index, _) = match self.ctx.swapchain_fn.acquire_next_image(self.swapchain, 0, frame.image_available, vk::Fence::null()) {
                 Ok(r) => r,
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.needs_rebuild = true;
+                    return Ok(false);
+                }
+                Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                    self.waiter.wake_when(None);
                     return Ok(false);
                 }
                 Err(e) => return Err(e.into()),
@@ -447,6 +476,7 @@ impl PopupRenderer {
             device.cmd_push_constants(cb, self.layout, vk::ShaderStageFlags::FRAGMENT, 0, bytes);
             device.cmd_draw(cb, 3, 1, 0, 0);
             self.egui.as_mut().unwrap().cmd_draw(cb, self.extent, pixels_per_point, primitives)?;
+
             device.cmd_end_rendering(cb);
             gpu::image_barrier(&device, cb, image, (S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::COLOR_ATTACHMENT_OPTIMAL), (S::BOTTOM_OF_PIPE, A::NONE, L::PRESENT_SRC_KHR));
             device.end_command_buffer(cb)?;
@@ -457,6 +487,7 @@ impl PopupRenderer {
             let _q = self.ctx.lock_queue();
             let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             device.queue_submit2(self.ctx.queue, &[vk::SubmitInfo2::default().wait_semaphore_infos(&wait).command_buffer_infos(&cbs).signal_semaphore_infos(&signal)], frame.fence)?;
+
             let swapchains = [self.swapchain];
             let indices = [image_index];
             let waits = [render_done];
@@ -555,6 +586,7 @@ impl Drop for PopupRenderer {
     fn drop(&mut self) {
         unsafe {
             self.wait_frames();
+            self.waiter.stop();
             {
                 let _q = self.ctx.lock_queue();
                 let _ = self.ctx.device.queue_wait_idle(self.ctx.queue);

@@ -411,7 +411,7 @@ fn stack_key(stages: &[Stage], transfer: Transfer, deint: Option<SourceDeint>, s
 // ---- window side -----------------------------------------------------------------
 
 /// Position of a picture: source frame and sub-position (0..subs).
-type Pos = (i64, u8);
+pub type Pos = (i64, u8);
 
 pub(crate) struct Job {
     key: u64,
@@ -430,7 +430,13 @@ pub(crate) struct Job {
     /// The window's GPU device (pictures are made where they are shown).
     ctx: Arc<GpuContext>,
     deint: Option<SourceDeint>,
+    /// Stopped when a setting changes before it is done (pictures that take long; a
+    /// quick one finishes, so dragging a slider keeps showing its effect).
+    stoppable: bool,
 }
+
+/// A picture taking longer than this is stopped when a setting changes meanwhile.
+const STOP_AFTER: f64 = 0.15;
 
 type SourcePicture = (Arc<VideoFrame>, Option<Arc<VideoFrame>>, Option<Arc<VideoFrame>>, Option<brp_render::DeintParams>);
 
@@ -440,7 +446,7 @@ impl Job {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(stages: Arc<Vec<Stage>>, transfer: Transfer, deint: Option<SourceDeint>, tick: i64, frames: Vec<Arc<VideoFrame>>, last_frame: i64, color: ColorInfo, ctx: Arc<GpuContext>) -> Job {
         let subs = subs_of(&stages, deint);
-        Job { key: stack_key(&stages, transfer, deint, 0), source: 0, spaces: stage_spaces(&stages, &color), pos: (tick.div_euclid(subs), tick.rem_euclid(subs) as u8), stages, transfer, subs, frames, last_frame, color, ctx, deint }
+        Job { key: stack_key(&stages, transfer, deint, 0), source: 0, spaces: stage_spaces(&stages, &color), pos: (tick.div_euclid(subs), tick.rem_euclid(subs) as u8), stages, transfer, subs, frames, last_frame, color, ctx, deint, stoppable: false }
     }
 
     /// Source pictures per frame: 2 when each field becomes a picture.
@@ -473,6 +479,8 @@ enum Outcome {
     Done(Arc<Picture>),
     /// A source frame the stack needs is not decoded (yet).
     Missing,
+    /// Stopped because a setting changed (`Shared::wanted`).
+    Cancelled,
     Failed(String),
 }
 
@@ -520,6 +528,9 @@ struct Shared {
     restore_wake: Condvar,
     /// Set when the window closes: the worker drops its models and ends.
     quit: std::sync::atomic::AtomicBool,
+    /// Key of the current settings: a picture for another key stops at its next
+    /// submission (moving a slider does not wait for the old picture to finish).
+    wanted: std::sync::atomic::AtomicU64,
 }
 
 /// Deinterlacing of the source, done before the whole stack.
@@ -568,6 +579,12 @@ pub struct Ai {
     cost: f64,
     /// Last picture shown, held during playback until the next one is ready.
     held: Option<(u64, Pos, Arc<Picture>)>,
+    /// The live shader effects after the AI ones (their settings), if any: the whole
+    /// stack's pictures are kept under `whole_key` (see `keep_captured`).
+    live: Option<u64>,
+    /// The picture `get` returned last was the one made for that position (not one
+    /// held from another).
+    exact: Option<Pos>,
     pub error: Option<String>,
     /// The window's GPU device.
     pub ctx: Option<Arc<GpuContext>>,
@@ -596,6 +613,7 @@ impl Ai {
             restoring: Mutex::new(None),
             restore_wake: Condvar::new(),
             quit: false.into(),
+            wanted: 0.into(),
         });
         let s = shared.clone();
         let worker = std::thread::Builder::new().name("brp-ai".into()).spawn(move || worker(s)).expect("ai thread");
@@ -619,6 +637,8 @@ impl Ai {
             missing: HashMap::new(),
             cost: 0.1,
             held: None,
+            live: None,
+            exact: None,
             error: None,
             ctx: None,
             threads: vec![worker, restorer],
@@ -661,6 +681,7 @@ impl Ai {
             self.shared.restores.lock().clear();
         }
         self.key = key;
+        self.shared.wanted.store(key, std::sync::atomic::Ordering::Relaxed);
         self.subs = subs;
         changed
     }
@@ -691,6 +712,72 @@ impl Ai {
             || !self.shared.restores.lock().is_empty()
     }
 
+    /// The live shader effects (their key), or None. Pictures of the whole stack are
+    /// kept and looked up under `whole_key`.
+    pub fn set_live(&mut self, live: Option<u64>) {
+        self.live = live;
+    }
+
+    /// Key of the whole stack's pictures: the AI part's key, with the live effects'.
+    pub fn whole_key(&self) -> u64 {
+        match self.live {
+            None => self.key,
+            Some(l) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (self.key, l).hash(&mut h);
+                h.finish()
+            }
+        }
+    }
+
+    /// Some effect is on (AI or live): there are whole-stack pictures to keep.
+    pub fn any_effect(&self) -> bool {
+        self.active() || self.live.is_some()
+    }
+
+    /// The whole stack's picture at `pos` kept in RAM: (width, height, RGBA16F pixels).
+    pub fn ram_picture(&self, pos: Pos) -> Option<(u32, u32, &[u8])> {
+        self.ram.get(&(self.whole_key(), pos)).map(|(p, _)| (p.w, p.h, &p.data[..]))
+    }
+
+    /// The picture last returned by `get` was made for `pos` exactly.
+    pub fn exact(&self) -> Option<Pos> {
+        self.exact
+    }
+
+    /// A picture of the whole stack the window made (the live effects' output).
+    pub fn keep_captured(&mut self, c: brp_render::Captured) {
+        let (key, n, sub) = c.tag;
+        let k = (key, (n, sub));
+        let ram = RamPicture { w: c.pic.w, h: c.pic.h, alpha: c.pic.alpha, data: c.data };
+        self.keep_ram(k, Arc::new(ram));
+        self.keep_gpu(k, c.pic);
+    }
+
+    /// Keep a picture in the GPU cache (oldest dropped over its budget).
+    fn keep_gpu(&mut self, k: (u64, Pos), p: Arc<Picture>) {
+        let bytes = picture_bytes(&p);
+        if let Some(old) = self.cache.insert(k, p) {
+            self.cache_bytes -= picture_bytes(&old);
+        } else {
+            self.order.push_back(k);
+        }
+        self.cache_bytes += bytes;
+        while self.cache_bytes > CACHE_BYTES && self.order.len() > 2 {
+            if let Some(old) = self.order.pop_front() {
+                if let Some(p) = self.cache.remove(&old) {
+                    self.cache_bytes -= picture_bytes(&p);
+                }
+            }
+        }
+    }
+
+    /// A picture kept in RAM is being put back on the GPU.
+    pub fn restoring(&self) -> bool {
+        self.shared.restoring.lock().is_some() || !self.shared.restores.lock().is_empty()
+    }
+
     /// Forget everything (another file: positions mean other pictures).
     pub fn clear(&mut self) {
         self.clear_gpu();
@@ -713,10 +800,11 @@ impl Ai {
 
     /// Frames with a processed picture of the current stack in RAM (timeline).
     pub fn ram_cached_frames(&self) -> Vec<i64> {
-        if !self.active() {
+        if !self.any_effect() {
             return Vec::new();
         }
-        let mut v: Vec<i64> = self.ram.keys().filter(|(k, _)| *k == self.key).map(|(_, p)| p.0).collect();
+        let key = self.whole_key();
+        let mut v: Vec<i64> = self.ram.keys().filter(|(k, _)| *k == key).map(|(_, p)| p.0).collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -775,21 +863,10 @@ impl Ai {
                     if !d.restored {
                         self.cost = self.cost * 0.7 + d.took.as_secs_f64() * 0.3;
                     }
-                    let bytes = picture_bytes(&p);
-                    self.last_bytes = bytes;
-                    if let Some(old) = self.cache.insert((d.key, d.pos), p) {
-                        self.cache_bytes -= picture_bytes(&old);
-                    } else {
-                        self.order.push_back((d.key, d.pos));
+                    if !d.restored {
+                        self.last_bytes = picture_bytes(&p);
                     }
-                    self.cache_bytes += bytes;
-                    while self.cache_bytes > CACHE_BYTES && self.order.len() > 2 {
-                        if let Some(old) = self.order.pop_front() {
-                            if let Some(p) = self.cache.remove(&old) {
-                                self.cache_bytes -= picture_bytes(&p);
-                            }
-                        }
-                    }
+                    self.keep_gpu((d.key, d.pos), p);
                     if d.key == key {
                         self.error = None;
                     }
@@ -801,7 +878,7 @@ impl Ai {
                 Outcome::Missing => {
                     self.missing.insert((d.key, d.pos), d.decoded);
                 }
-                Outcome::Failed(_) => {}
+                Outcome::Failed(_) | Outcome::Cancelled => {}
             }
         }
     }
@@ -869,7 +946,42 @@ impl Ai {
             color: src.info.color,
             ctx,
             deint: self.deint,
+            stoppable: self.cost > STOP_AFTER,
         })
+    }
+
+    /// While scrubbing: the processed picture at `pos` if it is already made (on the
+    /// GPU, or in RAM: then uploaded, a few milliseconds, and shown from the next
+    /// redraw). Nothing new is computed.
+    /// Returns the picture and whether it is the whole stack's (else the AI part's,
+    /// for the live effects to run on).
+    pub fn cached(&mut self, pos: Pos) -> Option<(Arc<Picture>, bool)> {
+        self.collect();
+        let whole = self.whole_key();
+        let mut keys = vec![(whole, true)];
+        if self.live.is_some() && self.active() {
+            keys.push((self.key, false));
+        }
+        for &(key, is_whole) in &keys {
+            if let Some(f) = self.cache.get(&(key, pos)).cloned() {
+                self.touch((key, pos));
+                if key == self.key {
+                    self.held = Some((key, pos, f.clone()));
+                }
+                return Some((f, is_whole));
+            }
+        }
+        for &(key, _) in &keys {
+            if *self.shared.restoring.lock() == Some((key, pos)) {
+                return None;
+            }
+            if let (Some((pic, _)), Some(ctx)) = (self.ram.get(&(key, pos)), self.ctx.clone()) {
+                *self.shared.restores.lock() = VecDeque::from([Restore { key, pos, pic: pic.clone(), ctx }]);
+                self.shared.restore_wake.notify_one();
+                return None;
+            }
+        }
+        None
     }
 
     /// The processed picture to show at `pos`, if there is one. Asks for the pictures
@@ -940,6 +1052,7 @@ impl Ai {
                 self.shared.restore_wake.notify_one();
             }
         }
+        self.exact = exact.is_some().then_some(pos);
         match (exact, playback) {
             (Some(f), _) => {
                 self.held = Some((key, pos, f.clone()));
@@ -1116,6 +1229,11 @@ pub(crate) struct Worker {
     added_motion: Vec<(usize, i64, i64, u8)>,
     /// Host-visible buffer finished pictures are copied into for the RAM cache.
     readback: Option<Buffer>,
+    /// The viewer's worker: stop the picture being made (see `Shared::wanted`).
+    cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// GPU time of the last picture made, and the average per network layer.
+    last_gpu: Option<std::time::Duration>,
+    ms_per_layer: f64,
 }
 
 /// Stage outputs kept (GPU memory; tensors are planar f32).
@@ -1151,6 +1269,10 @@ fn worker(shared: Arc<Shared>) {
             }
         };
         let t = std::time::Instant::now();
+        let (s, key, stoppable) = (shared.clone(), job.key, job.stoppable);
+        w.cancel = Some(Arc::new(move || stoppable && s.wanted.load(std::sync::atomic::Ordering::Relaxed) != key));
+        let layers = brp_ai::vk::Net::layers_recorded();
+        w.last_gpu = None;
         // A panic in the work must not kill this thread: "current" would stay set, the
         // window would wait (spinner) forever and no picture would come again. It
         // becomes the job's error (shown on the effect), and the state starts afresh.
@@ -1165,6 +1287,10 @@ fn worker(shared: Arc<Shared>) {
                 log::debug!("AI: {e}");
                 Outcome::Missing
             }
+            Ok(Err(e)) if e.is::<brp_render::compute::Cancelled>() => {
+                log::debug!("AI: frame {} stopped after {:?} (a setting changed)", job.pos.0, t.elapsed());
+                Outcome::Cancelled
+            }
             Ok(Err(e)) => Outcome::Failed(format!("{e:#}")),
             Err(panic) => {
                 let msg = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
@@ -1174,10 +1300,30 @@ fn worker(shared: Arc<Shared>) {
             }
         };
         let took = t.elapsed();
+        if let Some(gpu) = w.last_gpu {
+            pace_submissions(&mut w.ms_per_layer, gpu, brp_ai::vk::Net::layers_recorded() - layers);
+        }
         log::debug!("AI: frame {} sub {} in {:?}", job.pos.0, job.pos.1, took);
         shared.done.lock().push(Done { key: job.key, pos: job.pos, outcome, took, decoded: job.frames.len(), ram, restored: false });
         *shared.current.lock() = None;
     }
+}
+
+/// The window draws between the worker's submissions: each should take about this
+/// long on the GPU (longer ones make the window stutter while effects compute).
+const SUBMIT_MS: f64 = 8.0;
+
+/// Keep the networks' submissions near `SUBMIT_MS`, from the GPU time per network
+/// layer the last picture took (an average over all its work, so a little short).
+fn pace_submissions(ms_per_layer: &mut f64, gpu: std::time::Duration, layers: u64) {
+    if layers < 16 {
+        return;
+    }
+    let ms = gpu.as_secs_f64() * 1e3 / layers as f64;
+    *ms_per_layer = if *ms_per_layer > 0.0 { *ms_per_layer * 0.5 + ms * 0.5 } else { ms };
+    let limit = (SUBMIT_MS / *ms_per_layer).round().clamp(2.0, 400.0) as usize;
+    brp_ai::vk::Net::set_flush_limit(limit);
+    log::trace!("AI: {ms:.3} ms per layer: submit every {limit} layers");
 }
 
 /// Puts pictures kept in RAM back on the GPU (a staging buffer and one copy each,
@@ -1417,7 +1563,9 @@ impl Worker {
     /// recording was to make.
     fn run<T>(&mut self, job: &Job, body: impl FnOnce(&mut Self, &mut Recorder) -> anyhow::Result<T>) -> anyhow::Result<T> {
         if self.gpu.as_ref().is_none_or(|g| !Arc::ptr_eq(&g.ctx, &job.ctx)) {
+            let cancel = self.cancel.take();
             *self = Worker::default();
+            self.cancel = cancel;
             let compute = Compute::new(job.ctx.clone());
             let ops = Ops::new(&compute)?;
             let tm = Temporal::new(&ops)?;
@@ -1461,6 +1609,11 @@ impl Worker {
         let compute = self.gpu().compute.clone();
         let mut rec = Recorder::new(&compute)?;
         rec.label = format!("ai {}:{}", job.pos.0, job.pos.1);
+        rec.cancel = self.cancel.clone();
+        if rec.cancel.is_some() {
+            // The viewer: the window's frames get the GPU between the parts.
+            rec.max_queued = 1;
+        }
         self.begun.clear();
         self.added.clear();
         self.added_motion.clear();
@@ -1470,6 +1623,7 @@ impl Worker {
             Ok(v) => {
                 let recorded = t0.elapsed();
                 rec.submit_wait().map(|t| {
+                    self.last_gpu = Some(t);
                     log::trace!("AI: recorded in {recorded:?}, GPU {t:?}, total {:?}", t0.elapsed());
                     v
                 })

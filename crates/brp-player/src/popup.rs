@@ -98,6 +98,7 @@ impl PopupWin {
         blur_behind(&window);
         let size = window.inner_size();
         let renderer = PopupRenderer::new(gpu, &*window, size.width, size.height, Some(backdrop))?;
+        renderer.set_waker(crate::redraw_waker(&window));
         let egui_ctx = egui::Context::default();
         ui::setup_style(&egui_ctx, true);
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, Some(window.scale_factor() as f32), None, Some(8192));

@@ -38,30 +38,59 @@ impl RestoreModel {
     }
 }
 
-/// Where the network ran away: a pixel it moved by more than DIVERGE (or made
-/// non-finite). NAFNet REDS does on dense, already sharp detail at full size (crowds,
-/// foliage in aerial shots): its activations grow to 1e5-1e6 and the output to
-/// +-1000, the same in the official network (tools/airef/nafnet_ref.py). On normal
-/// frames 0.002% of pixels move by more than 0.35.
+/// Where the network ran away. NAFNet REDS does on dense, already sharp detail at
+/// full size (crowds, foliage in aerial shots): its activations grow to 1e5-1e6 and
+/// the output to +-1000, the same in the official network (tools/airef/nafnet_ref.py),
+/// with coloured speckles inside 0..1 around those places and on their own. A pixel
+/// ran away if the network made it more than DIVERGE outside 0..1 (or non-finite) or
+/// changed its colour by more than CHROMA (green-red or green-blue: the speckles turn
+/// brown into pure blue, green, magenta; deblurring mostly changes brightness), or
+/// moved it by more than DIVERGE within NEAR_R of such a pixel. Moving a pixel that far is not
+/// enough by itself: deblurring a fast hand legitimately does at its edges (a smear
+/// becomes skin against a white wall), and the original came back there in 17 px
+/// blurred squares.
 const DIVERGE: f32 = 0.35;
+const NEAR_R: i32 = 16;
+const CHROMA: f32 = 0.4;
 /// The window (2 R + 1)^2 around a pixel whose share of runaway pixels decides how
 /// much of the original it shows; FULL of them shows it alone.
 const FALLBACK_R: i32 = 8;
 const FALLBACK_FULL: f32 = 0.02;
 
+// Per pixel: out of range (seed) and moved far (moved), 0 or 1.
 const BAD: &str = r#"
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
-layout(push_constant) uniform P { F32 a; F32 b; F32 o; int W, H; float t; } p;
+layout(push_constant) uniform P { F32 a; F32 b; F32 seed; F32 moved; int W, H; float t; float chroma; } p;
 void main() {
     int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
     if (x >= p.W || y >= p.H) return;
     int i = y * p.W + x, n = p.W * p.H;
-    bool bad = false;
+    bool seed = false, moved = false;
+    vec3 d;
     for (int c = 0; c < 3; c++) {
         float v = p.b.v[c * n + i];
-        bad = bad || isnan(v) || isinf(v) || abs(v - p.a.v[c * n + i]) > p.t;
+        seed = seed || isnan(v) || isinf(v) || v < -p.t || v > 1.0 + p.t;
+        d[c] = v - p.a.v[c * n + i];
+        moved = moved || abs(d[c]) > p.t;
     }
-    p.o.v[i] = bad ? 1.0 : 0.0;
+    seed = seed || abs(d.r - d.g) > p.chroma || abs(d.b - d.g) > p.chroma;
+    p.seed.v[i] = seed ? 1.0 : 0.0;
+    p.moved.v[i] = moved ? 1.0 : 0.0;
+}
+"#;
+
+// Ran away: a seed, or moved far with a seed within R (rows: the seeds summed along
+// each row over +-R).
+const NEAR: &str = r#"
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform P { F32 rows; F32 seed; F32 moved; F32 o; int W, H, R; } p;
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.W || y >= p.H) return;
+    float s = 0.0;
+    for (int d = -p.R; d <= p.R; d++) s += p.rows.v[clamp(y + d, 0, p.H - 1) * p.W + x];
+    int i = y * p.W + x;
+    p.o.v[i] = (p.seed.v[i] > 0.0 || (p.moved.v[i] > 0.0 && s > 0.0)) ? 1.0 : 0.0;
 }
 "#;
 
@@ -102,6 +131,7 @@ pub struct Restorer {
     net: Net,
     pub model: RestoreModel,
     bad: Arc<Kernel>,
+    near: Arc<Kernel>,
     rowsum: Arc<Kernel>,
     fallback: Arc<Kernel>,
 }
@@ -123,7 +153,7 @@ impl Restorer {
         // nears Windows' 2 s limit on slower ones.
         net.set_flush_every(40);
         let k = |name: &str, body: &str| ops.compute.kernel(&format!("restore_{name}"), &format!("{PRELUDE}{body}"), 0);
-        Ok(Restorer { ops: ops.clone(), net, model, bad: k("bad", BAD)?, rowsum: k("rowsum", ROWSUM)?, fallback: k("fallback", FALLBACK)? })
+        Ok(Restorer { ops: ops.clone(), net, model, bad: k("bad3", BAD)?, near: k("near", NEAR)?, rowsum: k("rowsum", ROWSUM)?, fallback: k("fallback", FALLBACK)? })
     }
 
     /// Where the network ran away (see DIVERGE), `out` (3 channels, `img`'s size)
@@ -132,12 +162,16 @@ impl Restorer {
         let ops = &self.ops;
         let (w, h) = (img.w, img.h);
         let g = |k: &Kernel| Recorder::groups(k, [w as u32, h as u32, 1]);
-        let bad = ops.tensor(1, h, w)?;
-        rec.dispatch(&self.bad, g(&self.bad), &Push::new().t(img).t(out).t(&bad).i(w as i32).i(h as i32).f(DIVERGE))?;
+        let (seed, moved, bad) = (ops.tensor(1, h, w)?, ops.tensor(1, h, w)?, ops.tensor(1, h, w)?);
+        rec.dispatch(&self.bad, g(&self.bad), &Push::new().t(img).t(out).t(&seed).t(&moved).i(w as i32).i(h as i32).f(DIVERGE).f(CHROMA))?;
         let rows = ops.tensor(1, h, w)?;
+        rec.dispatch(&self.rowsum, g(&self.rowsum), &Push::new().t(&seed).t(&rows).i(w as i32).i(h as i32).i(NEAR_R))?;
+        rec.dispatch(&self.near, g(&self.near), &Push::new().t(&rows).t(&seed).t(&moved).t(&bad).i(w as i32).i(h as i32).i(NEAR_R))?;
         rec.dispatch(&self.rowsum, g(&self.rowsum), &Push::new().t(&bad).t(&rows).i(w as i32).i(h as i32).i(FALLBACK_R))?;
         rec.dispatch(&self.fallback, g(&self.fallback), &Push::new().t(&rows).t(img).t(out).i(w as i32).i(h as i32).i(FALLBACK_R).f(FALLBACK_FULL))?;
         ops.recycle(rec, bad);
+        ops.recycle(rec, seed);
+        ops.recycle(rec, moved);
         ops.recycle(rec, rows);
         Ok(())
     }

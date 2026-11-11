@@ -160,6 +160,7 @@ pub struct UiState {
     /// BRP_TEST_DROP_AFTER done.
     pub test_dropped: bool,
     pub test_layer_done: bool,
+    pub test_dumped: bool,
     pub icons: Icons,
 }
 
@@ -203,6 +204,7 @@ impl UiState {
             fx_add_open: false,
             test_dropped: false,
             test_layer_done: false,
+            test_dumped: false,
         };
         s.export.load(&s.settings);
         s
@@ -2287,96 +2289,102 @@ fn effects_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions:
     let before = p.fx.list.clone();
     let mut changed = false;
     let mut started = false;
-    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-        let ai_kind = p.fx.list[idx].ai;
-        let text = |i: usize| crate::effects::param_text(&file, ai_kind, i, l);
-        for (cat, views) in param_views(&file, &text) {
-            let mut body = |ui: &mut egui::Ui| {
-                egui::Grid::new(("fx_params", sel, cat.clone())).num_columns(2).spacing(Vec2::new(10.0, 6.0)).show(ui, |ui| {
-                    let ai = p.fx.list[idx].ai;
-                    for v in &views {
-                        let values = &mut p.fx.list[idx].spec.params;
-                        if let (Some(k), ParamView::Single(i)) = (ai, v) {
-                            if !k.param_shown(*i, values) {
-                                continue;
-                            }
-                        }
-                        match v {
-                            ParamView::Single(i) => {
-                                let pd = &file.params[*i];
-                                let (label, desc) = text(*i);
-                                ui.label(RichText::new(&label).color(Color32::from_gray(170))).on_hover_text(clean_desc(&desc));
-                                let (lo, hi) = (pd.min.unwrap_or(0.0), pd.max.unwrap_or(1.0));
-                                let options = crate::effects::param_options(&desc);
-                                let r = match pd.kind {
-                                    _ if options.is_some() => {
-                                        let options = options.unwrap();
-                                        let mut n = (values[*i].round() as usize).min(options.len().saturating_sub(1));
-                                        let r = egui::ComboBox::from_id_salt(("fx_opt", sel, *i))
-                                            .selected_text(options.get(n).cloned().unwrap_or_default())
-                                            .width(200.0)
-                                            .show_ui(ui, |ui| {
-                                                for (k, o) in options.iter().enumerate() {
-                                                    ui.selectable_value(&mut n, k, o);
-                                                }
-                                            })
-                                            .response;
-                                        let picked = n as f64 != values[*i];
-                                        values[*i] = n as f64;
-                                        if picked {
-                                            started = true;
-                                            changed = true;
-                                        }
-                                        r
-                                    }
-                                    ParamKind::Float => ui.add(egui::Slider::new(&mut values[*i], lo..=hi).max_decimals(3)),
-                                    _ if lo == 0.0 && hi == 1.0 => {
-                                        let mut b = values[*i] >= 0.5;
-                                        let r = ui.checkbox(&mut b, "");
-                                        values[*i] = b as i32 as f64;
-                                        r
-                                    }
-                                    _ => {
-                                        let mut n = values[*i].round() as i64;
-                                        let r = ui.add(egui::Slider::new(&mut n, lo as i64..=hi as i64));
-                                        values[*i] = n as f64;
-                                        r
-                                    }
-                                };
-                                let r = r.on_hover_text(clean_desc(&desc));
-                                started |= r.drag_started() || (r.changed() && !r.dragged());
-                                changed |= r.changed();
-                            }
-                            ParamView::Color { label, idx: [r, g, b] } => {
-                                ui.label(RichText::new(label).color(Color32::from_gray(170))).on_hover_text(clean_desc(&text(*r).1));
-                                let mut c = [values[*r] as f32, values[*g] as f32, values[*b] as f32];
-                                let resp = ui.color_edit_button_rgb(&mut c);
-                                if resp.changed() {
-                                    values[*r] = c[0] as f64;
-                                    values[*g] = c[1] as f64;
-                                    values[*b] = c[2] as f64;
-                                    changed = true;
+    // A fixed identity for the parameters: widgets get theirs from what was drawn
+    // before them, and the effects list above changes (a busy spinner comes and goes
+    // as a paused frame is computed). A slider whose identity changes is let go of
+    // in the middle of a drag.
+    ui.scope_builder(egui::UiBuilder::new().id(Id::new(("fx_params_area", sel))), |ui| {
+        egui::ScrollArea::vertical().id_salt("fx_params").max_height(420.0).show(ui, |ui| {
+            let ai_kind = p.fx.list[idx].ai;
+            let text = |i: usize| crate::effects::param_text(&file, ai_kind, i, l);
+            for (cat, views) in param_views(&file, &text) {
+                let mut body = |ui: &mut egui::Ui| {
+                    egui::Grid::new(("fx_params", sel, cat.clone())).num_columns(2).spacing(Vec2::new(10.0, 6.0)).show(ui, |ui| {
+                        let ai = p.fx.list[idx].ai;
+                        for v in &views {
+                            let values = &mut p.fx.list[idx].spec.params;
+                            if let (Some(k), ParamView::Single(i)) = (ai, v) {
+                                if !k.param_shown(*i, values) {
+                                    continue;
                                 }
-                                started |= resp.clicked();
                             }
+                            match v {
+                                ParamView::Single(i) => {
+                                    let pd = &file.params[*i];
+                                    let (label, desc) = text(*i);
+                                    ui.label(RichText::new(&label).color(Color32::from_gray(170))).on_hover_text(clean_desc(&desc));
+                                    let (lo, hi) = (pd.min.unwrap_or(0.0), pd.max.unwrap_or(1.0));
+                                    let options = crate::effects::param_options(&desc);
+                                    let r = match pd.kind {
+                                        _ if options.is_some() => {
+                                            let options = options.unwrap();
+                                            let mut n = (values[*i].round() as usize).min(options.len().saturating_sub(1));
+                                            let r = egui::ComboBox::from_id_salt(("fx_opt", sel, *i))
+                                                .selected_text(options.get(n).cloned().unwrap_or_default())
+                                                .width(200.0)
+                                                .show_ui(ui, |ui| {
+                                                    for (k, o) in options.iter().enumerate() {
+                                                        ui.selectable_value(&mut n, k, o);
+                                                    }
+                                                })
+                                                .response;
+                                            let picked = n as f64 != values[*i];
+                                            values[*i] = n as f64;
+                                            if picked {
+                                                started = true;
+                                                changed = true;
+                                            }
+                                            r
+                                        }
+                                        ParamKind::Float => ui.add(egui::Slider::new(&mut values[*i], lo..=hi).max_decimals(3)),
+                                        _ if lo == 0.0 && hi == 1.0 => {
+                                            let mut b = values[*i] >= 0.5;
+                                            let r = ui.checkbox(&mut b, "");
+                                            values[*i] = b as i32 as f64;
+                                            r
+                                        }
+                                        _ => {
+                                            let mut n = values[*i].round() as i64;
+                                            let r = ui.add(egui::Slider::new(&mut n, lo as i64..=hi as i64));
+                                            values[*i] = n as f64;
+                                            r
+                                        }
+                                    };
+                                    let r = r.on_hover_text(clean_desc(&desc));
+                                    started |= r.drag_started() || (r.changed() && !r.dragged());
+                                    changed |= r.changed();
+                                }
+                                ParamView::Color { label, idx: [r, g, b] } => {
+                                    ui.label(RichText::new(label).color(Color32::from_gray(170))).on_hover_text(clean_desc(&text(*r).1));
+                                    let mut c = [values[*r] as f32, values[*g] as f32, values[*b] as f32];
+                                    let resp = ui.color_edit_button_rgb(&mut c);
+                                    if resp.changed() {
+                                        values[*r] = c[0] as f64;
+                                        values[*g] = c[1] as f64;
+                                        values[*b] = c[2] as f64;
+                                        changed = true;
+                                    }
+                                    started |= resp.clicked();
+                                }
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
+                    });
+                };
+                match &cat {
+                    Some(c) => {
+                        egui::CollapsingHeader::new(c).id_salt(("fx_cat", sel, c.clone())).default_open(true).show(ui, &mut body);
                     }
-                });
-            };
-            match &cat {
-                Some(c) => {
-                    egui::CollapsingHeader::new(c).id_salt(("fx_cat", sel, c.clone())).default_open(true).show(ui, &mut body);
+                    None => body(ui),
                 }
-                None => body(ui),
             }
-        }
-        ui.add_space(4.0);
-        if ui.button(l.t("fx_reset")).clicked() {
-            p.fx.list[idx].spec.params = file.params.iter().map(|q| q.default).collect();
-            started = true;
-            changed = true;
-        }
+            ui.add_space(4.0);
+            if ui.button(l.t("fx_reset")).clicked() {
+                p.fx.list[idx].spec.params = file.params.iter().map(|q| q.default).collect();
+                started = true;
+                changed = true;
+            }
+        });
     });
     if started {
         // One undo step per drag / click, holding the state before the change.

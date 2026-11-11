@@ -734,19 +734,47 @@ impl Player {
             self.first_frame_logged = true;
         }
         // AI results arrive asynchronously: keep redrawing while one is being made.
-        if self.ai.active() && self.ai.busy() && !self.scrubbing {
+        // While scrubbing only pictures kept in RAM are put back (see `Ai::cached`).
+        if if self.scrubbing { self.ai.any_effect() && self.ai.restoring() } else { self.ai.active() && self.ai.busy() } {
             waiting = true;
         }
         self.playing || waiting
     }
 
+    /// Position of the picture on screen: (frame, picture within it: the in-between
+    /// picture of the AI effects, or the field shown at field rate).
+    pub fn shown_pos(&self) -> Option<crate::ai::Pos> {
+        let n = self.shown.as_ref()?.index();
+        Some(if self.ai.active() {
+            (n, if n == self.current { self.sub } else { 0 })
+        } else {
+            (n, if self.field_rate_active() { self.field } else { 0 })
+        })
+    }
+
+    /// While scrubbing: the effect picture already made for the frame on screen, if
+    /// any, and whether it is the whole stack's (else the AI part's, for the live
+    /// effects to run on). See `Ai::cached`.
+    pub fn scrub_picture(&mut self) -> Option<(Arc<brp_render::compute::Picture>, bool)> {
+        if !self.scrubbing || !self.ai.any_effect() {
+            return None;
+        }
+        let pos = self.shown_pos()?;
+        self.ai.cached(pos)
+    }
+
     /// The AI-processed picture on screen, if AI is on and it is ready.
     pub fn ai_frame(&mut self) -> Option<Arc<brp_render::compute::Picture>> {
-        if !self.ai.active() || self.scrubbing {
+        if !self.ai.active() {
             return None;
         }
         let n = self.shown.as_ref()?.index();
         let sub = if n == self.current { self.sub } else { 0 };
+        // Scrubbing: see `scrub_picture` (nothing is computed until the playhead is
+        // let go).
+        if self.scrubbing {
+            return None;
+        }
         let src = self.source.as_ref()?;
         let playback = self.playing.then(|| crate::ai::Playback {
             interval: 1.0 / (src.info.frame_rate.max(1.0) * self.speed.max(0.01)),
