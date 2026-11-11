@@ -8,6 +8,7 @@
 //! from the source file, cut to the exported range, retimed when the export changes
 //! speed, and encoded alongside.
 
+use crate::external::{self, External, Msg, Pkt};
 use crate::ffutil::{self, cstr, Input, Packet};
 use crate::info::{ColorInfo, Matrix, Primaries, Transfer};
 use anyhow::{bail, Context as _, Result};
@@ -280,14 +281,33 @@ pub fn video_encoders() -> Vec<EncoderInfo> {
             }
         }
     }
+    out.extend(external::ENCODERS.iter().filter(|n| external::handles(n)).filter_map(|n| external_info(n)));
     out
+}
+
+/// An encoder run by the external GPL `ffmpeg.exe` (x264, x265).
+fn external_info(name: &str) -> Option<EncoderInfo> {
+    let (codec, pix) = external::info(name)?;
+    Some(EncoderInfo {
+        name: name.to_string(),
+        long_name: format!("{name} (external ffmpeg.exe)"),
+        codec: codec.to_string(),
+        pix_fmts: pix.iter().map(|s| s.to_string()).collect(),
+        hardware: false,
+    })
 }
 
 pub fn encoder(name: &str) -> Option<EncoderInfo> {
     let n = cstr(name);
     unsafe {
         let c = ff::avcodec_find_encoder_by_name(n.as_ptr());
-        if c.is_null() { None } else { Some(info_of(c)) }
+        if !c.is_null() {
+            Some(info_of(c))
+        } else if external::handles(name) {
+            external_info(name)
+        } else {
+            None
+        }
     }
 }
 
@@ -351,6 +371,9 @@ pub fn encoder_has_option(encoder: &str, option: &str) -> bool {
 /// Whether the encoder really opens here (hardware encoders need the right GPU and
 /// driver): opens it on a small picture and closes it.
 pub fn probe_encoder(name: &str, pix_fmt: &str) -> Result<()> {
+    if external::handles(name) {
+        return Ok(());
+    }
     let n = cstr(name);
     unsafe {
         let c = ff::avcodec_find_encoder_by_name(n.as_ptr());
@@ -382,10 +405,21 @@ pub fn muxer_accepts(muxer: &str, encoder: &str) -> Option<bool> {
     unsafe {
         let of = ff::av_guess_format(m.as_ptr(), std::ptr::null(), std::ptr::null());
         let c = ff::avcodec_find_encoder_by_name(e.as_ptr());
-        if of.is_null() || c.is_null() {
+        let id = if !c.is_null() {
+            (*c).id
+        } else if let Some((codec, _)) = external::info(encoder).filter(|_| external::handles(encoder)) {
+            let d = ff::avcodec_descriptor_get_by_name(cstr(codec).as_ptr());
+            if d.is_null() {
+                return None;
+            }
+            (*d).id
+        } else {
+            return None;
+        };
+        if of.is_null() {
             return None;
         }
-        match ff::avformat_query_codec(of, (*c).id, ff::FF_COMPLIANCE_NORMAL as i32) {
+        match ff::avformat_query_codec(of, id, ff::FF_COMPLIANCE_NORMAL as i32) {
             1 => Some(true),
             0 => Some(false),
             _ => None,
@@ -502,6 +536,12 @@ pub struct Writer {
     finished: bool,
     /// Packets come encoded (no encoder of ours is open).
     precoded: Option<Precoded>,
+    /// x264/x265 in the external GPL ffmpeg.exe: pictures go to it, packets come back.
+    /// The header waits for its codec parameters.
+    ext: Option<External>,
+    ext_pending: Vec<Pkt>,
+    ext_tb: ff::AVRational,
+    rotation: u32,
 }
 
 unsafe impl Send for Writer {}
@@ -584,9 +624,15 @@ impl Writer {
                 header: false,
                 finished: false,
                 precoded: v.precoded.clone(),
+                ext: None,
+                ext_pending: Vec::new(),
+                ext_tb: ff::AVRational { num: 1, den: 1 },
+                rotation: v.rotation,
             };
             if v.precoded.is_some() {
                 w.open_precoded(v)?;
+            } else if external::handles(&v.encoder) {
+                w.open_external(v)?;
             } else {
                 w.open_video(v)?;
             }
@@ -604,6 +650,18 @@ impl Writer {
             for (k, val) in metadata {
                 dict_set(&mut (*oc).metadata, k, val);
             }
+            // The external encoder's header comes with its first packets.
+            if w.ext.is_none() {
+                w.write_header()?;
+            }
+            Ok(w)
+        }
+    }
+
+    unsafe fn write_header(&mut self) -> Result<()> {
+        unsafe {
+            let oc = self.oc;
+            let fmt = (*oc).oformat;
             let mut opts: *mut ff::AVDictionary = std::ptr::null_mut();
             let mname = ffutil::opt_str((*fmt).name).unwrap_or_default();
             if mname.contains("mp4") || mname.contains("mov") {
@@ -615,8 +673,162 @@ impl Writer {
             let r = ff::avformat_write_header(oc, &mut opts);
             ff::av_dict_free(&mut opts);
             ffutil::check(r, "write header")?;
-            w.header = true;
-            Ok(w)
+            self.header = true;
+            Ok(())
+        }
+    }
+
+    /// x264/x265 through the external program: the stream gets its parameters
+    /// when the program sends them; the pictures are prepared as for our own
+    /// encoders and sent raw.
+    unsafe fn open_external(&mut self, v: &VideoConfig) -> Result<()> {
+        unsafe {
+            let st = ff::avformat_new_stream(self.oc, std::ptr::null());
+            if st.is_null() {
+                bail!("new stream");
+            }
+            self.vst = (*st).index;
+            (*st).time_base = ff::AVRational { num: v.rate.1, den: v.rate.0 };
+            (*st).avg_frame_rate = ff::AVRational { num: v.rate.0, den: v.rate.1 };
+            (*st).sample_aspect_ratio = ff::AVRational { num: v.sar.0.max(1), den: v.sar.1.max(1) };
+            let enc_fmt = pix_fmt_of(&v.pix_fmt);
+            if enc_fmt < 0 {
+                bail!("unknown pixel format {}", v.pix_fmt);
+            }
+            let info = pix_fmt_info(&v.pix_fmt);
+            let yuv = info.as_ref().is_some_and(|i| !i.rgb);
+            let color = v.color.as_ref().map(|c| {
+                let (p, t, s, r) = col_tags(c, yuv);
+                let n = |x: *const std::ffi::c_char| ffutil::opt_str(x).unwrap_or_else(|| "unknown".into());
+                [n(ff::av_color_primaries_name(p)), n(ff::av_color_transfer_name(t)), n(ff::av_color_space_name(s)), n(ff::av_color_range_name(r))]
+            });
+            let mut options = v.options.clone();
+            match &v.rate_control {
+                RateControl::Default => {}
+                RateControl::Quality(q) => options.push(("crf".into(), format!("{q}"))),
+                RateControl::Bitrate(k) => options.push(("b:v".into(), format!("{k}k"))),
+                RateControl::Cbr(k) => {
+                    for o in ["b:v", "minrate", "maxrate"] {
+                        options.push((o.into(), format!("{k}k")));
+                    }
+                    options.push(("bufsize".into(), format!("{}k", (k / 2).max(1))));
+                }
+            }
+            let job = external::Job {
+                encoder: &v.encoder,
+                pix_fmt: &v.pix_fmt,
+                width: v.width,
+                height: v.height,
+                rate: v.rate,
+                sar: v.sar,
+                options,
+                gop: v.gop,
+                field_order: v.field_order,
+                color,
+                global_header: (*(*self.oc).oformat).flags & ff::AVFMT_GLOBALHEADER as i32 != 0,
+            };
+            self.setup_delivery(v, enc_fmt, &info)?;
+            self.ext = Some(External::start(&job)?);
+            Ok(())
+        }
+    }
+
+    /// Take what the external program sent: its parameters (then the header is
+    /// written) and packets. `block`: until it ends.
+    unsafe fn ext_pump(&mut self, block: bool) -> Result<()> {
+        unsafe {
+            loop {
+                let Some(ext) = self.ext.as_ref() else { return Ok(()) };
+                let msg = if block {
+                    match ext.rx.recv() {
+                        Ok(m) => m,
+                        Err(_) => return Ok(()),
+                    }
+                } else {
+                    match ext.rx.try_recv() {
+                        Ok(m) => m,
+                        Err(_) => return Ok(()),
+                    }
+                };
+                match msg {
+                    Msg::Params(p) => {
+                        let st = *(*self.oc).streams.add(self.vst as usize);
+                        let sar = (*st).sample_aspect_ratio;
+                        ffutil::check(ff::avcodec_parameters_copy((*st).codecpar, p.0), "stream parameters")?;
+                        (*(*st).codecpar).codec_tag = 0;
+                        (*(*st).codecpar).sample_aspect_ratio = sar;
+                        if self.rotation % 360 != 0 {
+                            let par = (*st).codecpar;
+                            let sd = ff::av_packet_side_data_new(&mut (*par).coded_side_data, &mut (*par).nb_coded_side_data, ff::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX, 36, 0);
+                            if !sd.is_null() {
+                                ff::av_display_rotation_set((*sd).data as *mut i32, -(self.rotation as f64));
+                            }
+                        }
+                        if let Some(tff) = self.field_order {
+                            (*(*st).codecpar).field_order = if tff { ff::AVFieldOrder::AV_FIELD_TT } else { ff::AVFieldOrder::AV_FIELD_BB };
+                        }
+                        self.ext_tb = p.1;
+                        self.write_header()?;
+                        self.ext_flush(false)?;
+                    }
+                    Msg::Packet(k) => {
+                        self.ext_pending.push(k);
+                        self.ext_flush(false)?;
+                    }
+                    Msg::End(r) => {
+                        if let Err(e) = r {
+                            let why = self.ext.as_ref().map(|x| x.error_text()).unwrap_or_default();
+                            bail!("{e}: {why}");
+                        }
+                        self.ext_flush(true)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mux the waiting packets once the header is out. The first packets of a stream
+    /// with B-frames come without decode times (libavformat learns the reorder depth
+    /// a few packets in): they wait for the first known one and get the times before
+    /// it, one frame apart. `end`: no more are coming (unknown times = presentation).
+    unsafe fn ext_flush(&mut self, end: bool) -> Result<()> {
+        unsafe {
+            if !self.header || self.ext_pending.is_empty() {
+                return Ok(());
+            }
+            let none = ffutil::AV_NOPTS_VALUE;
+            if let Some(i) = self.ext_pending.iter().position(|k| (*k.0).dts != none) {
+                let d = (*self.ext_pending[i].0).dts;
+                let step = ((*self.ext_pending[i].0).duration).max(1);
+                for (j, k) in self.ext_pending[..i].iter().enumerate() {
+                    (*k.0).dts = d - (i - j) as i64 * step;
+                }
+            } else if end {
+                for k in &self.ext_pending {
+                    (*k.0).dts = (*k.0).pts;
+                }
+            } else {
+                return Ok(());
+            }
+            for k in std::mem::take(&mut self.ext_pending) {
+                if (*k.0).dts == none {
+                    // After the first known time every packet has one; keep the order.
+                    (*k.0).dts = (*k.0).pts;
+                }
+                self.ext_mux(k)?;
+            }
+            Ok(())
+        }
+    }
+
+    unsafe fn ext_mux(&mut self, k: Pkt) -> Result<()> {
+        unsafe {
+            let st = *(*self.oc).streams.add(self.vst as usize);
+            ff::av_packet_rescale_ts(k.0, self.ext_tb, (*st).time_base);
+            (*k.0).stream_index = self.vst;
+            ffutil::check(ff::av_interleaved_write_frame(self.oc, k.0), "write video")?;
+            Ok(())
         }
     }
 
@@ -717,7 +929,15 @@ impl Writer {
                 }
             }
 
-            // What the GPU delivers, and how it reaches the encoder.
+            self.setup_delivery(v, enc_fmt, &info)?;
+            Ok(())
+        }
+    }
+
+    /// What the GPU delivers, and how it reaches the encoder (swscale for formats
+    /// the GPU cannot write, the filter graph when there is one).
+    unsafe fn setup_delivery(&mut self, v: &VideoConfig, enc_fmt: i32, info: &Option<PixFmtInfo>) -> Result<()> {
+        unsafe {
             let (deliver_fmt, filter_fmt) = match &v.filter {
                 Some((_, input)) => (pix_fmt_of(input), Some(pix_fmt_of(input))),
                 None => (enc_fmt, None),
@@ -907,15 +1127,29 @@ impl Writer {
                 None => (*frame).flags &= !((ff::AV_FRAME_FLAG_INTERLACED | ff::AV_FRAME_FLAG_TOP_FIELD_FIRST) as i32),
             }
             self.next_pts += 1;
-            if let Some(g) = &self.vfilter {
+            if let Some(ext) = &mut self.ext {
+                let f = &*frame;
+                let fmt = std::mem::transmute::<i32, ff::AVPixelFormat>(f.format);
+                let size = ff::av_image_get_buffer_size(fmt, f.width, f.height, 1);
+                ffutil::check(size, "picture size")?;
+                let mut buf = std::mem::take(&mut ext.buf);
+                buf.resize(size as usize, 0);
+                ffutil::check(ff::av_image_copy_to_buffer(buf.as_mut_ptr(), size, f.data.as_ptr() as *const *const u8, f.linesize.as_ptr(), fmt, f.width, f.height, 1), "copy picture")?;
+                let r = ext.send(&buf);
+                ext.buf = buf;
+                r?;
+                self.ext_pump(false)?;
+            } else if let Some(g) = &self.vfilter {
                 ffutil::check(ff::av_buffersrc_add_frame_flags(g.src, frame, ff::AV_BUFFERSRC_FLAG_KEEP_REF as i32), "video filter")?;
                 self.drain_filter(false)?;
             } else {
                 self.encode(frame)?;
             }
-            // Audio up to the end of this picture.
+            // Audio up to the end of this picture (once the header is out).
             let t = self.next_pts as f64 * self.rate.1 as f64 / self.rate.0 as f64;
-            if let Some(a) = &mut self.audio {
+            if self.header
+                && let Some(a) = &mut self.audio
+            {
                 a.pump(self.oc, t)?;
             }
         }
@@ -981,7 +1215,16 @@ impl Writer {
             if self.vfilter.is_some() {
                 self.drain_filter(true)?;
             }
-            if self.precoded.is_none() {
+            if let Some(ext) = &mut self.ext {
+                ext.close_input();
+                self.ext_pump(true)?;
+                if let Some(ext) = &mut self.ext {
+                    ext.wait()?;
+                }
+                if !self.header {
+                    bail!("the external encoder sent nothing");
+                }
+            } else if self.precoded.is_none() {
                 self.encode(std::ptr::null_mut())?;
             }
             if let Some(a) = &mut self.audio {

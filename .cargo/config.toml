@@ -1,9 +1,11 @@
 # Machine-specific SDK locations (Windows dev box). Adjust per machine.
-# FFmpeg: GPL build (the project is GPL-3.0-or-later).
+# FFmpeg: LGPL shared build (BtbN FFmpeg-Builds n7.1.5-12, win64-lgpl-shared-7.1) unpacked
+# into third_party/ffmpeg-lgpl/7.1. The app links only LGPL FFmpeg; x264/x265 export runs
+# a separate GPL ffmpeg.exe (see crates/brp-media/src/encode_pipe.rs).
 [env]
 # onnxref (dev tool): ONNX Runtime downloads cached in the project, not on C:.
 ORT_CACHE_DIR = { value = "target/ort-cache", relative = true }
-FFMPEG_DIR = "C:/Users/brurp/AppData/Local/Microsoft/WinGet/Packages/BtbN.FFmpeg.GPL.Shared.7.1_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1"
+FFMPEG_DIR = { value = "third_party/ffmpeg-lgpl/7.1", relative = true }
 LIBCLANG_PATH = "C:/Program Files/LLVM/bin"
 VULKAN_SDK = "C:/VulkanSDK/1.4.363.0"
 SHADERC_LIB_DIR = "C:/VulkanSDK/1.4.363.0/Lib"

@@ -4,6 +4,7 @@ mod ffutil;
 pub mod audio;
 pub mod detect;
 pub mod encode;
+pub mod external;
 pub mod sequence;
 pub mod exr_seq;
 pub mod frame;

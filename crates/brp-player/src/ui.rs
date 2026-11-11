@@ -47,6 +47,8 @@ pub enum Action {
     SetLayer(String),
     /// Show a file in the system's file browser.
     Reveal(String),
+    /// An update was installed: start the new version and close this one.
+    RestartForUpdate,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -114,6 +116,8 @@ pub struct UiState {
     pub show_batch: bool,
     /// Export and batch export (see `export_ui`).
     pub export: crate::export_ui::ExportUi,
+    /// New versions and downloaded components (models, GPL ffmpeg.exe).
+    pub update: crate::update::Updater,
     /// Popups are separate glass windows (false: drawn inside the player window).
     pub detached: bool,
     pub fx_status: Vec<(u64, brp_render::EffectStatus)>,
@@ -159,6 +163,7 @@ impl UiState {
             show_export: false,
             show_batch: false,
             export: Default::default(),
+            update: crate::update::Updater::start(),
             detached: true,
             fx_status: Vec::new(),
             fx_library: Vec::new(),
@@ -985,6 +990,7 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState) -> Vec<Action>
     });
 
     toast(ctx, s);
+    update_banner(ctx, s, &mut actions);
 
     // Popups inside this window (only when they could not get windows of their own).
     if !s.detached {
@@ -1035,6 +1041,90 @@ fn empty_state(ui: &mut egui::Ui, rect: Rect, p: &Player, s: &UiState, resp: &eg
     painter.text(c + vec2(0.0, 82.0), Align2::CENTER_CENTER, text, FontId::proportional(18.0), Color32::from_gray(200));
     painter.text(c + vec2(0.0, 108.0), Align2::CENTER_CENTER, l.t("drop_sub"), FontId::proportional(13.0), Color32::from_gray(120));
     ui.ctx().request_repaint_after(Duration::from_millis(33));
+}
+
+/// Updates and component downloads: a small card in the top right corner.
+fn update_banner(ctx: &egui::Context, s: &mut UiState, actions: &mut Vec<Action>) {
+    use crate::update::Phase;
+    if !s.update.enabled() {
+        return;
+    }
+    let l = s.lang;
+    let (phase, comps, comp_err, dismissed) = {
+        let st = s.update.state.lock();
+        (st.phase.clone(), st.components.clone(), st.component_error.clone(), st.dismissed)
+    };
+    let busy = !comps.is_empty() || matches!(phase, Phase::Downloading(..));
+    if !busy && (dismissed || (matches!(phase, Phase::Idle) && comp_err.is_none())) {
+        return;
+    }
+    let mb = |b: u64| format!("{:.0} MB", b as f64 / 1e6);
+    let bar = |ui: &mut egui::Ui, done: u64, total: u64| {
+        let f = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+        ui.add(egui::ProgressBar::new(f).desired_width(260.0).text(if total > 0 { format!("{} / {}", mb(done), mb(total)) } else { mb(done) }));
+    };
+    let screen = ctx.content_rect();
+    egui::Area::new(Id::new("update_banner")).order(Order::Foreground).fixed_pos(pos2(screen.right() - 300.0, screen.top() + 48.0)).show(ctx, |ui| {
+        Frame::new()
+            .fill(Color32::from_rgba_premultiplied(16, 18, 26, 235))
+            .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.55)))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(270.0);
+                if !comps.is_empty() {
+                    ui.label(RichText::new(l.t("upd_components")).strong());
+                    let (done, total) = comps.iter().fold((0, 0), |a, c| (a.0 + c.1, a.1 + c.2));
+                    if let Some(c) = comps.iter().find(|c| c.1 < c.2) {
+                        ui.label(RichText::new(&c.0).small().color(Color32::from_gray(160)));
+                    }
+                    bar(ui, done, total);
+                }
+                match &phase {
+                    Phase::Available(r) => {
+                        ui.label(RichText::new(format!("{} · {}", l.t("upd_available"), r.version)).strong());
+                        ui.horizontal(|ui| {
+                            if ui.button(l.t("upd_install")).clicked() {
+                                s.update.install();
+                            }
+                            if ui.button(l.t("upd_later")).clicked() {
+                                s.update.state.lock().dismissed = true;
+                            }
+                        });
+                    }
+                    Phase::Downloading(what, d, t) => {
+                        ui.label(RichText::new(format!("{} {what}", l.t("upd_downloading"))).strong());
+                        bar(ui, *d, *t);
+                    }
+                    Phase::Ready => {
+                        ui.label(RichText::new(l.t("upd_ready")).strong());
+                        if ui.button(l.t("upd_restart")).clicked() {
+                            actions.push(Action::RestartForUpdate);
+                        }
+                    }
+                    Phase::Failed(e) => {
+                        ui.label(RichText::new(l.t("upd_failed")).strong());
+                        ui.label(RichText::new(e).small().color(Color32::from_gray(170)));
+                        if ui.button("OK").clicked() {
+                            s.update.state.lock().dismissed = true;
+                        }
+                    }
+                    Phase::Idle => {}
+                }
+                if let Some(e) = comp_err.as_ref().filter(|_| comps.is_empty()) {
+                    ui.label(RichText::new(l.t("upd_comp_failed")).strong());
+                    ui.label(RichText::new(e).small().color(Color32::from_gray(170)));
+                    if ui.button("OK").clicked() {
+                        let mut st = s.update.state.lock();
+                        st.component_error = None;
+                        st.dismissed = true;
+                    }
+                }
+            });
+    });
+    if busy {
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
 }
 
 /// The short message over the picture (fades out).
@@ -1945,6 +2035,12 @@ fn settings_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions
             }
         });
         ui.end_row();
+    });
+    // About (the license asks forks to keep this attribution).
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(concat!("BRP Player ", env!("CARGO_PKG_VERSION"), " · brurpo")).small().color(Color32::from_gray(130)));
+        ui.hyperlink_to(RichText::new("github.com/brurpo/brp-player-2").small(), "https://github.com/brurpo/brp-player-2");
     });
 }
 

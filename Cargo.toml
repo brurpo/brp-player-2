@@ -5,7 +5,7 @@ members = ["crates/brp-media", "crates/brp-render", "crates/brp-ai", "crates/brp
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license-file = "LICENSE.md"
 
 [workspace.dependencies]
 anyhow = "1"

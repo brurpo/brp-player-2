@@ -11,6 +11,7 @@ mod player;
 mod popup;
 mod settings;
 mod ui;
+mod update;
 mod warm;
 
 use brp_render::{Renderer, VideoDraw};
@@ -481,6 +482,10 @@ impl Win {
                 Action::Minimize => self.window.set_minimized(true),
                 Action::ToggleMaximize => self.window.set_maximized(!self.window.is_maximized()),
                 Action::Close => self.close = true,
+                Action::RestartForUpdate => {
+                    update::restart();
+                    self.close = true;
+                }
                 Action::ExportBrowse => {
                     let e = &mut self.ui.export;
                     let c = export::container(&e.settings.container);

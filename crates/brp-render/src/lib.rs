@@ -964,14 +964,15 @@ impl Drop for Renderer {
     }
 }
 
-/// `nnedi3_weights.bin`: `BRP_NNEDI_WEIGHTS`, or next to the executable.
+/// `nnedi3_weights.bin` (GPL, a separate download in releases): `BRP_NNEDI_WEIGHTS`,
+/// `<exe dir>/nnedi3/`, or next to the executable (development builds).
 pub(crate) fn find_nnedi_weights() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("BRP_NNEDI_WEIGHTS") {
         return Some(p.into());
     }
     let exe = std::env::current_exe().ok()?;
-    let p = exe.parent()?.join("nnedi3_weights.bin");
-    p.exists().then_some(p)
+    let dir = exe.parent()?;
+    [dir.join("nnedi3").join("nnedi3_weights.bin"), dir.join("nnedi3_weights.bin")].into_iter().find(|p| p.exists())
 }
 
 /// Optimal-tiling features of `format` on the context's GPU.
