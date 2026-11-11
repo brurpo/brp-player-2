@@ -1,3 +1,11 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Distorção de lente
+// @brp pt.param Distortion Distorção | Força principal da distorção da lente. Negativo: almofada; positivo: barril.
+// @brp pt.param Aberration Aberração | Aberração espectral. Valores positivos levam o azul para fora, negativos o vermelho.
+// @brp pt.param CenterX Centro X | Centro horizontal (eixo X) da distorção.
+// @brp pt.param CenterY Centro Y | Centro vertical (eixo Y) da distorção.
+// @brp pt.param SpectralSamples Amostras espectrais | Número de amostras da aberração espectral. Mais é mais suave, porém mais pesado.
+// @brp pt.param AutoZoom Zoom automático | Se 1, aproxima a imagem para esconder as bordas causadas pela distorção.
 //!PARAM Distortion
 //!DESC Controls the main lens distortion strength. Negative for pincushion, positive for barrel.
 //!TYPE float

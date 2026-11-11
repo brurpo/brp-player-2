@@ -1,3 +1,38 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Chroma key (AMatte)
+// @brp pt.param SplitView Tela dividida | Tela dividida para escolher a cor.
+// @brp pt.param DistanceOrDifference Tipo de keyer | 0 = Delta Keyer (rápido), 1 = IBK Keyer (usa a placa limpa gerada, mais pesado).
+// @brp pt.param KeyColorR Cor da chave | Cor principal da chave.
+// @brp pt.param KeyColor2R Segunda cor da chave | Segunda cor da chave, para fundos irregulares.
+// @brp pt.param KeyTolerance Tolerância | Ponto central da chave. Valores maiores deixam a chave mais rígida.
+// @brp pt.param KeySoftness Suavidade | Suavidade da transição na borda da chave.
+// @brp pt.param ScreenBalance Equilíbrio da tela | (Modo Delta Keyer) Equilibra a chave entre vermelho e azul.
+// @brp pt.param UseProtectionMatte Máscara de proteção | Se 1, liga a máscara de proteção do primeiro plano. (cat: Máscara de proteção)
+// @brp pt.param CoreMatteColorR Cor protegida | Cor a proteger, forçada como primeiro plano opaco.
+// @brp pt.param CoreMatteTolerance Tolerância da proteção | Tolerância da comparação com a cor protegida.
+// @brp pt.param CoreMatteSoftness Suavidade da proteção | Suavidade da transição da máscara de proteção.
+// @brp pt.param UseHairDetection Detectar cabelo | Se 1, liga a detecção de fios de cabelo. Pesado. (cat: Recuperação de cabelo)
+// @brp pt.param HairWidth Largura do fio | Largura esperada de um fio de cabelo, em pixels.
+// @brp pt.param HairIntensity Intensidade do cabelo | Intensidade da máscara de cabelo detectada.
+// @brp pt.param GarbageMatteClean Limpeza da máscara | Força da remoção de ruído (filtro de mediana) na máscara. 0 = desligado. (cat: Ajustes da máscara)
+// @brp pt.param ErodeDilate1 Erodir/dilatar 1 | Erosão (negativo) ou expansão (positivo) da máscara.
+// @brp pt.param ErodeDilate2 Erodir/dilatar 2 | Erosão (negativo) ou expansão (positivo) da máscara.
+// @brp pt.param MatteSoftenBlur Suavizar máscara | Desfoca a máscara antes da correção das bordas.
+// @brp pt.param BlackRemap Remapear pretos | Remapeia os pretos da máscara. Valores maiores deixam a máscara mais transparente nas bordas.
+// @brp pt.param WhiteRemap Remapear brancos | Remapeia os brancos da máscara. Valores menores deixam a máscara mais opaca.
+// @brp pt.param MatteShrink Encolher máscara | Leva as áreas semitransparentes para o preto, afinando a borda da máscara.
+// @brp pt.param MatteExpand Expandir máscara | Leva as áreas semitransparentes para o branco, solidificando a borda da máscara.
+// @brp pt.param FinalMatteBlur Desfoque final | Desfoque final da máscara processada, para suavizar a borda.
+// @brp pt.param ColorUnmix Separar cores | Usa a separação de cores. (cat: Supressão de vazamento)
+// @brp pt.param Unmix Força da separação | Força da separação de cores.
+// @brp pt.param SpillSuppressor Supressão de vazamento | Força da supressão do vazamento de cor.
+// @brp pt.param SpillTolerance Tolerância do vazamento | (Modo simples) Faixa de matizes afetada pela supressão. Valores menores afetam uma faixa maior.
+// @brp pt.param DespillMode Modo de supressão | Modo da supressão de vazamento. 0 = Dessaturar simples, 1 = Reconstruir cor (avançado).
+// @brp pt.param FixBorders Corrigir bordas | Estende as cores da borda para corrigi-las. Define o número de iterações. (cat: Recuperação de bordas)
+// @brp pt.param ViewMatte Ver máscara | Mostra só a máscara. (cat: Teste da máscara)
+// @brp pt.param ViewCleanPlate Ver placa limpa | Mostra só a placa limpa.
+// @brp pt.param TestBackground Fundo de teste | Se 1, compõe sobre uma cor sólida de teste em vez de preto transparente.
+// @brp pt.param TestBgR Cor do fundo de teste | Cor do fundo de teste.
 //!PARAM SplitView
 //!DESC Split View for color picking.
 //!TYPE float

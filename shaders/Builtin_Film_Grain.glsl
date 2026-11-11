@@ -1,3 +1,6 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Grão de filme
+// @brp pt.param Intensity Intensidade | Intensidade do efeito.
 //!PARAM Intensity
 //!DESC Intensity of the effect
 //!TYPE float

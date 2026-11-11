@@ -1,0 +1,12 @@
+[package]
+name = "onnxref"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Development tool: runs an ONNX model with ONNX Runtime on the CPU, as the reference our GPU runner is checked against. Not part of the player."
+
+[dependencies]
+anyhow.workspace = true
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs", "api-31"] }
+png = "0.18"

@@ -1,3 +1,8 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Pintura
+// @brp pt.param SmoothingRadius Raio de suavização | Tamanho da suavização. Valores maiores dão um visual mais abstrato, de pintura.
+// @brp pt.param EdgeSharpness Nitidez das bordas | Anisotropia (alongamento) do filtro ao longo das bordas. Valores maiores respeitam mais as bordas.
+// @brp pt.param EffectMix Mistura | Mistura a imagem filtrada com a original. 0 = original, 1 = efeito completo.
 //!PARAM SmoothingRadius
 //!DESC Controls the size of the smoothing effect. Higher values create a more abstract, painterly look.
 //!TYPE int

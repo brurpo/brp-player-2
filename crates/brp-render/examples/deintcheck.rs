@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn get(src: &Source, n: i64) -> Arc<VideoFrame> {
-    src.request(Request { frame: n, playing: false, dir: 1 });
+    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false });
     let t = Instant::now();
     loop {
         if let Some(f) = src.get(n) {

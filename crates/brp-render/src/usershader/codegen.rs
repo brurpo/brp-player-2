@@ -85,6 +85,8 @@ pub fn generate(
         g,
         "layout(push_constant) uniform _brp_pc {{ vec2 _brp_out_size; vec2 input_size; vec2 target_size; vec2 tex_offset; int frame; float random; }};"
     );
+    // Normalised position of the output pixel (libplacebo: the pass's texture coordinate).
+    let _ = writeln!(g, "#define _brp_pos ((vec2(gl_GlobalInvocationID.xy) + 0.5) / _brp_out_size)");
 
     // Parameters.
     let uniform_params: Vec<_> = file.params.iter().enumerate().filter(|(_, p)| p.kind != ParamKind::Define).collect();
@@ -125,7 +127,12 @@ pub fn generate(
             }
             BindKind::Sampled => {
                 let _ = writeln!(g, "layout(set = 0, binding = {b}) uniform sampler2D _{id}_raw;");
-                let _ = writeln!(g, "vec2 _{id}_pos; vec2 _{id}_size; vec2 _{id}_pt;");
+                // Expressions, not variables: shaders use these in global
+                // initializers, which run before main().
+                let _ = writeln!(
+                    g,
+                    "#define _{id}_pos _brp_pos\n#define _{id}_size vec2(textureSize(_{id}_raw, 0))\n#define _{id}_pt (1.0 / _{id}_size)"
+                );
                 write_tex_macros(&mut g, &id, &id);
                 // libplacebo also exposes the hooked texture under its stage name
                 // (LUMA_*, CHROMA_*, MAIN_*); shaders test `defined(CHROMA_raw)`.
@@ -195,27 +202,18 @@ vec3 _brp_delin(vec3 c) {{
 #endif
 }}
 {lin_fns}
-void _brp_init(vec2 id) {{
-    vec2 p = (id + 0.5) / _brp_out_size;
 "#
     );
-    for (name, kind) in binds {
-        if *kind == BindKind::Sampled {
-            let id = ident(name);
-            let _ = writeln!(g, "    _{id}_size = vec2(textureSize(_{id}_raw, 0)); _{id}_pt = 1.0 / _{id}_size; _{id}_pos = p;");
-        }
-    }
-    let _ = writeln!(g, "}}\n");
 
     let _ = writeln!(g, "#line 1");
     g.push_str(&pass.body);
     g.push('\n');
     if compute.is_some() {
-        let _ = writeln!(g, "void main() {{\n    _brp_init(vec2(gl_GlobalInvocationID.xy));\n    hook();\n}}");
+        let _ = writeln!(g, "void main() {{\n    hook();\n}}");
     } else {
         let _ = writeln!(
             g,
-            "void main() {{\n    ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n    if (id.x >= int(_brp_out_size.x) || id.y >= int(_brp_out_size.y)) return;\n    _brp_init(vec2(id));\n    imageStore(out_image, id, hook());\n}}"
+            "void main() {{\n    ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n    if (id.x >= int(_brp_out_size.x) || id.y >= int(_brp_out_size.y)) return;\n    imageStore(out_image, id, hook());\n}}"
         );
     }
     Generated { glsl: g, has_params, binds: binds.to_vec(), out_binding, local_size: local, block }

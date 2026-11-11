@@ -62,6 +62,8 @@ pub struct MediaInfo {
     /// Display aspect ratio (width / height) including sample aspect ratio.
     pub dar: f64,
     pub frame_rate: f64,
+    /// The same as a fraction (num, den), e.g. 30000/1001 (exact for export timing).
+    pub frame_rate_q: (i32, i32),
     pub time_base: (i32, i32),
     pub start_pts: i64,
     /// Absolute time of the first video frame (seconds), to line up with audio.
@@ -77,6 +79,9 @@ pub struct MediaInfo {
     pub video_stream: i32,
     /// Clockwise rotation needed for display: 0, 90, 180 or 270 degrees.
     pub rotation: u32,
+    /// EXR: the layers (name, label for the picker) and the one shown (empty otherwise).
+    pub layers: Vec<(String, String)>,
+    pub layer: usize,
 }
 
 impl MediaInfo {
@@ -112,8 +117,10 @@ pub(crate) unsafe fn read_info(path: &str, input: &Input, vs: i32) -> MediaInfo 
 
         let fr = ff::av_guess_frame_rate(input.ctx, st, std::ptr::null_mut());
         let mut frame_rate = ffutil::q2d(fr);
+        let mut frame_rate_q = (fr.num, fr.den);
         if !(frame_rate > 0.0 && frame_rate < 1000.0) {
             frame_rate = 25.0;
+            frame_rate_q = (25, 1);
         }
 
         let tb = (*st).time_base;
@@ -173,6 +180,7 @@ pub(crate) unsafe fn read_info(path: &str, input: &Input, vs: i32) -> MediaInfo 
             height,
             dar,
             frame_rate,
+            frame_rate_q,
             time_base: (tb.num, tb.den),
             start_pts,
             start_secs: start_pts as f64 * ffutil::q2d(tb),
@@ -186,6 +194,8 @@ pub(crate) unsafe fn read_info(path: &str, input: &Input, vs: i32) -> MediaInfo 
             timecode,
             video_stream: vs,
             rotation,
+            layers: Vec::new(),
+            layer: 0,
         }
     }
 }
@@ -236,6 +246,10 @@ unsafe fn color_info(par: *const ff::AVCodecParameters, height: u32) -> ColorInf
         let transfer = match (*par).color_trc {
             T::AVCOL_TRC_SMPTE2084 => Transfer::Pq,
             T::AVCOL_TRC_ARIB_STD_B67 => Transfer::Hlg,
+            // Integer DPX tagged "linear" is almost always video or log: FFmpeg's own DPX
+            // writer (and many others) set that tag on everything. Shown as is, like
+            // other DPX viewers do; linear light in 10 bits would band.
+            T::AVCOL_TRC_LINEAR if (*par).codec_id == ff::AVCodecID::AV_CODEC_ID_DPX => Transfer::Sdr,
             T::AVCOL_TRC_LINEAR => Transfer::Linear,
             _ => Transfer::Sdr,
         };

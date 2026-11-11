@@ -1,3 +1,14 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Chroma key
+// @brp pt.param KeyColorR Cor da chave | Primeira cor da chave.
+// @brp pt.param KeyColor2R Segunda cor da chave | Segunda cor da chave.
+// @brp pt.param Tolerance Tolerância | Tolerância da comparação com a cor da chave. Valores menores são mais rígidos.
+// @brp pt.param Softness Suavidade | Suavização da borda da máscara.
+// @brp pt.param ErodeDilate Erodir/dilatar | Erosão (negativo) ou expansão (positivo) da máscara.
+// @brp pt.param BlackRemap Remapear pretos | Remapeia os pretos da máscara. Valores maiores deixam a máscara mais transparente nas bordas.
+// @brp pt.param WhiteRemap Remapear brancos | Remapeia os brancos da máscara. Valores menores deixam a máscara mais opaca.
+// @brp pt.param SpillSuppressor Supressão de vazamento | Força da supressão do vazamento de cor.
+// @brp pt.param SpillColorR Cor do vazamento | Cor do vazamento a suprimir.
 //!PARAM KeyColorR
 //!DESC First key color red component (0-1).
 //!TYPE float

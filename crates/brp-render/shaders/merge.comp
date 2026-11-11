@@ -34,7 +34,9 @@ void main() {
         float y = texelFetch(t0, p, 0).r * n;
         vec2 c = pc.misc.w > 0.5 ? textureLod(t1, uv, 0.0).rg : vec2(textureLod(t1, uv, 0.0).r, textureLod(t2, uv, 0.0).r) * n;
         vec3 yuv = vec3((y - pc.off.x) * pc.off.z, (c - pc.off.y) * pc.off.w);
-        rgb = vec3(dot(pc.m0.xyz, yuv), dot(pc.m1.xyz, yuv), dot(pc.m2.xyz, yuv));
+        // Clamp the over/undershoot of limited-range video: it isn't picture content,
+        // and shaders expect MAIN in [0, 1] (pow(), log() and patch distances).
+        rgb = clamp(vec3(dot(pc.m0.xyz, yuv), dot(pc.m1.xyz, yuv), dot(pc.m2.xyz, yuv)), 0.0, 1.0);
         if (pc.mode.z == 1) alpha = textureLod(t3, uv, 0.0).r * pc.misc.x;
     } else {
         vec4 s = texelFetch(t0, p, 0);

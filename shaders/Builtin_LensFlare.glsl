@@ -1,3 +1,16 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Reflexo de lente
+// @brp pt.param Threshold Limiar | Brilho a partir do qual surge o reflexo.
+// @brp pt.param Intensity Intensidade | Intensidade geral de todos os reflexos.
+// @brp pt.param Anamorphic Anamórfico | Estiramento horizontal, para um visual anamórfico.
+// @brp pt.param GlintPoints Pontas da estrela | Número de pontas do efeito estrela.
+// @brp pt.param GlintSize Tamanho da estrela | Comprimento dos raios da estrela.
+// @brp pt.param GlintDispersion Dispersão da estrela | Aberração cromática ao longo dos raios.
+// @brp pt.param GhostCount Fantasmas | Número de fantasmas da íris.
+// @brp pt.param GhostBlades Lâminas | Número de lâminas do diafragma na forma dos fantasmas. 0 = circular.
+// @brp pt.param GhostDispersion Dispersão dos fantasmas | Aberração cromática dos fantasmas.
+// @brp pt.param GlareSize Tamanho do clarão | Tamanho do clarão suave (bloom).
+// @brp pt.param DirtIntensity Sujeira da lente | Intensidade da sujeira na lente. Precisa de uma textura de sujeira.
 //!PARAM Threshold
 //!DESC Brightness threshold to trigger the lens flare.
 //!TYPE float

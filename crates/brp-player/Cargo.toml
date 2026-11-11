@@ -23,4 +23,5 @@ interprocess.workspace = true
 
 brp-media = { path = "../brp-media" }
 brp-render = { path = "../brp-render" }
+brp-ai = { path = "../brp-ai" }
 winit.workspace = true

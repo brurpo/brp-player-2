@@ -4,7 +4,10 @@
 //  mode.x: 0 = planar YUV (t0 Y, t1 U, t2 V, t3 A), 1 = packed RGBA in t0
 //  mode.y: transfer 0 = SDR (pass through), 1 = PQ, 2 = HLG, 3 = linear
 //  mode.z: 1 = has alpha (composite over checkerboard)
-//  mode.w: 1 = BT.2020 primaries (convert to BT.709 for HDR paths)
+//  mode.w: bit 0 = BT.2020 primaries (convert to BT.709 for HDR paths)
+//          bit 1 = HDR output: write linear light, Rec.2020, 1.0 = SDR white, for
+//          the HDR composite (DESIGN.md §7b); m0.w = SDR white (nits), m1.w = the
+//          screen's peak (nits)
 
 layout(set = 0, binding = 0) uniform sampler2D t0;
 layout(set = 0, binding = 1) uniform sampler2D t1;
@@ -59,6 +62,54 @@ vec3 tonemap(vec3 c, float peak) {
     return c * (t / m);
 }
 
+vec3 bt709_to_2020(vec3 c) {
+    return mat3(
+        0.6274, 0.0691, 0.0164,
+        0.3293, 0.9195, 0.0880,
+        0.0433, 0.0114, 0.8956) * c;
+}
+
+// Highlights above the screen's peak `dp` rolled off (hue kept, on the largest
+// channel): unchanged up to 3/4 of the peak, then a curve that reaches the peak at the
+// content's assumed peak `cp` (all relative to SDR white).
+vec3 rolloff(vec3 c, float dp, float cp) {
+    float m = max(max(c.r, c.g), c.b);
+    float k = 0.75 * dp;
+    if (cp <= dp || m <= k) return c;
+    float b = (cp - k) * (dp - k) / (cp - dp);
+    float x = m - k;
+    return c * ((k + x / (1.0 + x / b)) / m);
+}
+
+// HDR screen: the picture as linear light, Rec.2020, 1.0 = SDR white (the screen's
+// SDR white level); HDR in absolute brightness, rolled off to the screen's peak.
+vec3 hdr_out(vec3 rgb, float alpha) {
+    float sdr = pc.m0.w, peak = pc.m1.w;
+    bool b2020 = (pc.mode.w & 1) == 1;
+    vec3 lin;
+    float cp; // content peak, nits
+    if (pc.mode.y == 1 || pc.mode.y == 2) {
+        lin = (pc.mode.y == 1 ? pq_to_nits(rgb) : hlg_to_nits(clamp(rgb, 0.0, 1.0))) / sdr;
+        if (!b2020) lin = bt709_to_2020(lin);
+        cp = 1000.0;
+    } else if (pc.mode.y == 3) {
+        // Linear (EXR): 1.0 is SDR white, brighter is HDR.
+        lin = b2020 ? rgb : bt709_to_2020(rgb);
+        cp = 10000.0;
+    } else {
+        vec3 l = pow(clamp(rgb, 0.0, 1.0), vec3(2.4));
+        lin = b2020 ? l : bt709_to_2020(l);
+        cp = sdr;
+    }
+    lin = rolloff(max(lin, 0.0), peak / sdr, cp / sdr);
+    if (pc.mode.z == 1) {
+        ivec2 cell = ivec2(gl_FragCoord.xy / pc.misc.z);
+        float checker = pow(((cell.x + cell.y) & 1) == 0 ? 0.20 : 0.30, 2.2);
+        lin = mix(vec3(checker), lin, clamp(alpha, 0.0, 1.0));
+    }
+    return lin;
+}
+
 void main() {
     vec3 rgb;
     float alpha = 1.0;
@@ -76,10 +127,15 @@ void main() {
         if (pc.swz.w >= 0) alpha = s[pc.swz.w];
     }
 
+    if ((pc.mode.w & 2) != 0) {
+        o_color = vec4(hdr_out(rgb, alpha), 1.0);
+        return;
+    }
+
     if (pc.mode.y == 1 || pc.mode.y == 2) {
         vec3 nits = pc.mode.y == 1 ? pq_to_nits(rgb) : hlg_to_nits(clamp(rgb, 0.0, 1.0));
         vec3 lin = nits / SDR_WHITE_NITS;
-        if (pc.mode.w == 1) lin = bt2020_to_709(lin);
+        if ((pc.mode.w & 1) == 1) lin = bt2020_to_709(lin);
         rgb = pow(clamp(tonemap(max(lin, 0.0), pc.misc.y), 0.0, 1.0), vec3(1.0 / 2.4));
     } else if (pc.mode.y == 3) {
         rgb = pow(clamp(rgb, 0.0, 1.0), vec3(1.0 / 2.2));

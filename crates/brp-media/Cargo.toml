@@ -12,6 +12,8 @@ parking_lot.workspace = true
 ffmpeg-sys-next.workspace = true
 cpal.workspace = true
 rtrb.workspace = true
+# EXR sequences (layers read directly, exr.rs).
+exr = "1.74"
 
 [dev-dependencies]
 env_logger.workspace = true

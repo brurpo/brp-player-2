@@ -1,3 +1,8 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Redução de ruído espacial
+// @brp pt.param Strength Intensidade | Força da redução de ruído.
+// @brp pt.param BIAS Viés | Força da redução de ruído.
+// @brp pt.param Tolerance Tolerância | Força da redução de ruído.
 //!PARAM Strength
 //!DESC Denoise strength
 //!TYPE float

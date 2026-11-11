@@ -3,16 +3,21 @@
 mod ffutil;
 pub mod audio;
 pub mod detect;
+pub mod encode;
+pub mod sequence;
+pub mod exr_seq;
 pub mod frame;
+pub mod gpudec;
 pub mod index;
 pub mod info;
+pub mod mem;
 pub mod source;
 
-pub use frame::{FrameLayout, VideoFrame};
+pub use frame::{FrameLayout, PlanarRgb, VideoFrame};
 pub use info::{ColorInfo, FieldOrder, Matrix, MediaInfo, Primaries, Transfer};
 pub use audio::{output_devices, Audio};
 pub use detect::{FieldKind, Votes};
-pub use source::{Request, Source};
+pub use source::{CacheMap, Request, Source};
 
 /// Quiet FFmpeg's own logging (we log through `log`).
 pub fn init() {

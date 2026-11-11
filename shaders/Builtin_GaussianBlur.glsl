@@ -1,3 +1,6 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Desfoque gaussiano
+// @brp pt.param Size Tamanho | Tamanho do desfoque.
 //!PARAM Size
 //!DESC Blur size
 //!TYPE float

@@ -1,3 +1,13 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Brilho (rápido)
+// @brp pt.param Strength Intensidade | Tamanho do desfoque.
+// @brp pt.param Radius Raio | Raio do desfoque.
+// @brp pt.param Curve Decaimento | Decaimento do desfoque.
+// @brp pt.param Threshold Limiar | A partir de que luminância a imagem brilha.
+// @brp pt.param ThresholdSmooth Suavidade do limiar | Suavidade do limiar.
+// @brp pt.param Proportion Proporção | Proporções do brilho.
+// @brp pt.param Tonemap Mapeamento de tons | Aplica mapeamento de tons.
+// @brp pt.param Screen Modo tela | Compõe com o modo de mesclagem tela.
 //////////////////////////////////////////////////////////////////
 //  BRP_GLOW Free for any use, I have no liability though, lol  //
 //////////////////////////////////////////////////////////////////

@@ -17,7 +17,13 @@ fn main() {
         ("bwdif.comp", "bwdif.comp", &[]),
         ("planes.comp", "planes.comp", &[]),
         ("merge.comp", "merge.comp", &[]),
+        ("space.comp", "space.comp", &[]),
+        ("composite.vert", "composite.vert", &[]),
+        ("composite.frag", "composite.frag", &[]),
+        ("glass.vert", "glass.vert", &[]),
+        ("glass.frag", "glass.frag", &[]),
     ];
+    println!("cargo:rerun-if-changed=shaders/space.glsl");
     for (file, name, defines) in shaders {
         let src = PathBuf::from("shaders").join(file);
         println!("cargo:rerun-if-changed={}", src.display());

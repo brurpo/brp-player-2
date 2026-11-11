@@ -4,23 +4,38 @@ pub mod codegen;
 pub mod parse;
 
 pub use codegen::{BindKind, Generated, ParamMode, Transfer};
-pub use parse::{Param, ParamKind, Pass, Rpn, ShaderFile, TexDecl};
+pub use parse::{Localized, Param, ParamKind, Pass, Rpn, ShaderFile, TexDecl};
 
 use anyhow::{anyhow, Result};
-use std::sync::OnceLock;
 
-fn compiler() -> &'static std::sync::Mutex<shaderc::Compiler> {
-    static C: OnceLock<std::sync::Mutex<shaderc::Compiler>> = OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(shaderc::Compiler::new().expect("shaderc")))
+thread_local! {
+    /// One compiler per thread: compiles on several threads run at once (the start-up
+    /// build of the effect shaders uses that).
+    static COMPILER: shaderc::Compiler = shaderc::Compiler::new().expect("shaderc");
 }
+
+/// Appended to a kernel source: compile it without SPIR-V optimization.
+pub const NO_OPT: &str = "\n// spirv: no-opt\n";
 
 /// GLSL -> SPIR-V. Errors carry shaderc's messages (line numbers refer to the
 /// pass body thanks to `#line 1`).
 pub fn compile_glsl(glsl: &str, name: &str) -> Result<Vec<u32>> {
-    let c = compiler().lock().unwrap();
+    // From the disk cache when this source was compiled before (see shader_cache).
+    crate::shader_cache::spirv(glsl, "vulkan1.3 performance (no-opt if marked)", || compile_now(glsl, name))
+}
+
+fn compile_now(glsl: &str, name: &str) -> Result<Vec<u32>> {
+    COMPILER.with(|c| compile_with(c, glsl, name))
+}
+
+fn compile_with(c: &shaderc::Compiler, glsl: &str, name: &str) -> Result<Vec<u32>> {
     let mut opts = shaderc::CompileOptions::new().map_err(|e| anyhow!("shaderc options: {e}"))?;
     opts.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
-    opts.set_optimization_level(shaderc::OptimizationLevel::Performance);
+    // Sources marked "// spirv: no-opt" skip spirv-opt: on fully unrolled code (the
+    // denoiser's 8x8 DCTs) it took 15-22 s per kernel, for no speed (the driver
+    // optimizes again).
+    let level = if glsl.contains(NO_OPT) { shaderc::OptimizationLevel::Zero } else { shaderc::OptimizationLevel::Performance };
+    opts.set_optimization_level(level);
     let art = c
         .compile_into_spirv(glsl, shaderc::ShaderKind::Compute, name, "main", Some(&opts))
         .map_err(|e| anyhow!("{e}"))?;

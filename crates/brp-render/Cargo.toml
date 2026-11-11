@@ -18,4 +18,11 @@ egui-ash-renderer.workspace = true
 brp-media = { path = "../brp-media" }
 
 [dev-dependencies]
+ffmpeg-sys-next.workspace = true
 env_logger.workspace = true
+winit.workspace = true
+png = "0.18"
+
+# HDR screens: is HDR on for the window's monitor, its peak and SDR white (hdr.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Devices_Display"] }

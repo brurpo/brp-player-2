@@ -22,6 +22,8 @@ pub const APP_ICON: &[u8] = include_bytes!("../assets/icons/app_icon.png");
 
 pub struct Icons {
     map: HashMap<&'static str, TextureHandle>,
+    /// The app icon in colour (title bar).
+    pub app: Option<TextureHandle>,
 }
 
 impl Icons {
@@ -38,7 +40,11 @@ impl Icons {
                 Err(e) => log::warn!("icon {name}: {e}"),
             }
         }
-        Icons { map }
+        let app = decode(APP_ICON).ok().map(|(w, h, rgba)| {
+            let (sw, sh, small) = downscale(w, h, &key_out_tile(rgba), SIZE);
+            ctx.load_texture("app_icon", ColorImage::from_rgba_unmultiplied([sw, sh], &small), TextureOptions::LINEAR)
+        });
+        Icons { map, app }
     }
 
     pub fn get(&self, name: &str) -> Option<&TextureHandle> {
@@ -115,9 +121,18 @@ fn downscale(w: usize, h: usize, rgba: &[u8], size: usize) -> (usize, usize, Vec
 
 /// Window icon for winit (RGBA, 64x64).
 pub fn window_icon() -> Option<winit::window::Icon> {
+    icon_sized(64)
+}
+
+/// Large icon for the taskbar and Alt+Tab (256x256).
+pub fn taskbar_icon() -> Option<winit::window::Icon> {
+    icon_sized(256)
+}
+
+fn icon_sized(size: usize) -> Option<winit::window::Icon> {
     let (w, h, rgba) = decode(APP_ICON).ok()?;
     let rgba = key_out_tile(rgba);
-    let (sw, sh, small) = downscale(w, h, &rgba, 64);
+    let (sw, sh, small) = downscale(w, h, &rgba, size);
     winit::window::Icon::from_rgba(small, sw as u32, sh as u32).ok()
 }
 

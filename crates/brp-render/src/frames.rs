@@ -13,6 +13,8 @@ pub struct GpuFrame {
     pub planes: Vec<GpuImage>,
     pub layout: FrameLayout,
     last_used: u64,
+    /// The frame (recording) that filled it.
+    created: u64,
 }
 
 impl GpuFrame {
@@ -24,6 +26,15 @@ impl GpuFrame {
 pub struct FrameCache {
     entries: Vec<GpuFrame>,
     capacity: usize,
+    /// The device of the last upload: pictures decoded on it are copied GPU to GPU.
+    device: Option<vk::Device>,
+}
+
+/// The GPU-decoded picture of `frame`, if it lives on `device` (copied directly).
+fn on_gpu(frame: &VideoFrame, device: Option<vk::Device>) -> Option<(&crate::gpudec::Planes, &std::sync::Arc<dyn brp_media::gpudec::GpuPlanes>)> {
+    let arc = frame.gpu_planes()?;
+    let p = arc.as_any().downcast_ref::<crate::gpudec::Planes>()?;
+    (Some(p.device()) == device).then_some((p, arc))
 }
 
 fn plane_format(layout: FrameLayout, bytes_per_sample: usize) -> vk::Format {
@@ -32,6 +43,7 @@ fn plane_format(layout: FrameLayout, bytes_per_sample: usize) -> vk::Format {
         FrameLayout::Yuv { .. } => vk::Format::R8_UNORM,
         FrameLayout::Rgba8 { .. } => vk::Format::R8G8B8A8_UNORM,
         FrameLayout::Rgba16 => vk::Format::R16G16B16A16_UNORM,
+        FrameLayout::RgbaF16 { .. } => vk::Format::R16G16B16A16_SFLOAT,
     }
 }
 
@@ -46,11 +58,23 @@ fn texel_size(f: vk::Format) -> usize {
 
 impl FrameCache {
     pub fn new(capacity: usize) -> Self {
-        FrameCache { entries: Vec::new(), capacity }
+        FrameCache { entries: Vec::new(), capacity, device: None }
     }
 
     pub fn find(&self, key: FrameKey) -> Option<usize> {
         self.entries.iter().position(|e| e.key == key)
+    }
+
+    /// Drop the entries filled by recording `now`: it did not run, so their images
+    /// were never written (kept, a later recording would read garbage).
+    pub fn forget(&mut self, graveyard: &mut Graveyard, now: u64) {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries).into_iter().partition(|e| e.created == now);
+        self.entries = kept;
+        for e in gone {
+            for p in e.planes {
+                graveyard.bury(now, p);
+            }
+        }
     }
 
     pub fn get(&self, i: usize) -> &GpuFrame {
@@ -64,11 +88,11 @@ impl FrameCache {
             .iter()
             .filter(|f| {
                 let k = (source, f.index());
-                let new = self.find(k).is_none() && !seen.contains(&k);
+                let new = self.find(k).is_none() && !seen.contains(&k) && on_gpu(f, self.device).is_none();
                 seen.push(k);
                 new
             })
-            .map(|f| (0..f.plane_count()).map(|p| f.plane(p).0.len().next_multiple_of(16) as u64).sum::<u64>())
+            .map(|f| staging_bytes(f))
             .sum()
     }
 
@@ -103,6 +127,8 @@ impl FrameCache {
             }
         }
 
+        self.device = Some(device.handle());
+        let direct = on_gpu(frame, self.device);
         let n = frame.plane_count();
         let fmt = plane_format(frame.layout, frame.bytes_per_sample());
         let mut planes = Vec::with_capacity(n);
@@ -118,9 +144,29 @@ impl FrameCache {
                 "frame plane",
             )?);
         }
+        if let Some((_, arc)) = direct {
+            // Written by the decoder in an earlier submission that has finished (its
+            // fence was waited for): make those writes visible to the copy.
+            let mb = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
+            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&mb))) };
+            graveyard.hold(now, arc.clone());
+        }
         for (p, img) in planes.iter().enumerate() {
-            let (data, stride) = frame.plane(p);
-            let off = staging.push(data);
+            // From the decoder's GPU picture, or the frame's bytes through staging.
+            let (src_buf, off, stride) = match direct {
+                Some((g, _)) => {
+                    let (o, s) = g.plane_offsets_of(p);
+                    (g.buf.buffer, o, s as usize)
+                }
+                None => {
+                    let (data, stride) = frame.plane(p);
+                    (staging.buffer, staging.push(data), stride)
+                }
+            };
             gpu::image_barrier(
                 device,
                 cb,
@@ -134,7 +180,7 @@ impl FrameCache {
                 .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
                 .image_extent(vk::Extent3D { width: img.w, height: img.h, depth: 1 });
             unsafe {
-                device.cmd_copy_buffer_to_image(cb, staging.buffer, img.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                device.cmd_copy_buffer_to_image(cb, src_buf, img.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
             }
             gpu::image_barrier(
                 device,
@@ -148,7 +194,7 @@ impl FrameCache {
                 ),
             );
         }
-        self.entries.push(GpuFrame { key, planes, layout: frame.layout, last_used: now });
+        self.entries.push(GpuFrame { key, planes, layout: frame.layout, last_used: now, created: now });
         Ok(())
     }
 
@@ -159,4 +205,19 @@ impl FrameCache {
             }
         }
     }
+}
+
+/// Staging bytes `f` needs if uploaded from system memory (a GPU-decoded picture:
+/// an upper bound, without reading it back).
+fn staging_bytes(f: &VideoFrame) -> u64 {
+    (0..f.plane_count())
+        .map(|p| {
+            if f.gpu_planes().is_some() {
+                let (w, h) = f.plane_size(p);
+                ((w as u64 * f.bytes_per_sample() as u64).next_multiple_of(64) * h as u64).next_multiple_of(16)
+            } else {
+                f.plane(p).0.len().next_multiple_of(16) as u64
+            }
+        })
+        .sum()
 }

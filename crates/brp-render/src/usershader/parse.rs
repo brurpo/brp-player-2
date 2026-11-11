@@ -59,14 +59,105 @@ pub struct ShaderFile {
     pub textures: Vec<TexDecl>,
     pub passes: Vec<Pass>,
     /// Frames to replay after a jump so stateful (STORAGE) shaders see the right
-    /// history (`//!TEMPORAL_WARMUP n`, our extension).
+    /// history (`// @brp temporal_warmup n`, our extension; `//!TEMPORAL_WARMUP n` too).
     pub warmup: Option<u32>,
+    /// Translations (our extension, plain comments so mpv/libplacebo still accept the
+    /// file; usually at the top, before the first `//!` line):
+    ///   `// @brp pt.title Correção de cor`
+    ///   `// @brp pt.param STRENGTH Intensidade | Quanto o efeito age (cat: Geral)`
+    /// The language is a code ("pt"); the description after `|` is optional.
+    pub l10n: Vec<Localized>,
+    /// Working colour space of the file's MAIN/RGB passes (`// @brp space linear`, our
+    /// extension; DESIGN.md §7a). None: the source's own encoding, as in mpv.
+    pub space: Option<crate::workspace::Space>,
+}
+
+/// A translated name (or parameter label and description) for one language.
+#[derive(Clone, Debug)]
+pub struct Localized {
+    pub lang: String,
+    /// None: the effect's own name; Some: the parameter of that name.
+    pub param: Option<String>,
+    pub label: String,
+    pub desc: Option<String>,
 }
 
 impl ShaderFile {
     pub fn is_stateful(&self) -> bool {
         self.textures.iter().any(|t| t.storage)
     }
+
+    /// The effect's name in `lang`, if the file has one.
+    pub fn title(&self, lang: &str) -> Option<&str> {
+        self.l10n.iter().find(|l| l.param.is_none() && l.lang == lang).map(|l| l.label.as_str())
+    }
+
+    /// Parameter `i`'s label in `lang` (its name when not translated).
+    pub fn param_label(&self, i: usize, lang: &str) -> &str {
+        let p = &self.params[i];
+        self.param_l10n(i, lang).map_or(p.name.as_str(), |l| l.label.as_str())
+    }
+
+    /// Parameter `i`'s description in `lang` (the file's DESC when not translated).
+    /// "(cat: …)" and "(options: …)" tags the translation leaves out are taken from
+    /// DESC, so grouping and choice lists stay as they are.
+    pub fn param_desc(&self, i: usize, lang: &str) -> String {
+        let p = &self.params[i];
+        match self.param_l10n(i, lang).and_then(|l| l.desc.as_deref()) {
+            Some(d) => with_tags(d, &p.desc),
+            None => p.desc.clone(),
+        }
+    }
+
+    fn param_l10n(&self, i: usize, lang: &str) -> Option<&Localized> {
+        let name = &self.params.get(i)?.name;
+        self.l10n.iter().find(|l| l.lang == lang && l.param.as_deref() == Some(name.as_str()))
+    }
+}
+
+/// `text` with the "(cat: …)" and "(options: …)" tags of `from` it lacks appended.
+pub fn with_tags(text: &str, from: &str) -> String {
+    let mut out = text.trim().to_string();
+    for tag in ["(options:", "(cat:"] {
+        if out.contains(tag) {
+            continue;
+        }
+        if let Some(i) = from.find(tag) {
+            // To the ")" closing this tag (options may hold parentheses).
+            let mut depth = 0;
+            let end = from[i + 1..].char_indices().find_map(|(j, c)| match c {
+                '(' => {
+                    depth += 1;
+                    None
+                }
+                ')' if depth == 0 => Some(i + 1 + j + 1),
+                ')' => {
+                    depth -= 1;
+                    None
+                }
+                _ => None,
+            });
+            out.push(' ');
+            out.push_str(&from[i..end.unwrap_or(from.len())]);
+        }
+    }
+    out
+}
+
+/// `// @brp <lang>.title <name>` or `// @brp <lang>.param <NAME> <label> [| <desc>]`.
+fn localized(rest: &str) -> Option<Localized> {
+    let (tag, text) = rest.split_once(char::is_whitespace)?;
+    let text = text.trim();
+    if let Some(lang) = tag.strip_suffix(".title") {
+        return Some(Localized { lang: lang.to_string(), param: None, label: text.to_string(), desc: None });
+    }
+    let lang = tag.strip_suffix(".param")?;
+    let (name, text) = text.split_once(char::is_whitespace)?;
+    let (label, desc) = match text.split_once('|') {
+        Some((l, d)) => (l.trim(), Some(d.trim().to_string()).filter(|d| !d.is_empty())),
+        None => (text.trim(), None),
+    };
+    Some(Localized { lang: lang.to_string(), param: Some(name.to_string()), label: label.to_string(), desc })
 }
 
 /// Reverse-polish expression from WIDTH / HEIGHT / WHEN.
@@ -74,8 +165,9 @@ impl ShaderFile {
 pub struct Rpn(pub Vec<String>);
 
 impl Rpn {
-    /// `size(name)` gives (w, h) of a texture by name (`OUTPUT`, `HOOKED`, `MAIN`, …).
-    pub fn eval(&self, size: &dyn Fn(&str) -> Option<(f64, f64)>) -> Result<f64> {
+    /// `size(name)` gives (w, h) of a texture by name (`OUTPUT`, `HOOKED`, `MAIN`, …);
+    /// `param(name)` the value of a shader parameter.
+    pub fn eval(&self, size: &dyn Fn(&str) -> Option<(f64, f64)>, param: &dyn Fn(&str) -> Option<f64>) -> Result<f64> {
         let mut st: Vec<f64> = Vec::new();
         for tok in &self.0 {
             let t = tok.as_str();
@@ -107,6 +199,8 @@ impl Rpn {
                             "h" | "height" => h,
                             _ => bail!("bad size component '{t}'"),
                         });
+                    } else if let Some(v) = param(t) {
+                        st.push(v);
                     } else {
                         bail!("bad expression token '{t}'");
                     }
@@ -135,6 +229,20 @@ pub fn parse(name: &str, text: &str) -> Result<ShaderFile> {
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim_end_matches('\r');
         let trimmed = line.trim_start();
+        // Our extension as a plain comment, so mpv/libplacebo still accept the file:
+        //   // @brp temporal_warmup 4
+        if let Some(rest) = trimmed.strip_prefix("// @brp ") {
+            if let Some(n) = rest.trim().strip_prefix("temporal_warmup") {
+                file.warmup = n.trim().parse().ok();
+            } else if let Some(s) = rest.trim().strip_prefix("space ") {
+                match crate::workspace::Space::from_name(s) {
+                    Some(sp) => file.space = Some(sp),
+                    None => log::warn!("{name}:{}: unknown space '{}' (source, linear, display, pq)", lineno + 1, s.trim()),
+                }
+            } else if let Some(l) = localized(rest.trim()) {
+                file.l10n.push(l);
+            }
+        }
         if let Some(header) = trimmed.strip_prefix("//!") {
             let (key, rest) = header.split_once(char::is_whitespace).unwrap_or((header, ""));
             let rest = rest.trim();
@@ -277,4 +385,73 @@ pub fn parse(name: &str, text: &str) -> Result<ShaderFile> {
         }
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn working_space() {
+        use crate::workspace::Space;
+        let body = "//!HOOK MAIN\n//!BIND HOOKED\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n";
+        assert_eq!(parse("a.glsl", body).unwrap().space, None);
+        let f = parse("b.glsl", &format!("// @brp space linear\n{body}")).unwrap();
+        assert_eq!(f.space, Some(Space::Linear));
+        // The MAIN pass works in the file's space; a LINEAR hook in libplacebo's.
+        let lin = "//!HOOK LINEAR\n//!BIND HOOKED\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n";
+        let g = parse("c.glsl", &format!("{lin}{body}")).unwrap();
+        let passes = crate::effects::main_passes(&g);
+        assert_eq!(passes.iter().map(|p| (p.0, p.2)).collect::<Vec<_>>(), vec![(1, Space::Source), (0, Space::MpvLinear)]);
+    }
+
+    #[test]
+    fn translations() {
+        let src = "// @brp pt.title Inverter\n// @brp pt.param STRENGTH Intensidade | Quanto inverter\n// @brp pt.param MODE Modo\n//!PARAM STRENGTH\n//!DESC How much (cat: Main)\n//!TYPE float\n1.0\n//!PARAM MODE\n//!DESC Mode (options: A|B (fast))\n//!TYPE int\n0\n//!HOOK MAIN\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n";
+        let f = parse("t.glsl", src).unwrap();
+        assert_eq!(f.title("pt"), Some("Inverter"));
+        assert_eq!(f.title("en"), None);
+        assert_eq!(f.param_label(0, "pt"), "Intensidade");
+        assert_eq!(f.param_label(0, "en"), "STRENGTH");
+        assert_eq!(f.param_desc(0, "pt"), "Quanto inverter (cat: Main)");
+        assert_eq!(f.param_desc(1, "pt"), "Mode (options: A|B (fast))");
+        assert_eq!(f.param_label(1, "pt"), "Modo");
+        assert_eq!(f.params[0].default, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod bundled {
+    use super::*;
+
+    /// The shaders shipped in the repo's `shaders/` parse, name only parameters they
+    /// have, and give every parameter the panel shows a Portuguese label (the G and B
+    /// of a colour are shown with its R).
+    #[test]
+    fn bundled_shaders_translated() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shaders");
+        let mut n = 0;
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "glsl") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let f = parse(&name, &std::fs::read_to_string(&p).unwrap()).unwrap();
+            assert!(f.title("pt").is_some(), "{name}: no pt.title");
+            for l in &f.l10n {
+                if let Some(pn) = &l.param {
+                    assert!(f.params.iter().any(|q| &q.name == pn), "{name}: pt.param {pn} is not a parameter");
+                }
+            }
+            for (i, q) in f.params.iter().enumerate() {
+                let colour_part = ["G", "B", "g", "b"].iter().any(|s| q.name.strip_suffix(s).is_some_and(|pre| f.params.iter().any(|r| r.name == format!("{pre}R") || r.name == format!("{pre}r"))));
+                if !colour_part {
+                    assert!(f.param_l10n(i, "pt").is_some(), "{name}: {} has no Portuguese", q.name);
+                }
+            }
+            n += 1;
+        }
+        assert!(n > 10);
+    }
 }

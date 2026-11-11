@@ -7,6 +7,9 @@ use ash::vk;
 const VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video.vert.spv"));
 const FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video.frag.spv"));
 
+/// The HDR scene picture: linear light, Rec.2020, 1.0 = SDR white (DESIGN.md §7b).
+pub const SCENE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
 /// One descriptor set per frame in flight.
 pub struct Slot {
     set: vk::DescriptorSet,
@@ -17,6 +20,8 @@ pub struct Slot {
 pub struct VideoPass {
     device: ash::Device,
     pub pipeline: vk::Pipeline,
+    /// The same, drawing into the HDR scene picture (`SCENE_FORMAT`).
+    pub pipeline_hdr: vk::Pipeline,
     pub layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
@@ -70,7 +75,8 @@ impl VideoPass {
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-            let formats = [color_format];
+            let make = |format: vk::Format| {
+            let formats = [format];
             let mut rendering = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
             let info = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
@@ -83,9 +89,10 @@ impl VideoPass {
                 .dynamic_state(&dynamic)
                 .layout(layout)
                 .push_next(&mut rendering);
-            let pipeline = device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
-                .map_err(|(_, e)| e)?[0];
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e).map(|p| p[0])
+            };
+            let pipeline = make(color_format)?;
+            let pipeline_hdr = make(SCENE_FORMAT)?;
             device.destroy_shader_module(vs, None);
             device.destroy_shader_module(fs, None);
 
@@ -125,6 +132,7 @@ impl VideoPass {
             Ok(VideoPass {
                 device: device.clone(),
                 pipeline,
+                pipeline_hdr,
                 layout,
                 set_layout,
                 pool,
@@ -168,9 +176,9 @@ impl VideoPass {
     }
 
     /// Record the draw (inside rendering).
-    pub fn draw(&self, cb: vk::CommandBuffer, i: usize, push: &VideoPush) {
+    pub fn draw(&self, cb: vk::CommandBuffer, i: usize, push: &VideoPush, hdr: bool) {
         unsafe {
-            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, if hdr { self.pipeline_hdr } else { self.pipeline });
             self.device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[self.slots[i].set], &[]);
             self.device.cmd_push_constants(cb, self.layout, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, push.bytes());
             self.device.cmd_draw(cb, 4, 1, 0, 0);
@@ -185,6 +193,7 @@ impl Drop for VideoPass {
             self.device.destroy_sampler(self.sampler_linear, None);
             self.device.destroy_sampler(self.sampler_nearest, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.pipeline_hdr, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_set_layout(self.set_layout, None);
         }

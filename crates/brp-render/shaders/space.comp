@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Effect chain: converts a picture between working colour spaces (space.glsl).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform PC {
+    ivec4 m;   // from, to, transfer, src2020
+    vec4 f;    // x: peak
+} pc;
+
+#include "space.glsl"
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= imageSize(dst).x || p.y >= imageSize(dst).y) return;
+    vec4 c = texelFetch(src, p, 0);
+    imageStore(dst, p, vec4(brp_convert(pc.m.x, pc.m.y, c.rgb, pc.m.z, pc.m.w, pc.f.x), c.a));
+}

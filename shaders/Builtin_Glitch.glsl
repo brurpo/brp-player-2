@@ -1,3 +1,20 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Glitch
+// @brp pt.param MasterIntensity Intensidade geral | Força geral de todos os efeitos de glitch juntos.
+// @brp pt.param Speed Velocidade | Velocidade geral das animações e da evolução do glitch.
+// @brp pt.param Probability Probabilidade | Limiar de ativação do glitch, sobre uma onda de ruído suave. Valores maiores dão glitches mais frequentes.
+// @brp pt.param Seed Semente | Muda o padrão aleatório dos glitches. Qualquer valor dá uma nova sequência.
+// @brp pt.param BlockSize Tamanho do bloco | Tamanho dos blocos do glitch. Valores menores = blocos maiores.
+// @brp pt.param SliceHeight Altura da fatia | Altura das fatias do glitch. Valores menores = fatias mais finas.
+// @brp pt.param SliceShiftAmount Deslocamento da fatia | Distância horizontal máxima do deslocamento das fatias.
+// @brp pt.param BlockGlitch Glitch de blocos | Intensidade do glitch de macroblocos e do deslocamento de blocos.
+// @brp pt.param SliceGlitch Glitch de fatias | Intensidade do deslocamento horizontal das fatias.
+// @brp pt.param ColorShift Troca de cor | Probabilidade de um bloco ter a cor (matiz) trocada.
+// @brp pt.param ColorShiftAmount Quantidade da troca | Troca máxima de matiz num bloco com glitch.
+// @brp pt.param BlockRgbShift Separação RGB em blocos | Intensidade da separação dos canais RGB por blocos.
+// @brp pt.param ScanlineRgbShift Separação RGB em linhas | Intensidade da separação dos canais RGB por linhas.
+// @brp pt.param Noise Ruído | Quantidade de ruído digital sobre a imagem.
+// @brp pt.param Scanlines Linhas de varredura | Intensidade do efeito de linhas horizontais.
 //!PARAM MasterIntensity
 //!DESC Controls the overall strength of all glitch effects combined.
 //!TYPE float

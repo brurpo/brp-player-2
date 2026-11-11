@@ -1,3 +1,11 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Bordas
+// @brp pt.param LowThreshold Limiar baixo | Limiar inferior da detecção de bordas. Ajuda a ligar as linhas.
+// @brp pt.param HighThreshold Limiar alto | Limiar superior da detecção de bordas. Define os pixels de borda forte.
+// @brp pt.param Thickness Espessura | Espessura das linhas de borda.
+// @brp pt.param EdgeColorR Cor da borda | Cor das linhas de borda.
+// @brp pt.param EdgeOpacity Opacidade | Opacidade das linhas de borda.
+// @brp pt.param TransparentBg Fundo transparente | Se 1, as bordas ficam sobre fundo transparente. Se 0, sobre a imagem original.
 //!PARAM LowThreshold
 //!DESC Lower threshold for the edge detection. Helps connect edge lines.
 //!TYPE float

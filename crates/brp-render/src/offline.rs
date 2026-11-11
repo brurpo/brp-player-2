@@ -100,7 +100,10 @@ impl Offline {
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let t = std::time::Instant::now();
             let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-            device.queue_submit2(self.ctx.queue, &[vk::SubmitInfo2::default().command_buffer_infos(&cbs)], fence)?;
+            {
+                let _q = self.ctx.lock_queue();
+                device.queue_submit2(self.ctx.queue, &[vk::SubmitInfo2::default().command_buffer_infos(&cbs)], fence)?;
+            }
             device.wait_for_fences(&[fence], true, u64::MAX)?;
             let elapsed = t.elapsed();
             device.destroy_fence(fence, None);
@@ -126,7 +129,7 @@ impl Offline {
 impl Drop for Offline {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.ctx.device.device_wait_idle();
+            let _ = self.ctx.wait_idle();
             self.deint = None;
             let alloc = (*self.ctx.allocator).clone();
             self.cache.destroy(&self.ctx.device, &alloc);

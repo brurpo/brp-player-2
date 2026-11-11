@@ -1,5 +1,14 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Ampliação FSRCNN
+// @brp pt.param Upscale Ampliar | Desligado: amplia 2× e reduz de volta ao tamanho original com um filtro nítido (imagem mais limpa, mesma resolução). Ligado: sai na resolução ampliada 2×.
+//!PARAM Upscale
+//!DESC Off: upscale 2x, then downscale back to the source size with a sharp filter (cleaner picture, same resolution). On: output the 2x upscaled resolution.
+//!TYPE int
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Feature Map 1
 //!BIND LUMA
 //!SAVE FEATURE1
@@ -36,7 +45,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Feature Map 2
 //!BIND LUMA
 //!SAVE FEATURE2
@@ -73,7 +81,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 1_1
 //!BIND FEATURE1
 //!BIND FEATURE2
@@ -105,7 +112,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 1_2
 //!BIND FEATURE1
 //!BIND FEATURE2
@@ -137,7 +143,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 2_1
 //!BIND MODEL21
 //!BIND MODEL22
@@ -169,7 +174,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 2_2
 //!BIND MODEL21
 //!BIND MODEL22
@@ -201,7 +205,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 3_1
 //!BIND MODEL1
 //!BIND MODEL2
@@ -233,7 +236,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 3_2
 //!BIND MODEL1
 //!BIND MODEL2
@@ -265,7 +267,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 4_1
 //!BIND MODEL21
 //!BIND MODEL22
@@ -297,7 +298,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Mapping 4_2
 //!BIND MODEL21
 //!BIND MODEL22
@@ -329,7 +329,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Sub-band Residuals 1
 //!BIND MODEL1
 //!BIND MODEL2
@@ -347,7 +346,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Sub-band Residuals 2
 //!BIND MODEL1
 //!BIND MODEL2
@@ -365,7 +363,6 @@ return res;
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!DESC FSRCNNX Sub-pixel Convolution 1
 //!BIND RES1
 //!BIND RES2
@@ -396,7 +393,6 @@ return vec4(res);
 }
 
 //!HOOK LUMA
-//!WHEN OUTPUT.w LUMA.w / 1.200 > OUTPUT.h LUMA.h / 1.200 > *
 //!WIDTH LUMA.w 2 *
 //!HEIGHT LUMA.h 2 *
 //!DESC FSRCNNX Aggregation [x2_8]
@@ -408,4 +404,64 @@ vec2 base = SUBCONV1_pos + (vec2(0.5) - fcoord) * SUBCONV1_pt;
 ivec2 index = ivec2(fcoord * vec2(2));
 vec4 res = SUBCONV1_tex(base);
 return vec4(res[index.x * 2 + index.y], 0, 0, 1);
+}
+
+//!HOOK LUMA
+//!BIND HOOKED
+//!WHEN Upscale !
+//!WIDTH HOOKED.w 2 /
+//!DESC Downscale to source size (x, Lanczos2)
+
+#define K 2.0
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 2.0) return 0.0;
+    float px = 3.14159265 * x;
+    return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
+}
+vec4 hook() {
+    // Output pixel centre in input texels; taps cover the kernel stretched by K.
+    float xin = HOOKED_pos.x * HOOKED_size.x - 0.5;
+    float base = floor(xin);
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = -int(2.0 * K); i <= int(2.0 * K) + 1; i++) {
+        float xi = base + float(i);
+        float w = lanczos2((xi - xin) / K);
+        vec2 pos = HOOKED_pos + vec2(1.0, 0.0) * ((xi + 0.5) * HOOKED_pt.x - HOOKED_pos.x);
+        sum += w * HOOKED_tex(pos);
+        wsum += w;
+    }
+    return sum / wsum;
+}
+
+//!HOOK LUMA
+//!BIND HOOKED
+//!WHEN Upscale !
+//!HEIGHT HOOKED.h 2 /
+//!DESC Downscale to source size (y, Lanczos2)
+
+#define K 2.0
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 2.0) return 0.0;
+    float px = 3.14159265 * x;
+    return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
+}
+vec4 hook() {
+    // Output pixel centre in input texels; taps cover the kernel stretched by K.
+    float xin = HOOKED_pos.y * HOOKED_size.y - 0.5;
+    float base = floor(xin);
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = -int(2.0 * K); i <= int(2.0 * K) + 1; i++) {
+        float xi = base + float(i);
+        float w = lanczos2((xi - xin) / K);
+        vec2 pos = HOOKED_pos + vec2(0.0, 1.0) * ((xi + 0.5) * HOOKED_pt.y - HOOKED_pos.y);
+        sum += w * HOOKED_tex(pos);
+        wsum += w;
+    }
+    return sum / wsum;
 }

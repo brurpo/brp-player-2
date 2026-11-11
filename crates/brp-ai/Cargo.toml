@@ -1,0 +1,16 @@
+[package]
+name = "brp-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+brp-render = { path = "../brp-render" }
+brp-media = { path = "../brp-media" }
+ash.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+png = "0.18"

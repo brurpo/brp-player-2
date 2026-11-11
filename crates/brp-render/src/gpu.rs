@@ -150,15 +150,32 @@ impl Staging {
     }
 }
 
-/// Images whose destruction waits until no frame in flight can still use them.
+/// Images (and pipelines) whose destruction waits until no frame in flight can still
+/// use them.
 #[derive(Default)]
 pub struct Graveyard {
     items: Vec<(u64, GpuImage)>,
+    /// Compute pipelines with their layouts (replaced or removed shader effects).
+    pipelines: Vec<(u64, vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)>,
+    /// Other GPU memory (decoded pictures copied from) kept alive the same way.
+    held: Vec<(u64, std::sync::Arc<dyn brp_media::gpudec::GpuPlanes>)>,
 }
 
 impl Graveyard {
     pub fn bury(&mut self, frame: u64, img: GpuImage) {
         self.items.push((frame, img));
+    }
+
+    /// Destroy a pipeline, its layout and its set layout once no frame in flight can
+    /// still use them (no wait for the GPU: a device-wait-idle on the UI thread stalls
+    /// on other windows' presents and races other threads' submits).
+    pub fn bury_pipeline(&mut self, frame: u64, pipeline: vk::Pipeline, layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout) {
+        self.pipelines.push((frame, pipeline, layout, set_layout));
+    }
+
+    /// Keep `p` until no frame in flight can still read it.
+    pub fn hold(&mut self, frame: u64, p: std::sync::Arc<dyn brp_media::gpudec::GpuPlanes>) {
+        self.held.push((frame, p));
     }
 
     /// Destroy everything last used at least `frames_in_flight` frames ago.
@@ -168,11 +185,29 @@ impl Graveyard {
         for (_, img) in dead {
             destroy_image(device, allocator, img);
         }
+        self.held.retain(|(f, _)| f + frames_in_flight > now);
+        let (dead, alive): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pipelines).into_iter().partition(|(f, ..)| f + frames_in_flight <= now);
+        self.pipelines = alive;
+        for (_, p, l, s) in dead {
+            destroy_pipeline(device, p, l, s);
+        }
     }
 
     pub fn destroy_all(&mut self, device: &ash::Device, allocator: &SharedAllocator) {
         for (_, img) in self.items.drain(..) {
             destroy_image(device, allocator, img);
         }
+        self.held.clear();
+        for (_, p, l, s) in self.pipelines.drain(..) {
+            destroy_pipeline(device, p, l, s);
+        }
+    }
+}
+
+fn destroy_pipeline(device: &ash::Device, p: vk::Pipeline, l: vk::PipelineLayout, s: vk::DescriptorSetLayout) {
+    unsafe {
+        device.destroy_pipeline(p, None);
+        device.destroy_pipeline_layout(l, None);
+        device.destroy_descriptor_set_layout(s, None);
     }
 }

@@ -1,3 +1,6 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Ruído
+// @brp pt.param STRENGTH Intensidade | Intensidade do efeito.
 //!PARAM STRENGTH
 //!DESC Intensity of the effect
 //!TYPE float

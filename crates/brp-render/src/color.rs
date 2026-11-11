@@ -75,6 +75,10 @@ pub fn video_push(layout: FrameLayout, color: &ColorInfo, checker_px: f32) -> Vi
             p.mode[0] = 1;
             p.swz = [0, 1, 2, 3];
         }
+        FrameLayout::RgbaF16 { alpha } => {
+            p.mode[0] = 1;
+            p.swz = [0, 1, 2, if alpha { 3 } else { -1 }];
+        }
     }
     p
 }

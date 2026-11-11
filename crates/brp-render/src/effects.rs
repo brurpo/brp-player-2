@@ -7,6 +7,7 @@
 use crate::color::VideoPush;
 use crate::gpu::{self, GpuImage, Graveyard, SharedAllocator};
 use crate::usershader::{self, BindKind, Generated, ParamKind, ShaderFile, Transfer};
+use crate::workspace::{SourceColor, Space};
 use anyhow::{anyhow, Result};
 use ash::vk;
 use brp_media::{ColorInfo, FrameLayout};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 const PLANES_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/planes.comp.spv"));
 const MERGE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/merge.comp.spv"));
+const SPACE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/space.comp.spv"));
 const POOL_SETS: u32 = 2048;
 const PARAM_BUF: u64 = 256 * 1024;
 const WORK_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -54,12 +56,50 @@ pub struct ChainFrame<'a> {
     pub target: (u32, u32),
     /// Source video size (`input_size`).
     pub input: (u32, u32),
+    /// Colour space of `planes` (decoded frames: `Source`; DESIGN.md §7a).
+    pub space: Space,
+    /// Space the output must be in (None: whatever the last effect left).
+    pub want: Option<Space>,
 }
 
 pub struct ChainOutput {
     pub view: vk::ImageView,
     pub w: u32,
     pub h: u32,
+    /// Colour space of the output.
+    pub space: Space,
+}
+
+/// The post-RGB passes of `file`, in the order they run (mpv's stage order MAIN/RGB,
+/// LINEAR, SIGMOID, file order within a stage), with their hook and colour space.
+pub fn main_passes(file: &ShaderFile) -> Vec<(usize, String, Space)> {
+    let mut v: Vec<(u8, usize, String, Space)> = Vec::new();
+    for (pi, pass) in file.passes.iter().enumerate() {
+        // A pass hooking several of these stages runs at the first.
+        if let Some(h) = pass.hooks.iter().filter(|h| Space::hook_rank(h).is_some()).min_by_key(|h| Space::hook_rank(h)) {
+            v.push((Space::hook_rank(h).unwrap(), pi, h.clone(), Space::of_hook(h, file.space).unwrap()));
+        }
+    }
+    v.sort_by_key(|x| (x.0, x.1));
+    v.into_iter().map(|(_, pi, h, s)| (pi, h, s)).collect()
+}
+
+/// Space the chain's output is in for these effects (the enabled ones), from `input`,
+/// converting lazily as the chain does, then to `want` if given.
+pub fn out_space(specs: &[EffectSpec], input: Space, want: Option<Space>, color: &ColorInfo) -> Space {
+    let sc = SourceColor::of(color);
+    let mut cur = input;
+    for s in specs.iter().filter(|s| s.enabled) {
+        for (_, _, sp) in main_passes(&s.file) {
+            if !sc.same(cur, sp) {
+                cur = sp;
+            }
+        }
+    }
+    match want {
+        Some(w) if !sc.same(cur, w) => w,
+        _ => cur,
+    }
 }
 
 struct Pipe {
@@ -135,7 +175,7 @@ pub fn vk_format(glsl: &str) -> vk::Format {
     }
 }
 
-fn make_pipe(device: &ash::Device, spv: &[u32], bindings: &[vk::DescriptorType], push: u32) -> Result<Pipe> {
+fn make_pipe(device: &ash::Device, cache: vk::PipelineCache, spv: &[u32], bindings: &[vk::DescriptorType], push: u32) -> Result<Pipe> {
     unsafe {
         let b: Vec<_> = bindings
             .iter()
@@ -148,11 +188,15 @@ fn make_pipe(device: &ash::Device, spv: &[u32], bindings: &[vk::DescriptorType],
         let layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sl).push_constant_ranges(&pr), None)?;
         let module = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)?;
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-        let res = device.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None);
+        let res = device.create_compute_pipelines(cache, &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None);
         device.destroy_shader_module(module, None);
         let pipeline = res.map_err(|(_, e)| e)?[0];
         Ok(Pipe { pipeline, layout, set_layout })
     }
+}
+
+fn retire(graveyard: &mut Graveyard, now: u64, p: &Pipe) {
+    graveyard.bury_pipeline(now, p.pipeline, p.layout, p.set_layout);
 }
 
 fn destroy_pipe(device: &ash::Device, p: &Pipe) {
@@ -177,6 +221,13 @@ fn needs_recompile(file: &ShaderFile, const_mode: bool, baked: &[f64], params: &
     file.params.iter().enumerate().any(|(i, p)| (const_mode || p.kind == ParamKind::Define) && baked.get(i) != params.get(i))
 }
 
+/// Compile an effect file (default parameters) for `transfer` into the disk shader
+/// cache, ahead of use (start-up), without building pipelines.
+pub fn precompile(file: &ShaderFile, transfer: Transfer) -> Result<()> {
+    let params: Vec<f64> = file.params.iter().map(|p| p.default).collect();
+    compile_effect(file, &params, transfer).map(|_| ())
+}
+
 fn compile_effect(file: &ShaderFile, params: &[f64], transfer: Transfer) -> Result<Vec<((usize, String), Generated, Vec<u32>, bool)>> {
     let mut out = Vec::new();
     for (pi, pass) in file.passes.iter().enumerate() {
@@ -192,6 +243,8 @@ fn compile_effect(file: &ShaderFile, params: &[f64], transfer: Transfer) -> Resu
 
 pub struct EffectChain {
     device: ash::Device,
+    /// The driver's pipeline cache (kept on disk: see `shader_cache`).
+    pipeline_cache: vk::PipelineCache,
     allocator: SharedAllocator,
     effects: Vec<Effect>,
     transfer: Transfer,
@@ -200,6 +253,7 @@ pub struct EffectChain {
     next_job: u64,
     planes_pipe: Pipe,
     merge_pipe: Pipe,
+    space_pipe: Pipe,
     pools: Vec<vk::DescriptorPool>,
     param_bufs: Vec<(vk::Buffer, Option<Allocation>)>,
     param_used: u64,
@@ -213,16 +267,18 @@ pub struct EffectChain {
 }
 
 impl EffectChain {
-    pub fn new(device: &ash::Device, allocator: SharedAllocator, slots: usize, ubo_align: u64) -> Result<Self> {
+    pub fn new(device: &ash::Device, allocator: SharedAllocator, slots: usize, ubo_align: u64, pipeline_cache: vk::PipelineCache) -> Result<Self> {
         use vk::DescriptorType as D;
         let words = |b: &[u8]| ash::util::read_spv(&mut std::io::Cursor::new(b)).expect("spirv");
-        let planes_pipe = make_pipe(device, &words(PLANES_SPV), &[D::COMBINED_IMAGE_SAMPLER, D::COMBINED_IMAGE_SAMPLER, D::STORAGE_IMAGE], 8)?;
+        let planes_pipe = make_pipe(device, pipeline_cache, &words(PLANES_SPV), &[D::COMBINED_IMAGE_SAMPLER, D::COMBINED_IMAGE_SAMPLER, D::STORAGE_IMAGE], 8)?;
         let merge_pipe = make_pipe(
             device,
+            pipeline_cache,
             &words(MERGE_SPV),
             &[D::COMBINED_IMAGE_SAMPLER, D::COMBINED_IMAGE_SAMPLER, D::COMBINED_IMAGE_SAMPLER, D::COMBINED_IMAGE_SAMPLER, D::STORAGE_IMAGE],
             std::mem::size_of::<VideoPush>() as u32,
         )?;
+        let space_pipe = make_pipe(device, pipeline_cache, &words(SPACE_SPV), &[D::COMBINED_IMAGE_SAMPLER, D::STORAGE_IMAGE], 32)?;
         let mut pools = Vec::new();
         let mut param_bufs = Vec::new();
         unsafe {
@@ -256,6 +312,7 @@ impl EffectChain {
             let (tx, rx) = crossbeam_channel::unbounded();
             Ok(EffectChain {
                 device: device.clone(),
+                pipeline_cache,
                 allocator,
                 effects: Vec::new(),
                 transfer: Transfer::Sdr,
@@ -264,6 +321,7 @@ impl EffectChain {
                 next_job: 1,
                 planes_pipe,
                 merge_pipe,
+                space_pipe,
                 pools,
                 param_bufs,
                 param_used: 0,
@@ -288,7 +346,7 @@ impl EffectChain {
                     let recompile = transfer_changed || needs_recompile(&spec.file, e.const_mode, &e.baked, &spec.params);
                     e.spec = spec.clone();
                     if recompile {
-                        self.drop_compiled(&mut e);
+                        Self::drop_compiled(&mut e, graveyard, now);
                         e.status = EffectStatus::Compiling;
                         e.job = 0;
                     }
@@ -318,7 +376,10 @@ impl EffectChain {
                     .name("brp-shader-compile".into())
                     .spawn(move || {
                         let t = std::time::Instant::now();
-                        let passes = compile_effect(&file, &params, transfer);
+                        // A panic while compiling becomes the effect's error (else it would
+                        // show as compiling forever).
+                        let passes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_effect(&file, &params, transfer)))
+                            .unwrap_or_else(|p| Err(anyhow::anyhow!("internal error while compiling: {}", p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())));
                         log::info!("compiled {} in {:?}{}", file.name, t.elapsed(), if passes.is_err() { " (failed)" } else { "" });
                         let _ = tx.send(JobResult { id, job, passes });
                     })
@@ -332,7 +393,8 @@ impl EffectChain {
     }
 
     /// Integrate finished background compiles. Returns true if something changed.
-    pub fn poll(&mut self) -> bool {
+    /// Replaced pipelines go to `graveyard` (frame `now`).
+    pub fn poll(&mut self, graveyard: &mut Graveyard, now: u64) -> bool {
         let mut changed = false;
         while let Ok(r) = self.rx.try_recv() {
             let Some(i) = self.effects.iter().position(|e| e.spec.id == r.id && e.job == r.job) else { continue };
@@ -355,7 +417,7 @@ impl EffectChain {
                             kinds.push(if matches!(k, BindKind::Storage(_)) { D::STORAGE_IMAGE } else { D::COMBINED_IMAGE_SAMPLER });
                         }
                         kinds.push(D::STORAGE_IMAGE);
-                        match make_pipe(&self.device, &spv, &kinds, std::mem::size_of::<UserPush>() as u32) {
+                        match make_pipe(&self.device, self.pipeline_cache, &spv, &kinds, std::mem::size_of::<UserPush>() as u32) {
                             Ok(pipe) => {
                                 compiled.insert(key, Compiled { pipe, generated });
                             }
@@ -365,11 +427,10 @@ impl EffectChain {
                             }
                         }
                     }
-                    self.device_wait_for_reuse();
                     let e = &mut self.effects[i];
                     let old = std::mem::replace(&mut e.compiled, compiled);
                     for (_, c) in old {
-                        destroy_pipe(&self.device, &c.pipe);
+                        retire(graveyard, now, &c.pipe);
                     }
                     e.const_mode = const_mode;
                     e.status = match error {
@@ -381,13 +442,6 @@ impl EffectChain {
             }
         }
         changed
-    }
-
-    fn device_wait_for_reuse(&self) {
-        // Pipelines may still be referenced by frames in flight.
-        unsafe {
-            let _ = self.device.device_wait_idle();
-        }
     }
 
     pub fn status(&self) -> Vec<(u64, EffectStatus)> {
@@ -426,6 +480,11 @@ impl EffectChain {
         h.finish()
     }
 
+    /// The image behind a chain texture view (for readback).
+    pub fn image_of(&self, view: vk::ImageView) -> Option<vk::Image> {
+        self.images.iter().find(|p| p.img.view == view).map(|p| p.img.image)
+    }
+
     /// Clear the history of stateful effects at the start of the next run.
     pub fn reset_history(&mut self) {
         self.reset_storage = true;
@@ -443,7 +502,7 @@ impl EffectChain {
             p.used = true;
             return Ok((p.img.view, p.img.image));
         }
-        let img = gpu::create_image(&self.device, &self.allocator, w, h, WORK_FORMAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED, "effect texture")?;
+        let img = gpu::create_image(&self.device, &self.allocator, w, h, WORK_FORMAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC, "effect texture")?;
         gpu::image_barrier(
             &self.device,
             cb,
@@ -471,7 +530,16 @@ impl EffectChain {
     /// Process one frame. Several runs may be recorded into the same command buffer
     /// (history warm-up); call [`begin`] once per command buffer first.
     pub fn run(&mut self, cb: vk::CommandBuffer, si: usize, f: &ChainFrame<'_>) -> Result<Option<ChainOutput>> {
-        if !self.has_active() || f.planes.is_empty() {
+        if !self.has_active() {
+            return Ok(None);
+        }
+        self.run_merge(cb, si, f)
+    }
+
+    /// Like `run`, but with no active effect still converts the input to RGB (the
+    /// merge pass): used to bring frames to the GPU for background processing.
+    pub fn run_merge(&mut self, cb: vk::CommandBuffer, si: usize, f: &ChainFrame<'_>) -> Result<Option<ChainOutput>> {
+        if f.planes.is_empty() {
             return Ok(None);
         }
         let d = self.device.clone();
@@ -531,9 +599,111 @@ impl EffectChain {
             self.merge(cb, si, f, &push, [(plane(0), l), (plane(1), l), (plane(2), l), (plane(3), l)], false, p0)?
         };
         reg.insert("MAIN".into(), main);
-        self.run_stage(cb, si, f, "MAIN", &mut reg)?;
+        let mut space = f.space;
+        self.run_main(cb, si, f, &mut reg, &mut space)?;
+        let sc = SourceColor::of(&f.color);
+        if let Some(want) = f.want.filter(|w| !sc.same(space, *w)) {
+            let old = reg["MAIN"].0;
+            let m = self.convert(cb, si, reg["MAIN"], space, want, &sc)?;
+            reg.insert("MAIN".into(), m);
+            self.release_dead(old, &reg);
+            space = want;
+        }
         let (view, w, h) = reg["MAIN"];
-        Ok(Some(ChainOutput { view, w, h }))
+        Ok(Some(ChainOutput { view, w, h, space }))
+    }
+
+    /// A MAIN picture that was replaced (by a pass or a conversion): if nothing in
+    /// `reg` still names it, later work in this run may reuse its image. (Passes are
+    /// separated by barriers, so reading it before and writing it after is safe.)
+    /// A conversion then costs one picture, not two, and a chain ping-pongs between two.
+    fn release_dead(&mut self, view: vk::ImageView, reg: &HashMap<String, (vk::ImageView, u32, u32)>) {
+        if reg.values().any(|t| t.0 == view) {
+            return;
+        }
+        if let Some(p) = self.images.iter_mut().find(|p| p.img.view == view) {
+            p.used = false;
+        }
+    }
+
+    /// `src` from one working colour space to another, into a new pool image.
+    fn convert(&mut self, cb: vk::CommandBuffer, si: usize, src: (vk::ImageView, u32, u32), from: Space, to: Space, sc: &SourceColor) -> Result<(vk::ImageView, u32, u32)> {
+        let (w, h) = (src.1, src.2);
+        let (dst, _) = self.alloc_image(cb, w, h)?;
+        let set = self.alloc_set(si, self.space_pipe.set_layout)?;
+        self.write_image(set, 0, src.0, vk::ImageLayout::GENERAL, false);
+        self.write_image(set, 1, dst, vk::ImageLayout::GENERAL, true);
+        let mut push = [0u8; 32];
+        for (i, v) in sc.words(from, to).iter().enumerate() {
+            push[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        push[16..20].copy_from_slice(&sc.peak.to_le_bytes());
+        let d = &self.device;
+        unsafe {
+            d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.space_pipe.pipeline);
+            d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.space_pipe.layout, 0, &[set], &[]);
+            d.cmd_push_constants(cb, self.space_pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+            d.cmd_dispatch(cb, w.div_ceil(16), h.div_ceil(16), 1);
+        }
+        barrier(d, cb);
+        Ok((dst, w, h))
+    }
+
+    /// No effect active (removed, all disabled, effects switch off): free the working
+    /// pictures and the history textures, so the direct path holds no float picture.
+    /// With effects active, only the history of the inactive ones goes. Images may
+    /// still be read by frames in flight: they go to `graveyard`.
+    pub fn release_idle(&mut self, graveyard: &mut Graveyard, now: u64) {
+        let any = self.has_active();
+        for e in &mut self.effects {
+            if !any || !(e.spec.enabled && e.status == EffectStatus::Ready) {
+                for (_, img) in e.storage.drain() {
+                    graveyard.bury(now, img);
+                }
+            }
+        }
+        if !any {
+            for p in self.images.drain(..) {
+                graveyard.bury(now, p.img);
+            }
+        }
+    }
+
+    /// The MAIN stage: each active effect's post-RGB passes in stack order, the
+    /// picture converted to a pass's colour space first when it is in another
+    /// (DESIGN.md §7a). `space` is the picture's space, before and after.
+    fn run_main(&mut self, cb: vk::CommandBuffer, si: usize, f: &ChainFrame<'_>, reg: &mut HashMap<String, (vk::ImageView, u32, u32)>, space: &mut Space) -> Result<()> {
+        let sc = SourceColor::of(&f.color);
+        let ids: Vec<usize> = (0..self.effects.len()).filter(|&i| self.effects[i].spec.enabled && self.effects[i].status == EffectStatus::Ready).collect();
+        for ei in ids {
+            let file = self.effects[ei].spec.file.clone();
+            for (pi, hook, sp) in main_passes(&file) {
+                if !sc.same(*space, sp) {
+                    let old = reg["MAIN"].0;
+                    let m = self.convert(cb, si, reg["MAIN"], *space, sp, &sc)?;
+                    reg.insert("MAIN".into(), m);
+                    self.release_dead(old, reg);
+                    *space = sp;
+                }
+                if hook != "MAIN" {
+                    // BIND LINEAR (etc.) is the picture in that stage.
+                    let m = reg["MAIN"];
+                    reg.insert(hook.clone(), m);
+                }
+                let old = reg["MAIN"].0;
+                let ran = self.run_pass(cb, si, f, ei, pi, &hook, "MAIN", reg)?;
+                if hook != "MAIN" {
+                    // The stage name follows the picture.
+                    let m = reg["MAIN"];
+                    reg.insert(hook.clone(), m);
+                }
+                self.release_dead(old, reg);
+                if !ran {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -566,156 +736,175 @@ impl EffectChain {
         Ok((dst, size.0, size.1))
     }
 
+    /// Hooks of `stage` (LUMA, CHROMA) of every active effect, in stack order.
     fn run_stage(&mut self, cb: vk::CommandBuffer, si: usize, f: &ChainFrame<'_>, stage: &str, reg: &mut HashMap<String, (vk::ImageView, u32, u32)>) -> Result<()> {
-        let d = self.device.clone();
         let ids: Vec<usize> = (0..self.effects.len()).filter(|&i| self.effects[i].spec.enabled && self.effects[i].status == EffectStatus::Ready).collect();
         for ei in ids {
             let file = self.effects[ei].spec.file.clone();
             for (pi, pass) in file.passes.iter().enumerate() {
-                let Some(hook) = pass.hooks.iter().find(|h| h.as_str() == stage || (stage == "MAIN" && h.as_str() == "RGB")) else { continue };
-                let hooked = reg[stage];
-                let size_of = |name: &str| -> Option<(f64, f64)> {
-                    match name {
-                        "HOOKED" => Some((hooked.1 as f64, hooked.2 as f64)),
-                        "OUTPUT" => Some((f.target.0 as f64, f.target.1 as f64)),
-                        "NATIVE" | "NATIVE_CROPPED" => Some((f.input.0 as f64, f.input.1 as f64)),
-                        n => reg.get(n).map(|t| (t.1 as f64, t.2 as f64)),
-                    }
-                };
-                if let Some(when) = &pass.when {
-                    match when.eval(&size_of) {
-                        Ok(v) if v == 0.0 => continue,
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::warn!("{} pass {pi}: WHEN: {e}", file.name);
-                            continue;
-                        }
-                    }
+                let Some(hook) = pass.hooks.iter().find(|h| h.as_str() == stage) else { continue };
+                if !self.run_pass(cb, si, f, ei, pi, hook, stage, reg)? {
+                    break;
                 }
-                let eval = |e: &Option<usershader::Rpn>, default: u32| -> u32 {
-                    e.as_ref().and_then(|x| x.eval(&size_of).ok()).map(|v| v.round().max(1.0) as u32).unwrap_or(default)
-                };
-                let (w, h) = (eval(&pass.width, hooked.1), eval(&pass.height, hooked.2));
-                let (out, _) = self.alloc_image(cb, w, h)?;
-
-                // Storage textures (persistent per effect).
-                for t in file.textures.iter().filter(|t| t.storage) {
-                    if !self.effects[ei].storage.contains_key(&t.name) {
-                        let img = gpu::create_image(
-                            &d,
-                            &self.allocator,
-                            t.w,
-                            t.h,
-                            vk_format(&t.format),
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST,
-                            "effect storage",
-                        )?;
-                        gpu::image_barrier(
-                            &d,
-                            cb,
-                            img.image,
-                            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::ImageLayout::UNDEFINED),
-                            (vk::PipelineStageFlags2::CLEAR, vk::AccessFlags2::TRANSFER_WRITE, vk::ImageLayout::GENERAL),
-                        );
-                        unsafe { d.cmd_clear_color_image(cb, img.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[gpu::color_range()]) };
-                        barrier(&d, cb);
-                        self.effects[ei].storage.insert(t.name.clone(), img);
-                    }
-                }
-
-                let e = &self.effects[ei];
-                let Some(c) = e.compiled.get(&(pi, hook.clone())) else { continue };
-                let set = self.alloc_set(si, c.pipe.set_layout)?;
-                // Parameters.
-                if c.generated.has_params {
-                    let off = self.param_used;
-                    let mut buf = Vec::new();
-                    for (i, p) in file.params.iter().enumerate() {
-                        let v = e.spec.params.get(i).copied().unwrap_or(p.default);
-                        match p.kind {
-                            ParamKind::Float => buf.extend_from_slice(&(v as f32).to_le_bytes()),
-                            ParamKind::Int => buf.extend_from_slice(&(v.round() as i32).to_le_bytes()),
-                            ParamKind::Uint => buf.extend_from_slice(&(v.round().max(0.0) as u32).to_le_bytes()),
-                            ParamKind::Define => {}
-                        }
-                    }
-                    let len = (buf.len() as u64).max(16);
-                    if off + len > PARAM_BUF {
-                        anyhow::bail!("effect parameter buffer full");
-                    }
-                    let (pbuf, palloc) = &mut self.param_bufs[si];
-                    let mapped = palloc.as_mut().unwrap().mapped_slice_mut().unwrap();
-                    mapped[off as usize..off as usize + buf.len()].copy_from_slice(&buf);
-                    self.param_used = (off + len).next_multiple_of(self.ubo_align);
-                    let bi = [vk::DescriptorBufferInfo::default().buffer(*pbuf).offset(off).range(len)];
-                    let w = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&bi);
-                    unsafe { d.update_descriptor_sets(&[w], &[]) };
-                } else {
-                    // Binding 0 is a placeholder storage image; point it at the output.
-                    self.write_image(set, 0, out, vk::ImageLayout::GENERAL, true);
-                }
-                for (bi, (name, kind)) in c.generated.binds.iter().enumerate() {
-                    let b = bi as u32 + 1;
-                    match kind {
-                        BindKind::Storage(_) => match self.effects[ei].storage.get(name) {
-                            Some(img) => self.write_image(set, b, img.view, vk::ImageLayout::GENERAL, true),
-                            None => anyhow::bail!("{}: storage texture {name} missing", file.name),
-                        },
-                        BindKind::Sampled => {
-                            let tex = if name == "HOOKED" { Some(hooked) } else { reg.get(name).copied() };
-                            match tex {
-                                Some(t) => self.write_image(set, b, t.0, vk::ImageLayout::GENERAL, false),
-                                None => {
-                                    log::warn!("{} pass {pi}: texture '{name}' is not available; effect skipped", file.name);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-                let c = &self.effects[ei].compiled[&(pi, hook.clone())];
-                self.write_image(set, c.generated.out_binding, out, vk::ImageLayout::GENERAL, true);
-                let random = {
-                    let mut x = (f.seq as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xD1B54A32D192ED03;
-                    x ^= x >> 33;
-                    x = x.wrapping_mul(0xff51afd7ed558ccd);
-                    x ^= x >> 33;
-                    (x >> 40) as f32 / (1u64 << 24) as f32
-                };
-                let push = UserPush {
-                    out_size: [w as f32, h as f32],
-                    input_size: [f.input.0 as f32, f.input.1 as f32],
-                    target_size: [f.target.0 as f32, f.target.1 as f32],
-                    tex_offset: [0.0, 0.0],
-                    // Stateful effects count from the history reset (deterministic, and
-                    // `frame == 0` still means "no history"); others use the picture number.
-                    frame: if file.is_stateful() { (f.seq - self.frame_base).max(0) as i32 } else { f.seq as i32 },
-                    random,
-                };
-                unsafe {
-                    d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, c.pipe.pipeline);
-                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, c.pipe.layout, 0, &[set], &[]);
-                    d.cmd_push_constants(cb, c.pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes(&push));
-                    d.cmd_dispatch(cb, w.div_ceil(c.generated.block[0]), h.div_ceil(c.generated.block[1]), 1);
-                }
-                barrier(&d, cb);
-                let save = pass.save.clone().unwrap_or_else(|| stage.to_string());
-                let save = if save == "HOOKED" { stage.to_string() } else { save };
-                reg.insert(save, (out, w, h));
             }
         }
         Ok(())
     }
 
-    fn drop_compiled(&self, e: &mut Effect) {
-        self.device_wait_for_reuse();
+    /// Pass `pi` of effect `ei`, hooking `hook`, on the picture `reg[stage]`; its
+    /// output replaces that picture (or is saved under its SAVE name). False if the
+    /// effect cannot run (a texture it binds is missing): its other passes are skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pass(&mut self, cb: vk::CommandBuffer, si: usize, f: &ChainFrame<'_>, ei: usize, pi: usize, hook: &str, stage: &str, reg: &mut HashMap<String, (vk::ImageView, u32, u32)>) -> Result<bool> {
+        let d = self.device.clone();
+        let file = self.effects[ei].spec.file.clone();
+        let pass = &file.passes[pi];
+        let hooked = reg[stage];
+        let size_of = |name: &str| -> Option<(f64, f64)> {
+            match name {
+                "HOOKED" => Some((hooked.1 as f64, hooked.2 as f64)),
+                "OUTPUT" => Some((f.target.0 as f64, f.target.1 as f64)),
+                "NATIVE" | "NATIVE_CROPPED" => Some((f.input.0 as f64, f.input.1 as f64)),
+                n => reg.get(n).map(|t| (t.1 as f64, t.2 as f64)),
+            }
+        };
+        let spec_params = &self.effects[ei].spec.params;
+        let param_of = |name: &str| -> Option<f64> {
+            let i = file.params.iter().position(|p| p.name == name)?;
+            Some(spec_params.get(i).copied().unwrap_or(file.params[i].default))
+        };
+        if let Some(when) = &pass.when {
+            match when.eval(&size_of, &param_of) {
+                Ok(v) if v == 0.0 => return Ok(true),
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("{} pass {pi}: WHEN: {e}", file.name);
+                    return Ok(true);
+                }
+            }
+        }
+        let eval = |e: &Option<usershader::Rpn>, default: u32| -> u32 {
+            e.as_ref().and_then(|x| x.eval(&size_of, &param_of).ok()).map(|v| v.round().max(1.0) as u32).unwrap_or(default)
+        };
+        let (w, h) = (eval(&pass.width, hooked.1), eval(&pass.height, hooked.2));
+        let (out, _) = self.alloc_image(cb, w, h)?;
+
+        // Storage textures (persistent per effect).
+        for t in file.textures.iter().filter(|t| t.storage) {
+            if !self.effects[ei].storage.contains_key(&t.name) {
+                let img = gpu::create_image(
+                    &d,
+                    &self.allocator,
+                    t.w,
+                    t.h,
+                    vk_format(&t.format),
+                    vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST,
+                    "effect storage",
+                )?;
+                gpu::image_barrier(
+                    &d,
+                    cb,
+                    img.image,
+                    (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::ImageLayout::UNDEFINED),
+                    (vk::PipelineStageFlags2::CLEAR, vk::AccessFlags2::TRANSFER_WRITE, vk::ImageLayout::GENERAL),
+                );
+                unsafe { d.cmd_clear_color_image(cb, img.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[gpu::color_range()]) };
+                barrier(&d, cb);
+                self.effects[ei].storage.insert(t.name.clone(), img);
+            }
+        }
+
+        let e = &self.effects[ei];
+        let Some(c) = e.compiled.get(&(pi, hook.to_string())) else { return Ok(true) };
+        let set = self.alloc_set(si, c.pipe.set_layout)?;
+        // Parameters.
+        if c.generated.has_params {
+            let off = self.param_used;
+            let mut buf = Vec::new();
+            for (i, p) in file.params.iter().enumerate() {
+                let v = e.spec.params.get(i).copied().unwrap_or(p.default);
+                match p.kind {
+                    ParamKind::Float => buf.extend_from_slice(&(v as f32).to_le_bytes()),
+                    ParamKind::Int => buf.extend_from_slice(&(v.round() as i32).to_le_bytes()),
+                    ParamKind::Uint => buf.extend_from_slice(&(v.round().max(0.0) as u32).to_le_bytes()),
+                    ParamKind::Define => {}
+                }
+            }
+            let len = (buf.len() as u64).max(16);
+            if off + len > PARAM_BUF {
+                anyhow::bail!("effect parameter buffer full");
+            }
+            let (pbuf, palloc) = &mut self.param_bufs[si];
+            let mapped = palloc.as_mut().unwrap().mapped_slice_mut().unwrap();
+            mapped[off as usize..off as usize + buf.len()].copy_from_slice(&buf);
+            self.param_used = (off + len).next_multiple_of(self.ubo_align);
+            let bi = [vk::DescriptorBufferInfo::default().buffer(*pbuf).offset(off).range(len)];
+            let w = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&bi);
+            unsafe { d.update_descriptor_sets(&[w], &[]) };
+        } else {
+            // Binding 0 is a placeholder storage image; point it at the output.
+            self.write_image(set, 0, out, vk::ImageLayout::GENERAL, true);
+        }
+        for (bi, (name, kind)) in c.generated.binds.iter().enumerate() {
+            let b = bi as u32 + 1;
+            match kind {
+                BindKind::Storage(_) => match self.effects[ei].storage.get(name) {
+                    Some(img) => self.write_image(set, b, img.view, vk::ImageLayout::GENERAL, true),
+                    None => anyhow::bail!("{}: storage texture {name} missing", file.name),
+                },
+                BindKind::Sampled => {
+                    let tex = if name == "HOOKED" { Some(hooked) } else { reg.get(name).copied() };
+                    match tex {
+                        Some(t) => self.write_image(set, b, t.0, vk::ImageLayout::GENERAL, false),
+                        None => {
+                            log::warn!("{} pass {pi}: texture '{name}' is not available; effect skipped", file.name);
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        let c = &self.effects[ei].compiled[&(pi, hook.to_string())];
+        self.write_image(set, c.generated.out_binding, out, vk::ImageLayout::GENERAL, true);
+        let random = {
+            let mut x = (f.seq as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xD1B54A32D192ED03;
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51afd7ed558ccd);
+            x ^= x >> 33;
+            (x >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let push = UserPush {
+            out_size: [w as f32, h as f32],
+            input_size: [f.input.0 as f32, f.input.1 as f32],
+            target_size: [f.target.0 as f32, f.target.1 as f32],
+            tex_offset: [0.0, 0.0],
+            // Stateful effects count from the history reset (deterministic, and
+            // `frame == 0` still means "no history"); others use the picture number.
+            frame: if file.is_stateful() { (f.seq - self.frame_base).max(0) as i32 } else { f.seq as i32 },
+            random,
+        };
+        unsafe {
+            d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, c.pipe.pipeline);
+            d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, c.pipe.layout, 0, &[set], &[]);
+            d.cmd_push_constants(cb, c.pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes(&push));
+            d.cmd_dispatch(cb, w.div_ceil(c.generated.block[0]), h.div_ceil(c.generated.block[1]), 1);
+        }
+        barrier(&d, cb);
+        let save = pass.save.clone().unwrap_or_else(|| stage.to_string());
+        let save = if save == "HOOKED" || save == hook { stage.to_string() } else { save };
+        reg.insert(save, (out, w, h));
+        Ok(true)
+    }
+
+    /// Pipelines may still be used by frames in flight: retired, not destroyed.
+    fn drop_compiled(e: &mut Effect, graveyard: &mut Graveyard, now: u64) {
         for (_, c) in e.compiled.drain() {
-            destroy_pipe(&self.device, &c.pipe);
+            retire(graveyard, now, &c.pipe);
         }
     }
 
     fn drop_effect(&self, e: &mut Effect, graveyard: &mut Graveyard, now: u64) {
-        self.drop_compiled(e);
+        Self::drop_compiled(e, graveyard, now);
         for (_, img) in e.storage.drain() {
             graveyard.bury(now, img);
         }
@@ -750,6 +939,7 @@ impl Drop for EffectChain {
             self.device.destroy_sampler(self.sampler, None);
             destroy_pipe(&self.device, &self.planes_pipe);
             destroy_pipe(&self.device, &self.merge_pipe);
+            destroy_pipe(&self.device, &self.space_pipe);
         }
     }
 }

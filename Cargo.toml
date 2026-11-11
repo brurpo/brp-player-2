@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/brp-media", "crates/brp-render", "crates/brp-player"]
+members = ["crates/brp-media", "crates/brp-render", "crates/brp-ai", "crates/brp-player", "crates/onnxref"]
 
 [workspace.package]
 version = "0.1.0"

@@ -23,7 +23,7 @@ fn hash(f: &VideoFrame) -> u64 {
 }
 
 fn wait(src: &Source, frame: i64, playing: bool) -> Option<Arc<VideoFrame>> {
-    src.request(Request { frame, playing, dir: 1 });
+    src.request(Request { frame, playing, dir: 1, ahead: 0, fill: false });
     let t = Instant::now();
     loop {
         if let Some(f) = src.get(frame) {

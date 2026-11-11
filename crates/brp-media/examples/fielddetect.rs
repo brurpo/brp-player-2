@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
         }
         let n = src.frame_count().min(150);
         for f in 0..n {
-            src.request(Request { frame: f, playing: true, dir: 1 });
+            src.request(Request { frame: f, playing: true, dir: 1, ahead: 0, fill: false });
             let t = Instant::now();
             while src.get(f).is_none() && t.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(1));

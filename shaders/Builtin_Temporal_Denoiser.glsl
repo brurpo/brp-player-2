@@ -1,3 +1,7 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Redução de ruído temporal
+// @brp pt.param Intensity Intensidade | Intensidade do efeito.
+// @brp pt.param Size Tamanho | Tamanho do ruído.
 /* vi: ft=c
  *
  * Based on vf_nlmeans.c from FFmpeg.

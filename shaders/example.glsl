@@ -1,3 +1,8 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Exemplo
+// @brp pt.param KeyColorR Cor da chave | Intensidade do efeito.
+// @brp pt.param BColorR Cor de fundo | Intensidade do efeito.
+// @brp pt.param MIX Mistura | Intensidade do efeito.
 //!PARAM KeyColorR
 //!DESC Intensity of the effect
 //!TYPE float

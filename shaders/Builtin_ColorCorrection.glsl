@@ -1,3 +1,20 @@
+// Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp pt.title Correção de cor
+// @brp pt.param SharpenStrength Nitidez | Quanto de nitidez aplicar. 0 = sem efeito.
+// @brp pt.param SharpenRadius Raio da nitidez | Raio do desfoque da máscara de nitidez. Valores maiores afetam bordas mais largas.
+// @brp pt.param Exposure Exposição | Multiplica o brilho da imagem. 1 = sem mudança.
+// @brp pt.param Temperature Temperatura | Temperatura de cor. Abaixo de 0 mais fria (azul), acima de 0 mais quente (laranja).
+// @brp pt.param Saturation Saturação | Intensidade geral das cores. 0 = tons de cinza, 1 = original.
+// @brp pt.param Vibrance Vibração | Ajusta a saturação de forma inteligente, protegendo os tons de pele.
+// @brp pt.param Gamma Gama | Ajusta os tons médios da imagem toda.
+// @brp pt.param GammaRed Gama do vermelho | Ajusta os tons médios do canal vermelho.
+// @brp pt.param GammaGreen Gama do verde | Ajusta os tons médios do canal verde.
+// @brp pt.param GammaBlue Gama do azul | Ajusta os tons médios do canal azul.
+// @brp pt.param VignetteStrength Vinheta | Força da vinheta. Abaixo de 0 escurece as bordas, acima de 0 clareia.
+// @brp pt.param VignetteRadius Raio da vinheta | Raio interno da vinheta, antes de começar a esmaecer.
+// @brp pt.param VignetteSoftness Suavidade da vinheta | Quão suave é a transição da vinheta.
+// @brp pt.param LinearizeInput Luz linear | Corrige em luz linear (ACEScg) em vez de na imagem codificada. 1 = ligado.
+// @brp pt.param DeLinearizeOutput Sair da luz linear | Converte o resultado de volta da luz linear. Mantenha ligado quando Luz linear estiver ligado.
 //!PARAM SharpenStrength
 //!DESC Amount of sharpening to apply. 0.0 means no effect.
 //!TYPE float
@@ -90,14 +107,14 @@
 0.4
 
 //!PARAM LinearizeInput
-//!DESC How soft the transition of the vignette is.
+//!DESC Grade in linear light (ACEScg) instead of on the encoded picture. 1 = on.
 //!TYPE uint
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM DeLinearizeOutput
-//!DESC How soft the transition of the vignette is.
+//!DESC Convert the result back from linear light. Keep on when LinearizeInput is on.
 //!TYPE uint
 //!MINIMUM 0
 //!MAXIMUM 1
@@ -283,7 +300,9 @@ vec4 hook() {
         vec4 Poriginal = texture(HOOKED_raw, HOOKED_pos);
         color = Poriginal.rgb;
         color += (color - blurred) * SharpenStrength;
-        color = srgb_to_acescg(color);
+        if (LinearizeInput == 1u) {
+            color = clamp(srgb_to_acescg(color), vec3(0.0), vec3(50.0));
+        }
     }
 
     
@@ -299,15 +318,27 @@ vec4 hook() {
     }
 
     // --- 5. Saturation & Vibrance ---
-    float color_luma = luma(color);
-    float color_sat = max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
-    
-    float vibrance_adjust = Vibrance * (1.0 - smoothstep(0.2, 0.5, color_sat));
-    color = mix(vec3(color_luma), color, Saturation + vibrance_adjust);
+    // Luminance weights of the working space (ACEScg AP1 when linearised).
+    vec3 lw = LinearizeInput == 1u ? vec3(0.2722287, 0.6740818, 0.0536895) : vec3(0.2126, 0.7152, 0.0722);
+    color = max(color, 0.0);
+    float color_luma = dot(color, lw);
+    float cmax = max(max(color.r, color.g), color.b);
+    float cmin = min(min(color.r, color.g), color.b);
+    // Relative saturation (0 grey .. 1 fully saturated), independent of brightness.
+    float color_sat = (cmax - cmin) / max(cmax, 1e-6);
+    // Vibrance boosts muted colours more than saturated ones (and, when negative,
+    // mutes saturated colours first).
+    float vib = Vibrance > 0.0 ? Vibrance * (1.0 - color_sat) : Vibrance * color_sat;
+    float s = max(Saturation * (1.0 + vib), 0.0);
+    // Never push a channel below zero: stop at the gamut edge instead.
+    if (s > 1.0 && cmin < color_luma) {
+        s = min(s, color_luma / max(color_luma - cmin, 1e-6));
+    }
+    color = max(mix(vec3(color_luma), color, s), 0.0);
 
     // --- 6. Gamma Correction (Combined) ---
     vec3 gamma_vec = vec3(1.0 / (Gamma * GammaRed), 1.0 / (Gamma * GammaGreen), 1.0 / (Gamma * GammaBlue));
-    color = pow(color, gamma_vec);
+    color = pow(max(color, 0.0), gamma_vec);
 
     // --- 7. Vignette ---
     if (VignetteStrength != 0.0) {
