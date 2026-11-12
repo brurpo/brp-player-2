@@ -28,7 +28,9 @@ Releases are packaged by `tools/release/package.py`.
 
 ## License
 
-BRP Player is free to use, including for commercial work, and everything you make
-with it is yours. It may be shared and modified, for free and with attribution, but
-not sold. See [LICENSE.md](LICENSE.md). Third-party components keep their own
+BRP Player is free for individuals and for companies with less than US$1 million in
+annual revenue, including for commercial work. Larger companies need a commercial
+license: contact **contact@brpapp.com**. Everything you make with it is yours. It may
+be shared and modified, for free and with attribution, but not sold. See
+[LICENSE.md](LICENSE.md). Third-party components keep their own
 licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

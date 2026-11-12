@@ -2077,6 +2077,11 @@ fn settings_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions
         ui.label(RichText::new(concat!("BRP Player ", env!("CARGO_PKG_VERSION"), " · brurpo")).small().color(Color32::from_gray(130)));
         ui.hyperlink_to(RichText::new("github.com/brurpo/brp-player-2").small(), "https://github.com/brurpo/brp-player-2");
     });
+    // License terms (LICENSE.md): free under US$1M a year in revenue.
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(l.t("license_free")).small().color(Color32::from_gray(130)));
+        ui.hyperlink_to(RichText::new("contact@brpapp.com").small(), "mailto:contact@brpapp.com");
+    });
 }
 
 fn effects_contents(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions: &mut Vec<Action>) {

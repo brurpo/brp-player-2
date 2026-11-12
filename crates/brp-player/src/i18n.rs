@@ -133,6 +133,10 @@ impl Lang {
                 "Clique ou arraste: ir a um quadro · Arraste as alças amarelas: entrada/saída · Roda: zoom · Shift+roda ou botão do meio: rolar · Duplo clique na régua: clipe inteiro (\\)",
             ),
             "toast_in" => ("In", "Entrada"),
+            "license_free" => (
+                "Free for individuals and companies under US$1M a year in revenue. Larger companies need a license:",
+                "Gratuito para pessoas e empresas com faturamento anual abaixo de US$1 milhão. Empresas maiores precisam de licença:",
+            ),
             "upd_available" => ("Update available", "Atualização disponível"),
             "upd_install" => ("Install", "Instalar"),
             "upd_later" => ("Later", "Depois"),
