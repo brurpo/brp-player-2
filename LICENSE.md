@@ -37,6 +37,9 @@ restriction and without attribution.
 
 ## 4. Copies and changes
 
+The rights in this section apply only to those who may use the Software under
+section 1 or hold a commercial license under section 2.
+
 You may copy, modify and redistribute the Software, changed or unchanged, provided
 that:
 
@@ -45,6 +48,10 @@ that:
 - the attribution below is kept, in the source and in the application's About or
   Info screen: "Based on BRP Player by brurpo — https://github.com/brurpo/brp-player-2";
 - modified versions are marked as modified.
+
+Copies and modified versions, including builds from the source code, remain subject
+to sections 1 and 2: an organization at or above the revenue threshold needs a
+commercial license to use them, however it obtained them.
 
 ## 5. Not for sale
 
