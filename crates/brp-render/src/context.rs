@@ -94,8 +94,11 @@ unsafe fn create_device(entry: &ash::Entry, instance: &ash::Instance, physical: 
             coopmat_acc16 = coopmat && has(vk::ComponentTypeKHR::FLOAT16);
         }
         let memory_budget = available.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME));
+        // (Whether they are faster than the plain kernels is measured once the
+        // device is up: `coopcheck`.)
         if std::env::var_os("BRP_NO_COOPMAT").is_some() {
             coopmat = false;
+            coopmat_acc16 = false;
         }
         let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
@@ -342,7 +345,7 @@ impl GpuContext {
             lap("device");
             let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
 
-            Ok(GpuContext {
+            Ok(crate::coopcheck::check(GpuContext {
                 entry,
                 instance,
                 debug,
@@ -364,7 +367,7 @@ impl GpuContext {
                 coopmat_acc16,
                 memory_budget,
                 pipeline_cache,
-            })
+            }))
         }
     }
 
@@ -397,7 +400,7 @@ impl GpuContext {
             let pipeline_cache = crate::shader_cache::load_pipeline_cache(&device, &instance.get_physical_device_properties(physical));
             let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
             let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
-            Ok(GpuContext {
+            Ok(crate::coopcheck::check(GpuContext {
                 entry,
                 instance,
                 debug,
@@ -419,7 +422,7 @@ impl GpuContext {
                 coopmat_acc16,
                 memory_budget,
                 pipeline_cache,
-            })
+            }))
         }
     }
 

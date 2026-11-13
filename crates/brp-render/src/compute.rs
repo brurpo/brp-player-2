@@ -284,6 +284,11 @@ pub struct Recorder<'a> {
     /// both queues' work in the order it was submitted: with a lot queued, the
     /// window's frames wait behind all of it. With one, a frame waits for one part.
     pub max_queued: usize,
+    /// Never submitted (building kernels ahead of use): `flush` and `sync` record on
+    /// in the same command buffer, which is dropped unrun. Without this the start-up
+    /// warm-up ran every network for real, which on a slow GPU (an integrated one)
+    /// took minutes and got the GPU reset.
+    pub dry: bool,
 }
 
 /// The error `Recorder::flush` returns when the work is no longer wanted.
@@ -299,6 +304,13 @@ impl std::fmt::Display for Cancelled {
 impl std::error::Error for Cancelled {}
 
 impl<'a> Recorder<'a> {
+    /// A recorder that is never submitted (see `dry`).
+    pub fn dry(compute: &'a Compute) -> Result<Recorder<'a>> {
+        let mut r = Self::new(compute)?;
+        r.dry = true;
+        Ok(r)
+    }
+
     pub fn new(compute: &'a Compute) -> Result<Recorder<'a>> {
         let ctx = &compute.ctx;
         let device = &ctx.device;
@@ -316,7 +328,7 @@ impl<'a> Recorder<'a> {
             } else {
                 None
             };
-            Ok(Recorder { compute, pool, cb, desc_pool, dispatches: 0, keep: Vec::new(), submitted: Vec::new(), first_submit: None, queries, label: String::new(), cancel: None, max_queued: 0 })
+            Ok(Recorder { compute, pool, cb, desc_pool, dispatches: 0, keep: Vec::new(), submitted: Vec::new(), first_submit: None, queries, label: String::new(), cancel: None, max_queued: 0, dry: false })
         }
     }
 
@@ -452,6 +464,9 @@ impl<'a> Recorder<'a> {
             self.wait_submitted();
             return Err(Cancelled.into());
         }
+        if self.dry {
+            return Ok(());
+        }
         let ctx = &self.compute.ctx;
         let device = &ctx.device;
         unsafe {
@@ -492,6 +507,9 @@ impl<'a> Recorder<'a> {
     /// error names the work that failed).
     pub fn sync(&mut self) -> Result<()> {
         self.flush()?;
+        if self.dry {
+            return Ok(());
+        }
         let device = &self.compute.ctx.device;
         let mut r = Ok(());
         for f in self.submitted.drain(..) {

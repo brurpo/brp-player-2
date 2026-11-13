@@ -3,6 +3,7 @@
 mod color;
 mod composite;
 mod context;
+mod coopcheck;
 mod deint;
 pub mod effects;
 pub mod gpudec;

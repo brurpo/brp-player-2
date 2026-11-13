@@ -99,7 +99,7 @@ pub fn spirv(glsl: &str, options: &str, compile: impl FnOnce() -> anyhow::Result
 }
 
 /// What a pipeline cache is valid for: the GPU and its driver.
-fn device_id(props: &vk::PhysicalDeviceProperties) -> String {
+pub(crate) fn device_id(props: &vk::PhysicalDeviceProperties) -> String {
     let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
     format!("{:04x}:{:04x} driver {:08x} cache {uuid}", props.vendor_id, props.device_id, props.driver_version)
 }

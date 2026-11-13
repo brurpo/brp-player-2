@@ -1,7 +1,9 @@
 //! Building every AI shader ahead of use (at start-up), so adding an effect does not
 //! wait for compiles. The shared objects (operations, motion, denoiser) build theirs
 //! when made; each network builds its kernel variants while it records, so each is
-//! recorded once on a small blank picture and the recording dropped unsubmitted.
+//! recorded once on a small blank picture and the recording dropped unsubmitted
+//! (`Recorder::dry`: nothing of it reaches the GPU, even the parts a network would
+//! submit on the way).
 //! What gets compiled lands in the disk caches (`brp_render::shader_cache`), where the
 //! effects' own objects find it later.
 
@@ -38,7 +40,7 @@ pub fn warm_up(compute: &Arc<Compute>, models: &Path, progress: &dyn Fn(usize, u
     for m in UpscaleModel::ALL {
         let r = (|| -> Result<()> {
             let up = Upscaler::new(&ops, models, m)?;
-            let mut rec = Recorder::new(compute)?;
+            let mut rec = Recorder::dry(compute)?;
             let img = blank(&mut rec, 64, 64)?;
             up.record(&mut rec, &img)?;
             Ok(())
@@ -48,7 +50,7 @@ pub fn warm_up(compute: &Arc<Compute>, models: &Path, progress: &dyn Fn(usize, u
     for m in RifeModel::ALL {
         let r = (|| -> Result<()> {
             let rife = Rife::new(&ops, models, m)?;
-            let mut rec = Recorder::new(compute)?;
+            let mut rec = Recorder::dry(compute)?;
             let (a, b) = (blank(&mut rec, 64, 64)?, blank(&mut rec, 64, 64)?);
             rife.record(&mut rec, &a, &b, 0.5)?;
             Ok(())
@@ -60,7 +62,7 @@ pub fn warm_up(compute: &Arc<Compute>, models: &Path, progress: &dyn Fn(usize, u
             anyhow::bail!("no matting model");
         }
         let mut net = Matting::new(&ops, models, 128, 128)?;
-        let mut rec = Recorder::new(compute)?;
+        let mut rec = Recorder::dry(compute)?;
         let img = blank(&mut rec, 128, 128)?;
         net.record(&mut rec, &img)?;
         Ok(())
@@ -71,7 +73,7 @@ pub fn warm_up(compute: &Arc<Compute>, models: &Path, progress: &dyn Fn(usize, u
             anyhow::bail!("no SEA-RAFT model");
         }
         let sr = crate::flow::SeaRaft::new(&ops, models)?;
-        let mut rec = Recorder::new(compute)?;
+        let mut rec = Recorder::dry(compute)?;
         let (a, b) = (blank(&mut rec, 128, 128)?, blank(&mut rec, 128, 128)?);
         sr.flow(&mut rec, &a, &b)?;
         Ok(())
@@ -82,7 +84,7 @@ pub fn warm_up(compute: &Arc<Compute>, models: &Path, progress: &dyn Fn(usize, u
             anyhow::bail!("no WAFT model");
         }
         let wf = crate::flow::Waft::new(&ops, models)?;
-        let mut rec = Recorder::new(compute)?;
+        let mut rec = Recorder::dry(compute)?;
         let (a, b) = (blank(&mut rec, 128, 128)?, blank(&mut rec, 128, 128)?);
         wf.flow(&mut rec, &a, &b)?;
         Ok(())
