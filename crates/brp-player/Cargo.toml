@@ -29,3 +29,7 @@ brp-render = { path = "../brp-render" }
 brp-ai = { path = "../brp-ai" }
 brp-ocio = { path = "../brp-ocio" }
 winit.workspace = true
+
+[build-dependencies]
+# The executable's icon (build.rs): the app icon's PNG decoded and re-encoded per size.
+png = "0.18"
