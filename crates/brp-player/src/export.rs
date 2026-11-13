@@ -2259,7 +2259,7 @@ fn verify_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) 
     // before: make every picture in order from the start, as the export (and
     // playback) did, and compare the listed ones.
     let warm = ai::shader_warmup(&stages);
-    let sequential = warm > 0 || stages.iter().any(|s| matches!(s, Stage::Ai { kind: AiKind::Matting | AiKind::Depth, .. }));
+    let sequential = warm > 0 || stages.iter().any(|s| matches!(s, Stage::Ai { kind: AiKind::Matting | AiKind::Depth | AiKind::DenoiseAi, .. }));
     let tol = get("tolerance").and_then(|t| t.parse::<f64>().ok()).unwrap_or(1.5);
     let transfer = transfer_of(&src.info.color);
     let job_at = |s: Sample| -> anyhow::Result<Job> {

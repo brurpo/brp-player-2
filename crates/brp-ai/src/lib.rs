@@ -18,6 +18,7 @@ pub mod flow;
 pub mod gpu;
 pub mod gpu_temporal;
 pub mod gpuenc;
+pub mod learned;
 pub mod matting;
 pub mod pack;
 pub mod birefnet;

@@ -223,6 +223,41 @@ No film damage (scratches, dust, line dropouts): decided against.
   - Codec damage is made in worker processes with PyAV (no ffmpeg process per sample), plus a pre-generated bank of compressed variants.
   - The machine has 24 CPU threads.
 
+### Data pipeline and training loop (built)
+
+- **Caches** in `D:\denoise_data\bank` (about 80 GB): reading the sources directly cost 0.3–2 s per sample (PNG decoding, EXR blocks holding every channel, Noisebase's thousands of small files).
+  - `data/camera_bank.py`: two 512×512 crops per clip that pass the noise gate, every frame, Blosc-compressed (40 GB); `data/crop_maps.py`: their noise-gate maps in one 35 MB file.
+  - `data/render_bank.py`: per scene the GT, the 8 noisy variants (raw "Noisy Image") and Blender's denoised output of the 16 and 64 sample variants (its flicker is an input too), as raw half floats (27 GB). Frames matched by the number at the end of the name (the farm prefixes GT names). `exr.py` reads Blender's multilayer EXRs.
+  - `data/noisebase_bank.py`: the reference and the means of 1, 4 and 16 samples per pixel (13 GB).
+- **`dataset.py`** draws samples (55% camera, 30% render, 15% Noisebase): crops, scale, flips, time reversal, exposure, damage (`degrade.py`), noise map. Validation holds out REDS val, Netflix Crosswalk, the classroom scene and the last 8 Noisebase sequences, with a fixed set of samples.
+- **`loader.py`**: worker processes with NumPy only, batches through shared memory. PyTorch's DataLoader imported PyTorch in every worker, which on Windows reserves ~4 GB each for CUDA libraries: 14 workers ran the 31 GB machine out of memory. Also one BLAS thread per process (OpenBLAS reserved 0.8 GB per process for 24 threads and slowed sampling 3×) and one thread per video encoder.
+- **Damage on the GPU** (`gpu_degrade.py`, `recipes.py`): with the whole chain on the CPU, damaging samples saturated the 12 cores at about 5 steps/s, half of what the GPU could do. Now the workers only read clips and draw each clip's *recipe* (every setting, with `degrade.py`'s choices and distributions; NumPy only); the GPU applies it in the training process (noise, grain, blotches, render noise, salt and pepper, aliasing, banding, noise map). Compression, the one step that needs real encoders, goes to a pool of 8 CPU processes, a few batches in flight so it overlaps with training. The weave step's optical flow is computed by the workers.
+  - Checked against the CPU version (`gpu_check.py`): same damage strength per step within a few percent (sparse grain varies ±25% from clip to clip in both), same look.
+  - **Result: about 9 steps/s with the GPU waiting for data ~10–20% of the time** (was 3.5 steps/s and 80%), so 300k steps take about 9–10 h. Workers produce a sample in ~32 ms (was ~150 ms). Defaults: 6 reading workers, 12 compression processes, 8 batches in flight (`--feed-depth`; 4 was too few to hide compression once double compression came in).
+- **Film grain, rebuilt** (the first version looked like coloured sensor noise): the Boolean grain model (Newson, Delon, Galerne 2017). Opaque grains far smaller than a pixel, dropped by a Poisson process whose density follows the picture, rendered at 4× and averaged down; the visible grain is their clumping, sized by the scan blur (0.5–1.2 px). Black and white (one layer) or colour (dye layers, blue's grains largest, mixed with a shared luma grain). **Negative film (70%) is modelled in linear light: on screen the grain is strongest in the shadows**, fading in the highlights (measured on a ramp: 0.04 → 0.012); prints / reversal (30%) on display values: strongest in the mid-tones. Check sheet: `film_check.py`.
+- **Camera noise, calibrated on the black-curtain clip** (CRV, held out: only measured, never trained on; `noise_stats.py`, `curtain_calib.py`). On the curtain (~10% brightness): luma noise 3–5.5 levels, chroma as strong (Cb 3.1, Cr 5.0), along the Cr axis (magenta–teal, 1.6× the other axis), fine (0.8 px), 8×8 block mosaics, ~20% kept from frame to frame. The old sensor noise was colour-neutral in every direction. Now it goes through a camera's processing: shot + read noise per raw channel, white balance gains (R, B 1.0–3.0×), a colour-correction matrix (shape jittered per camera), the picture style's saturation (1–2.2× on the noise's colour), demosaic blur 0.2–0.9 px, 0–30% carried from frame to frame. Plus **DNxHR** among the codecs (8×8 DCT at a fixed rate: the block mosaic) and **double compression** (a camera codec then DNxHR / ProRes / MPEG-2) on a quarter of compressed clips. The curtain's statistics now fall inside what the recipes draw; the closest draws look like it (`check/curtain_vs_synthetic.png`).
+- **`train.py`** (`--workers` reading processes, default 6; `--compress-workers`, default 8): stage 1 (window, no recurrence), PQ inside, Charbonnier + FFT loss, AdamW with warm-up and cosine, bf16, EMA with warm-up, checkpoints, `--resume`, `pause` / `stop` files, `--low-priority`.
+- **`dashboard.py`**: the statistics window (`--open` shows it as its own window): progress and ETA, loss, quality gain per source in training and validation, speed and time waiting for data, learning rate, memory, gradient norm, sample pictures at any step, Pause / Resume / Stop.
+
+### Detail experiments (stage 1, at step ~19k)
+
+The outputs were getting softer: fine detail (0.7–1.5 px band energy, output vs clean) at about 90%, and even lightly damaged camera clips lost 12% (input 101% → output 86% on very light sensor noise). Six variants, 3,000 steps each from the same checkpoint, judged on the full validation set (`compare_runs.py`, `val_report.py`):
+
+| Variant | Quality gain | Camera | Fine detail | Medium detail |
+|---|---|---|---|---|
+| A: as before | +3.32 dB | +1.82 | 89% | 96% |
+| B: + edge loss, FFT ×4 | +3.40 | +1.87 | 88% | 95% |
+| C: B + bicubic warp | +3.41 | +1.87 | 88% | 95% |
+| D: stronger edge / FFT, bicubic | +3.41 | +1.87 | 88% | 95% |
+| E: B + noise map | +3.73 | +2.07 | 87% | 94% |
+| **F: E + detail-energy loss** | **+3.69** | **+2.05** | **92%** | **98%** |
+
+- Edge / frequency losses and bicubic warping barely moved detail: the loss of detail is the pixel loss's averaging of plausible textures (the mean is smoother than any of them), not loss weights.
+- The **noise map** (FFDNet-style "strength" input: local RMS of the damage, ×10, ±30% random error so the player's estimate is tolerated) raised quality clearly, but not detail.
+- The **detail-energy loss** (`detail_loss`: band energy in 16×16 patches, fine and medium, output must match clean) did: camera fine detail 83 / 90 / 94% from heavy to light damage (A: 83 / 86 / 88%). Renders slightly exceed the clean detail (104–106%) in the noisiest cases: watch for leftover noise or invented texture.
+- Main run continues as **stage1_v2** with F's settings (`--fft-weight 0.2 --grad-weight 0.5 --noise-map --detail-weight 2.0`, bilinear warp), from F's checkpoint.
+- Training metrics leave out the clean ("leave alone") samples (input PSNR ≥ 60 dB): one such sample moved the camera average by −0.6 dB. Their pass-through quality is logged on its own.
+
 ## 7. Pause and resume
 
 - **Checkpoints** go out every N minutes and on Ctrl+C or a `pause` file. They are written to a temporary file and then renamed, so a crash never leaves a broken one. The last K are kept, plus the best on validation.

@@ -43,6 +43,9 @@ pub enum AiKind {
     Matting,
     /// Our denoiser (`brp_ai::denoise`): before upscaling, or alone.
     Denoise,
+    /// Our learned denoiser (`brp_ai::learned`): each picture merged with its
+    /// neighbours and its own previous result by a small network.
+    DenoiseAi,
     /// NAFNet (REDS): motion and focus blur removed (`brp_ai::restore`).
     Deblur,
     /// SCUNet: noise, blocking and compression artefacts removed (`brp_ai::restore`).
@@ -61,7 +64,7 @@ const UPSCALE_MODELS: [UpscaleModel; 11] = [UpscaleModel::Fast2x, UpscaleModel::
 const INTERP_FACTORS: [u8; 4] = [2, 3, 4, 8];
 
 impl AiKind {
-    pub const ALL: [AiKind; 10] = [AiKind::Denoise, AiKind::CleanUp, AiKind::Deblur, AiKind::Steady, AiKind::Stabilise, AiKind::Upscale, AiKind::Interpolate, AiKind::MotionBlur, AiKind::Matting, AiKind::Depth];
+    pub const ALL: [AiKind; 11] = [AiKind::Denoise, AiKind::DenoiseAi, AiKind::CleanUp, AiKind::Deblur, AiKind::Steady, AiKind::Stabilise, AiKind::Upscale, AiKind::Interpolate, AiKind::MotionBlur, AiKind::Matting, AiKind::Depth];
 
     /// Stable name for presets and the command line.
     pub fn id(self) -> &'static str {
@@ -71,6 +74,7 @@ impl AiKind {
             AiKind::MotionBlur => "motion_blur",
             AiKind::Matting => "matting",
             AiKind::Denoise => "denoise",
+            AiKind::DenoiseAi => "denoise_ai",
             AiKind::Deblur => "deblur",
             AiKind::CleanUp => "cleanup",
             AiKind::Depth => "depth",
@@ -103,9 +107,13 @@ impl AiKind {
     /// Colour space the model works in (DESIGN.md §7a). All of today's models were
     /// trained on display pictures: they see the picture as the SDR viewer shows it,
     /// HDR mapped there and back invertibly. A model trained on linear light (the
-    /// planned learned denoiser) says `Space::Linear`.
+    /// learned denoiser) takes linear light in the source's primaries and encodes it
+    /// itself (`brp_ai::learned`: PQ, as it was trained).
     pub fn space(self) -> brp_render::Space {
-        brp_render::Space::Display
+        match self {
+            AiKind::DenoiseAi => brp_render::Space::MpvLinear,
+            _ => brp_render::Space::Display,
+        }
     }
 
     /// i18n key of the name shown in the stack.
@@ -116,6 +124,7 @@ impl AiKind {
             AiKind::MotionBlur => "fx_ai_blur",
             AiKind::Matting => "fx_ai_matting",
             AiKind::Denoise => "fx_ai_denoise",
+            AiKind::DenoiseAi => "fx_ai_denoise_ai",
             AiKind::Deblur => "fx_ai_deblur",
             AiKind::CleanUp => "fx_ai_cleanup",
             AiKind::Depth => "fx_ai_depth",
@@ -159,6 +168,11 @@ impl AiKind {
                 p("Colour", "Colour noise removal, relative to Spatial", ParamKind::Float, 1.0, 0.0, 3.0),
                 p("Motion", "How the motion between frames is found. Built-in: fast, and lines frames up best, grain included. SEA-RAFT (AI): follows the real motion far more accurately, small moving things included; about 40 ms per frame at 1080p. WAFT (AI): the most accurate, particles and fine detail included, but slow: about 0.7 s per frame at 1080p (options: Built-in|SEA-RAFT (AI)|WAFT (AI))", ParamKind::Int, 0.0, 0.0, 2.0),
                 p("Impulses", "Removes isolated pixels far brighter or darker than those around them: fireflies in 3D renders, salt and pepper, hot or dead pixels (0: off; higher catches fainter ones). A small highlight also in the neighbouring pictures, such as a star or a glint, is kept", ParamKind::Float, 0.5, 0.0, 1.0),
+            ],
+            AiKind::DenoiseAi => vec![
+                p("Strength", "How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
+                p("Temporal", "On: each frame is merged with the frame before, the frame after and its own previous result, moved onto it along the motion: cleaner and steadier. Off: each frame alone (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
+                p("Scene cuts", "On: a neighbouring frame that does not match this one at all (another shot) is left out, and the result starts afresh there. Off: the network alone decides what to take from each frame (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
             ],
             AiKind::Deblur => vec![p(
                 "Strength",
@@ -271,6 +285,19 @@ fn stab_radius(params: &[f64]) -> i64 {
 /// Depth: earlier pictures run after a jump so the video model has a history.
 const DEPTH_REPLAY: i64 = 4;
 
+/// Learned denoiser: earlier pictures run after a jump so its state has settled (its
+/// first picture has no neighbour before and no previous result, as in training;
+/// the result is steady from the second on).
+const LEARNED_REPLAY: i64 = 2;
+/// The learned denoiser carries on from its last picture when this one is at most
+/// this many steps later (playback skipping pictures): that picture is then the
+/// "frame before".
+const LEARNED_GAP: i64 = 3;
+
+fn learned_temporal(params: &[f64]) -> bool {
+    params.get(1).is_none_or(|&v| v >= 0.5)
+}
+
 /// Steady Detail: frames each way.
 fn steady_radius(params: &[f64]) -> i64 {
     params.first().map_or(4, |v| v.round() as i64).clamp(1, 8)
@@ -306,6 +333,8 @@ pub(crate) struct Reach {
     pub depth: i64,
     /// Stabilisation: its smoothing radius each way (stages add up).
     pub stab: i64,
+    /// Learned denoiser (temporal): earlier pictures replayed after a jump.
+    pub learned: i64,
 }
 
 impl Reach {
@@ -316,6 +345,7 @@ impl Reach {
             .filter_map(|s| match s {
                 Stage::Ai { kind: AiKind::Upscale, params } if params.get(2).is_none_or(|&v| v >= 0.5) => Some(window_radius(params)),
                 Stage::Ai { kind: AiKind::Denoise, params } => Some(params.first().map_or(3, |v| v.round() as i64).clamp(1, 5)),
+                Stage::Ai { kind: AiKind::DenoiseAi, params } if learned_temporal(params) => Some(1),
                 Stage::Ai { kind: AiKind::Matting, params } if params.get(1).is_none_or(|&v| v < 0.5) => Some(matte_radius(params)),
                 _ => None,
             })
@@ -330,12 +360,13 @@ impl Reach {
             .sum();
         // RVM replays earlier pictures after a jump; BiRefNet needs none.
         let rvm = stages.iter().filter(|s| matches!(s, Stage::Ai { kind: AiKind::Matting, params } if params.get(1).is_some_and(|&v| v >= 0.5))).count() as i64;
-        Reach { interp: count(AiKind::Interpolate), blur: count(AiKind::MotionBlur), matte: rvm, window, deint: deint as i64, depth: count(AiKind::Depth), stab }
+        let learned = stages.iter().filter(|s| matches!(s, Stage::Ai { kind: AiKind::DenoiseAi, params } if learned_temporal(params))).count() as i64;
+        Reach { interp: count(AiKind::Interpolate), blur: count(AiKind::MotionBlur), matte: rvm, window, deint: deint as i64, depth: count(AiKind::Depth), stab, learned }
     }
 
     /// Source frames read before and after a frame.
     pub fn frames(&self) -> (i64, i64) {
-        (self.blur + self.window + 4 * self.matte + DEPTH_REPLAY * self.depth + self.stab + self.deint, self.interp + self.blur + self.window + self.stab + self.deint)
+        (self.blur + self.window + 4 * self.matte + DEPTH_REPLAY * self.depth + LEARNED_REPLAY * self.learned + self.stab + self.deint, self.interp + self.blur + self.window + self.stab + self.deint)
     }
 }
 
@@ -1139,6 +1170,14 @@ struct DepthState {
 /// Camera movements kept (4 numbers each).
 const SIMS: usize = 16384;
 
+/// The learned denoiser's state after a picture of a stage's input.
+struct LearnedState {
+    /// Tick of that picture.
+    last: i64,
+    /// Its denoised picture, as the network keeps it (PQ, padded).
+    prev: Tensor,
+}
+
 struct MattingState {
     net: Matting,
     /// Tick of the last picture fed to the network (its state follows that picture).
@@ -1210,6 +1249,10 @@ pub(crate) struct Worker {
     alphas_order: VecDeque<(usize, i64)>,
     added_alphas: Vec<(usize, i64)>,
     cleanup: Option<brp_ai::restore::Restorer>,
+    /// The learned denoiser, loaded when first asked for, and per stage input its
+    /// state (the previous result).
+    learned: Option<brp_ai::learned::Learned>,
+    learned_state: HashMap<usize, LearnedState>,
     /// Depth: per stage input, the model (its frame history) and the last picture fed.
     depth: HashMap<usize, DepthState>,
     depth_fx: Option<brp_ai::depth::DepthFx>,
@@ -1599,6 +1642,7 @@ impl Worker {
             self.alphas.retain(|k, _| keep(k.0));
             self.alphas_order.retain(|k| keep(k.0));
             self.depth.retain(|i, _| keep(*i));
+            self.learned_state.retain(|i, _| keep(*i));
             self.sims.retain(|k, _| keep(k.0));
             self.sims_order.retain(|k| keep(k.0));
             self.motion.retain(|k, _| keep(k.0));
@@ -1665,6 +1709,8 @@ impl Worker {
             }
             self.motion_order.retain(|k| self.motion.contains_key(k));
             self.matting.clear();
+            // The denoiser's state was to be written by work that did not run.
+            self.learned_state.clear();
             for k in std::mem::take(&mut self.added_alphas) {
                 self.alphas.remove(&k);
             }
@@ -1868,6 +1914,7 @@ impl Worker {
                     self.put(rec, img);
                     out
                 }
+                AiKind::DenoiseAi => self.run_learned(rec, job, input, params, tick, g),
                 AiKind::Depth => self.run_depth(rec, job, input, params, tick, g),
                 AiKind::Stabilise => self.run_stabilise(rec, job, input, params, tick, g),
                 AiKind::Steady => {
@@ -1950,6 +1997,90 @@ impl Worker {
                 self.waft.as_ref().unwrap().flow(rec, a, b)?
             }
         })
+    }
+
+    /// Picture `tick` of stage `s` through the learned denoiser (`brp_ai::learned`).
+    /// It is recurrent: each picture takes the previous result as well as the frames
+    /// before and after. Playing on, the state carries over (a picture a few steps
+    /// later, when playback skips some, takes the last one made as its "frame
+    /// before"). After a jump it starts again `LEARNED_REPLAY` pictures earlier, the
+    /// first of them alone with the frame after it, as a clip's first frame in training.
+    #[allow(clippy::too_many_arguments)]
+    fn run_learned(&mut self, rec: &mut Recorder, job: &Job, s: usize, params: &[f64], tick: i64, g: i64) -> anyhow::Result<Tensor> {
+        use brp_ai::learned::Learned;
+        if self.learned.is_none() {
+            let models = brp_ai::models_dir();
+            if !Learned::available(&models) {
+                anyhow::bail!("denoise model not found in {}", models.display());
+            }
+            let net = Learned::new(&self.gpu().ops, &models)?;
+            log::info!("AI: learned denoiser {}", net.source);
+            self.learned = Some(net);
+        }
+        let strength = params.first().copied().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+        let cuts = params.get(2).is_none_or(|&v| v >= 0.5);
+        let sdr = job.color.transfer == brp_media::Transfer::Sdr;
+        let end = job.last_frame * job.subs;
+        if !learned_temporal(params) {
+            let img = self.eval(rec, job, s, tick)?;
+            let made = self.learned.as_ref().unwrap().record(rec, &img, None, None, None, sdr, strength, false);
+            self.put(rec, img);
+            let (out, state) = made?;
+            self.put(rec, state);
+            return Ok(out);
+        }
+        // Where to carry on from: the last picture made, if this one follows it closely.
+        let mut state = self.learned_state.remove(&s).filter(|st| st.last < tick && tick - st.last <= LEARNED_GAP * g);
+        let mut before = None;
+        if let Some(st) = &state {
+            match self.eval(rec, job, s, st.last) {
+                Ok(b) => before = Some(b),
+                Err(_) => state = None,
+            }
+        }
+        if state.is_none() {
+            for back in (1..=LEARNED_REPLAY).rev() {
+                let t = tick - back * g;
+                if t < 0 {
+                    continue;
+                }
+                let Ok(cur) = self.eval(rec, job, s, t) else {
+                    state = None;
+                    continue;
+                };
+                // With a state, the picture before it; the first one stands alone.
+                let b = if state.is_some() { self.eval(rec, job, s, t - g).ok() } else { None };
+                let a = self.eval(rec, job, s, t + g).ok();
+                let prev = state.as_ref().filter(|_| b.is_some()).map(|st| &st.prev);
+                let made = self.learned.as_ref().unwrap().record(rec, &cur, b.as_ref().filter(|_| prev.is_some()), a.as_ref(), prev, sdr, 1.0, cuts);
+                for x in [Some(cur), b, a].into_iter().flatten() {
+                    self.put(rec, x);
+                }
+                let (out, st) = made?;
+                self.put(rec, out);
+                if let Some(old) = state.replace(LearnedState { last: t, prev: st }) {
+                    self.put(rec, old.prev);
+                }
+            }
+            if let Some(st) = &state {
+                match self.eval(rec, job, s, st.last) {
+                    Ok(b) => before = Some(b),
+                    Err(_) => state = None,
+                }
+            }
+        }
+        let img = self.eval(rec, job, s, tick)?;
+        let after = if tick + g <= end { Some(self.eval(rec, job, s, tick + g)?) } else { None };
+        let made = self.learned.as_ref().unwrap().record(rec, &img, before.as_ref(), after.as_ref(), state.as_ref().map(|st| &st.prev), sdr, strength, cuts);
+        for x in [Some(img), before, after].into_iter().flatten() {
+            self.put(rec, x);
+        }
+        if let Some(old) = state {
+            self.put(rec, old.prev);
+        }
+        let (out, st) = made?;
+        self.learned_state.insert(s, LearnedState { last: tick, prev: st });
+        Ok(out)
     }
 
     /// Depth of picture `tick` of stage `s` and an effect from it. The video model

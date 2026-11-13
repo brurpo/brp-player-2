@@ -34,14 +34,21 @@ import numpy as np
 # --- transfer curves -------------------------------------------------------------
 
 
+# The curves use OpenCV's vectorised pow (about 2x NumPy's, same results to 1e-5):
+# they run on every sample, several times.
+def _pow(x, e):
+    x = np.ascontiguousarray(x, np.float32)
+    return cv2.pow(x.reshape(-1, 1), float(e)).reshape(x.shape)
+
+
 def srgb_oetf(x):
-    x = np.maximum(x, 0)
-    return np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(x, 1 / 2.4) - 0.055).astype(np.float32)
+    x = np.maximum(x, 0, dtype=np.float32)
+    return np.where(x <= 0.0031308, np.float32(12.92) * x, np.float32(1.055) * _pow(x, 1 / 2.4) - np.float32(0.055))
 
 
 def srgb_eotf(v):
-    v = np.maximum(v, 0)
-    return np.where(v <= 0.04045, v / 12.92, np.power((v + 0.055) / 1.055, 2.4)).astype(np.float32)
+    v = np.maximum(v, 0, dtype=np.float32)
+    return np.where(v <= 0.04045, v / np.float32(12.92), _pow((v + np.float32(0.055)) / np.float32(1.055), 2.4))
 
 
 _M1, _M2, _C1, _C2, _C3 = 0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875
@@ -49,13 +56,13 @@ WHITE_NITS = 203.0
 
 
 def pq_oetf(x):
-    y = np.power(np.clip(x * (WHITE_NITS / 10000.0), 0, 1), _M1)
-    return np.power((_C1 + _C2 * y) / (1 + _C3 * y), _M2).astype(np.float32)
+    y = _pow(np.clip(np.asarray(x, np.float32) * np.float32(WHITE_NITS / 10000.0), 0, 1), _M1)
+    return _pow((np.float32(_C1) + np.float32(_C2) * y) / (1 + np.float32(_C3) * y), _M2)
 
 
 def pq_eotf(v):
-    p = np.power(np.clip(v, 0, 1), 1 / _M2)
-    return (np.power(np.maximum(p - _C1, 0) / (_C2 - _C3 * p), 1 / _M1) * (10000.0 / WHITE_NITS)).astype(np.float32)
+    p = _pow(np.clip(np.asarray(v, np.float32), 0, 1), 1 / _M2)
+    return _pow(np.maximum(p - np.float32(_C1), 0) / (np.float32(_C2) - np.float32(_C3) * p), 1 / _M1) * np.float32(10000.0 / WHITE_NITS)
 
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
@@ -72,8 +79,8 @@ def blur(x, s):
 
 def shaped_noise(rng, shape, size, laplace=False):
     """Unit-variance noise with grain size `size` px (Gaussian-filtered white noise)."""
-    n = rng.laplace(0, 1 / np.sqrt(2), shape) if laplace else rng.standard_normal(shape)
-    n = n.astype(np.float32)
+    # float32 straight from the generator (twice as fast as float64 then cast).
+    n = rng.laplace(0, 1 / np.sqrt(2), shape).astype(np.float32) if laplace else rng.standard_normal(shape, dtype=np.float32)
     if size > 0.6:
         n = blur(n, size * 0.5)
         n /= n.std() + 1e-8
@@ -104,26 +111,50 @@ class Out:
 # --- linear-light steps ----------------------------------------------------------
 
 
+CCM_K = np.array([[0.6, -0.4, -0.2], [-0.2, 0.5, -0.3], [0.0, -0.5, 0.5]], np.float32)
+
+
 def sensor_noise(r, clip):
-    """Poisson-Gaussian per channel, light demosaic spread, optional chroma NR."""
-    gain = lu(r, 2e-4, 1e-2)  # shot-noise variance per unit of light
-    read = lu(r, 1e-4, 8e-3)  # read-noise sigma
-    spread = r.uniform(0, 0.9)  # demosaic correlation between neighbours
-    nr = r.random() < 0.3  # in-camera chroma NR: smears chroma noise into blotches
+    """Camera noise through a camera's processing (see recipes.sensor_settings): shot
+    + read noise per raw channel, times the white balance gains, mixed by a colour-
+    correction matrix (strong chroma noise along magenta-teal), softened by
+    demosaicing; sometimes in-camera chroma NR."""
+    gain = lu(r, 2e-4, 1e-2)
+    read = lu(r, 1e-4, 8e-3)
+    k = CCM_K.copy()
+    for i in range(3):
+        for j in range(3):
+            if i != j:
+                k[i, j] += r.uniform(-0.25, 0.25)
+        k[i, i] = -sum(k[i, j] for j in range(3) if j != i)
+    spread = r.uniform(0.2, 0.9)
+    nr = r.random() < 0.3
     nr_s = r.uniform(1.5, 4)
+    wb = np.array([r.uniform(1.0, 3.0), 1.0, r.uniform(1.0, 3.0)], np.float32)
+    ccm = np.eye(3, dtype=np.float32) + r.uniform(0.3, 1.5) * k
+    sat = r.uniform(1.0, 2.2)
+    persist = r.uniform(0.0, 0.3)
     T, H, W, _ = clip.shape
     out = np.empty_like(clip)
+    prev = None
     for t in range(T):
         x = clip[t]
-        sd = np.sqrt(np.maximum(x, 0) * gain + read * read)
-        n = colour_mix(r, H, W, 0.0, r.uniform(0.6, 1.0)) * sd
+        raw = np.maximum(x, 0) / wb
+        sd = np.sqrt(raw * gain + read * read)
+        fresh = r.standard_normal((H, W, 3), dtype=np.float32)
+        if prev is not None and persist > 0:
+            fresh = persist * prev + np.sqrt(1 - persist * persist) * fresh
+        prev = fresh
+        n = (fresh * sd * wb) @ ccm.T
+        y = (n @ LUMA)[..., None]
+        n = y + sat * (n - y)
         if spread > 0.1:
             n = blur(n, spread) * (1 + spread)
         if nr:
             y = (n @ LUMA)[..., None]
             n = y + blur(n - y, nr_s)
         out[t] = x + n
-    return out, f"sensor gain {gain:.1e} read {read:.1e}" + (" +chromaNR" if nr else "")
+    return out, f"sensor gain {gain:.1e} read {read:.1e} wb {wb[0]:.1f}/{wb[2]:.1f}" + (" +chromaNR" if nr else "")
 
 
 def render_noise(r, clip):
@@ -233,21 +264,61 @@ def grain(r, v):
     return out, f"grain {amp:.3f} size {size:.1f}" + (" colour" if colour else " mono") + (" sparse" if sparse else "") + (" clumped" if clump else "")
 
 
+SS = 4  # film grain super-sampling (as gpu_degrade.film_grain)
+RADIUS_SCALE = (1.0, 0.9, 1.3)  # R, G, B dye layers
+
+
+def _boolean_grain(r, u, radius, spread):
+    """Boolean-model grain layer (see gpu_degrade.py): u (H, W) in [0, 1] -> covered
+    fraction per pixel. Discs far smaller than a pixel, dropped by a Poisson process
+    whose density follows u, rendered at SS x and averaged down."""
+    H, W = u.shape
+    up = np.clip(cv2.resize(u, (W * SS, H * SS), interpolation=cv2.INTER_LINEAR), 0, 0.995)
+    radii = [radius * SS] if spread <= 0.02 else [radius * SS * (1 - spread), radius * SS * (1 + spread)]
+    hits = np.zeros_like(up)
+    for rr in radii:
+        R = max(1, int(np.ceil(rr)))
+        t = np.arange(-R, R + 1)
+        k = ((t[:, None] ** 2 + t[None, :] ** 2) <= max(rr, 0.5) ** 2).astype(np.float32)
+        lam = -np.log1p(-up) / (k.sum() * len(radii))
+        pts = r.poisson(lam).astype(np.float32)
+        hits += cv2.filter2D(pts, -1, k, borderType=cv2.BORDER_CONSTANT)
+    return cv2.resize((hits > 0).astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
+
+
 def film_grain(r, v):
-    """Particle-like grain, strongest in the mid-tones."""
-    size = lu(r, 0.7, 3.0)
-    amp = lu(r, 0.01, 0.08)
-    density = r.uniform(0.3, 1.0)
+    """Film grain, Boolean model (Newson et al. 2017): grains far smaller than a pixel,
+    the visible grain is their clumping, sized by the scan blur. Black and white (one
+    luma layer) or colour (each dye layer's grain mixed with a shared luma grain,
+    `chroma` setting how colourful). Negative film (70%): modelled in linear light, so
+    on screen strongest in the shadows; otherwise on display values (mid-tones)."""
+    radius = lu(r, 0.05, 0.25)
+    spread = r.uniform(0, 0.4)
+    mono = r.random() < 0.3
+    sblur = r.uniform(0.5, 1.2)
+    strength = r.uniform(0.4, 1.0)
+    chroma = r.uniform(0.15, 0.6)
+    neg = r.random() < 0.7
     T, H, W, _ = v.shape
     out = np.empty_like(v)
     for t in range(T):
-        y = np.clip(v[t] @ LUMA, 0, 1)[..., None]
-        mid = (4 * y * (1 - y)) ** 0.7
-        n = colour_mix(r, H, W, size, r.uniform(0, 0.3))
-        if density < 1:
-            n = n * (r.random((H, W, 1)) < density) / np.sqrt(density)
-        out[t] = v[t] + amp * mid * n
-    return out, f"film grain {amp:.3f} size {size:.1f}"
+        x = np.clip(v[t], 0, 1)
+        if neg:
+            x = srgb_eotf(x)
+        y = np.ascontiguousarray(x @ LUMA)
+        gy = blur(_boolean_grain(r, y, radius, spread), sblur) - blur(y, sblur)
+        if mono:
+            o = x + strength * gy[..., None]
+        else:
+            o = np.empty_like(x)
+            for c in range(3):
+                u = np.ascontiguousarray(x[..., c])
+                gc = blur(_boolean_grain(r, u, radius * RADIUS_SCALE[c], spread), sblur) - blur(u, sblur)
+                o[..., c] = u + strength * ((1 - chroma) * gy + chroma * gc)
+        if neg:
+            o = srgb_oetf(o)
+        out[t] = o + (v[t] - np.clip(v[t], 0, 1))
+    return out, f"film grain r {radius:.2f} px blur {sblur:.1f}" + (" b&w" if mono else "") + (" negative" if neg else "")
 
 
 def blotches(r, v):
@@ -353,17 +424,23 @@ def banding(r, v):
 
 # Codec: (pixel format, options from a random quality draw)
 CODECS = {
-    "libx264": lambda r: ("yuv420p", {"crf": str(int(r.integers(18, 41))), "preset": "veryfast"}),
-    "libx265": lambda r: (r.choice(["yuv420p", "yuv420p10le"]), {"crf": str(int(r.integers(20, 41))), "preset": "veryfast", "x265-params": "log-level=none"}),
+    "libx264": lambda r: ("yuv420p", {"crf": str(int(r.integers(18, 41))), "preset": str(r.choice(["ultrafast", "superfast", "veryfast"]))}),
+    "libx265": lambda r: (r.choice(["yuv420p", "yuv420p10le"]), {"crf": str(int(r.integers(20, 41))), "preset": str(r.choice(["ultrafast", "superfast"])), "x265-params": "log-level=none:pools=none:frame-threads=1"}),
     "mpeg2video": lambda r: ("yuv420p", {"qmin": (q := str(int(r.integers(2, 21)))), "qmax": q}),
     "mpeg4": lambda r: ("yuv420p", {"qmin": (q := str(int(r.integers(2, 21)))), "qmax": q}),
     "mjpeg": lambda r: ("yuvj420p", {"qmin": (q := str(int(r.integers(2, 21)))), "qmax": q}),
     "libvpx-vp9": lambda r: ("yuv420p", {"crf": str(int(r.integers(20, 55))), "b": "0", "deadline": "realtime", "cpu-used": "8"}),
-    "libsvtav1": lambda r: ("yuv420p", {"crf": str(int(r.integers(25, 55))), "preset": "12"}),
+    "libsvtav1": lambda r: ("yuv420p", {"crf": str(int(r.integers(25, 55))), "preset": "12", "svtav1-params": "lp=1"}),
     "prores_ks": lambda r: ("yuv422p10le", {"profile": "0", "qscale": str(int(r.integers(4, 32)))}),
     "dvvideo": lambda r: ("yuv420p", {}),
+    # DNxHR: broadcast editing codec, 8x8 DCT at a fixed bitrate, 4:2:2. On noisy dark
+    # footage it runs out of bits: 8x8 block mosaics (as on the black-curtain clip).
+    "dnxhd": lambda r: ("yuv422p", {"profile": str(r.choice(["dnxhr_lb", "dnxhr_sq"]))}),
 }
-WEIGHTS = {"libx264": 4, "libx265": 2, "mpeg2video": 2, "mpeg4": 1, "mjpeg": 1.5, "libvpx-vp9": 1, "libsvtav1": 1, "prores_ks": 0.5, "dvvideo": 0.5}
+WEIGHTS = {"libx264": 4, "libx265": 2, "mpeg2video": 2, "mpeg4": 1, "mjpeg": 1.5, "libvpx-vp9": 1, "libsvtav1": 1, "prores_ks": 0.5, "dvvideo": 0.5, "dnxhd": 1}
+# Double compression: a camera codec, then an editing / broadcast one.
+CAMERA_CODECS = ("libx264", "libx265")
+EDIT_CODECS = ("dnxhd", "prores_ks", "mpeg2video")
 
 
 FAILURES = {}  # codec -> count of encodes that failed and fell back to H.264
@@ -386,6 +463,64 @@ def compress(r, v, codec=None):
         return out, f"{s} (fallback: {codec} {type(e).__name__})"
 
 
+# RGB <-> Y'CbCr done here, exactly (BT.709, rounded once), instead of by the library:
+# its quick conversion lost about 1 level of 255 on every round trip, green most, with
+# any codec. The network learned to give that back and so brightened real footage
+# (+1.6 levels, greenish). Colour-space conversion is not damage a codec does.
+_KR, _KB = 0.2126, 0.0722
+_KG = 1.0 - _KR - _KB
+
+
+def _rgb_to_planes(v, pix):
+    """(T, H, W, 3) display values 0..1 -> per frame the three planes of `pix` (planar
+    Y'CbCr: 4:2:0 or 4:2:2, 8 or 10 bit, "yuvj" = full range), as integer arrays."""
+    bits = 10 if "10" in pix else 8
+    full = pix.startswith("yuvj")
+    y = _KR * v[..., 0] + _KG * v[..., 1] + _KB * v[..., 2]
+    cb = (v[..., 2] - y) / (2 * (1 - _KB))
+    cr = (v[..., 0] - y) / (2 * (1 - _KR))
+    if "420" in pix:  # chroma: the mean of each 2x2 (4:2:0) or 1x2 (4:2:2) block
+        sub = lambda c: c.reshape(c.shape[0], c.shape[1] // 2, 2, c.shape[2] // 2, 2).mean((2, 4))
+    else:
+        sub = lambda c: c.reshape(c.shape[0], c.shape[1], c.shape[2] // 2, 2).mean(3)
+    cb, cr = sub(cb), sub(cr)
+    k = 2 ** (bits - 8)
+    top = 2**bits - 1
+    if full:
+        y, cb, cr = y * top, 128 * k + cb * top, 128 * k + cr * top
+    else:
+        y, cb, cr = (16 + 219 * y) * k, (128 + 224 * cb) * k, (128 + 224 * cr) * k
+    dt = np.uint16 if bits > 8 else np.uint8
+    return [np.clip(np.round(a), 0, top).astype(dt) for a in (y, cb, cr)]
+
+
+def _planes_to_rgb(f, H, W):
+    """A decoded frame (planar Y'CbCr of any subsampling and depth) -> (H, W, 3) float32
+    display values, or None when the frame is something else."""
+    name = f.format.name
+    if not (name.startswith("yuv") and f.format.is_planar and len(f.planes) >= 3):
+        return None
+    bits = f.format.components[0].bits
+    dt = np.uint16 if bits > 8 else np.uint8
+    pl = []
+    for p_ in f.planes[:3]:
+        a = np.frombuffer(p_, dt).reshape(p_.height, -1)[:, : p_.width].astype(np.float32)
+        pl.append(a)
+    k = 2 ** (bits - 8)
+    top = 2**bits - 1
+    if name.startswith("yuvj"):
+        y, cb, cr = pl[0] / top, (pl[1] - 128 * k) / top, (pl[2] - 128 * k) / top
+    else:
+        y, cb, cr = (pl[0] / k - 16) / 219, (pl[1] / k - 128) / 224, (pl[2] / k - 128) / 224
+    if cb.shape != y.shape:
+        cb = cv2.resize(cb, (y.shape[1], y.shape[0]), interpolation=cv2.INTER_LINEAR)
+        cr = cv2.resize(cr, (y.shape[1], y.shape[0]), interpolation=cv2.INTER_LINEAR)
+    r_ = y + 2 * (1 - _KR) * cr
+    b_ = y + 2 * (1 - _KB) * cb
+    g_ = (y - _KR * r_ - _KB * b_) / _KG
+    return np.clip(np.stack([r_, g_, b_], -1)[:H, :W], 0, 1)
+
+
 def _encode(r, v, codec):
     import av
     from fractions import Fraction
@@ -397,22 +532,30 @@ def _encode(r, v, codec):
         if W > PW or H > PH:
             return _encode(r, v, "mpeg2video")
     else:
-        m = 16 if codec in ("libsvtav1", "mjpeg") else 2
+        m = 16 if codec in ("libsvtav1", "mjpeg", "dnxhd") else 2
         PW, PH = max(64, -(-W // m) * m), max(64, -(-H // m) * m)
     u8 = np.round(np.clip(v, 0, 1) * 255).astype(np.uint8)
     if (PW, PH) != (W, H):
         u8 = np.pad(u8, ((0, 0), (0, PH - H), (0, PW - W), (0, 0)), mode="reflect" if PH - H < H and PW - W < W else "edge")
     buf = io.BytesIO()
-    fmt = "matroska" if codec != "dvvideo" else "dv"
+    fmt = {"dvvideo": "dv", "dnxhd": "mov"}.get(codec, "matroska")
     with av.open(buf, "w", format=fmt) as c:
         s = c.add_stream(codec, rate=25)
         s.width, s.height, s.pix_fmt = PW, PH, pix
         s.time_base = Fraction(1, 25)
         gop = int(r.choice([1, 4, 12, 50]))
         s.codec_context.gop_size = gop
+        # One thread per encoder: the data workers already fill every CPU thread.
+        s.codec_context.thread_count = 1
         s.options = opts
+        planes = _rgb_to_planes(u8.astype(np.float32) / 255.0, pix)
         for t in range(T):
-            fr = av.VideoFrame.from_ndarray(u8[t], format="rgb24")
+            fr = av.VideoFrame(PW, PH, pix)
+            for p_, a in zip(fr.planes, planes):
+                row = np.zeros((p_.height, p_.line_size), np.uint8)
+                b_ = a[t].view(np.uint8).reshape(p_.height, -1)
+                row[:, : b_.shape[1]] = b_
+                p_.update(row.tobytes())
             fr.pts, fr.time_base = t, Fraction(1, 25)
             for pkt in s.encode(fr):
                 c.mux(pkt)
@@ -422,11 +565,12 @@ def _encode(r, v, codec):
     frames = []
     with av.open(buf, "r") as c:
         for f in c.decode(video=0):
-            frames.append(f.to_ndarray(format="rgb24")[:H, :W])
+            rgb = _planes_to_rgb(f, H, W)
+            frames.append(rgb if rgb is not None else f.to_ndarray(format="rgb24")[:H, :W].astype(np.float32) / 255.0)
     if len(frames) != T:
         raise RuntimeError(f"{codec}: {len(frames)} frames back of {T}")
-    q = opts.get("crf") or opts.get("qmin") or opts.get("qscale") or "-"
-    return np.stack(frames).astype(np.float32) / 255.0, f"{codec} q {q} gop {gop}" + (" 10bit" if "10" in pix else "")
+    q = opts.get("crf") or opts.get("qmin") or opts.get("qscale") or opts.get("profile") or "-"
+    return np.stack(frames).astype(np.float32), f"{codec} q {q} gop {gop}" + (" 10bit" if "10" in pix else "")
 
 
 # --- the chain -------------------------------------------------------------------
