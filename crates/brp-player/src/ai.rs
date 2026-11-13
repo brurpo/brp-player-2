@@ -170,7 +170,7 @@ impl AiKind {
                 p("Impulses", "Removes isolated pixels far brighter or darker than those around them: fireflies in 3D renders, salt and pepper, hot or dead pixels (0: off; higher catches fainter ones). A small highlight also in the neighbouring pictures, such as a star or a glint, is kept", ParamKind::Float, 0.5, 0.0, 1.0),
             ],
             AiKind::DenoiseAi => vec![
-                p("Strength", "How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
+                p("Strength", "Test model, still being trained: results will change in later versions. How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
                 p("Temporal", "On: each frame is merged with the frame before, the frame after and its own previous result, moved onto it along the motion: cleaner and steadier. Off: each frame alone (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
                 p("Scene cuts", "On: a neighbouring frame that does not match this one at all (another shot) is left out, and the result starts afresh there. Off: the network alone decides what to take from each frame (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
             ],
