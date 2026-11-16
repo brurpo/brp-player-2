@@ -1,6 +1,6 @@
 //! GPU decoders vs FFmpeg: every frame compared plane by plane, and decode speed.
 //!
-//!   cargo run -p brp-render --release --example gpudeccheck -- <file>... [--frames=N] [--bench=N] [--source] [--scrub=N]
+//!   cargo run -p brp-render --release --example gpudeccheck -- <file>... [--frames=N] [--bench=N] [--source] [--scrub=N] [--readahead]
 //!
 //! For each file: decodes the first N packets with the GPU decoder and the same
 //! frames with FFmpeg (`Source` with the GPU off), and reports exact / max difference
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn get(src: &Source, n: i64) -> Arc<VideoFrame> {
-    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false });
+    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false });
     let t = Instant::now();
     loop {
         if let Some(f) = src.get(n) {
@@ -192,6 +192,53 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             all_exact &= report(&format!("100 frames from kept packets ({:?})", t.elapsed()), &st, bits);
+        }
+
+        if args.iter().any(|a| a == "--readahead") && decoded > 0 {
+            // Playing from frame 0 with the background fill on: the pictures stay a
+            // window around the playhead in GPU memory, the packets are read ahead into
+            // system memory (what a slow drive needs kept); frames made from them later
+            // are the exact ones.
+            let src = Source::open(file)?;
+            while !src.index_ready() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let total = src.frame_count();
+            let play = |f: i64| src.request(Request { frame: f, playing: true, dir: 1, ahead: 0, fill: true, range: (0, i64::MAX), looping: false });
+            let t = Instant::now();
+            let (mut pics, mut ram) = (0, 0);
+            while t.elapsed().as_secs_f64() < 8.0 {
+                play(0);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let m = src.cache_map();
+                (pics, ram) = (m.decoded.len(), m.ram.len());
+                if ram as i64 >= total {
+                    break;
+                }
+            }
+            println!("  read ahead, playing at frame 0: {pics} pictures in GPU memory, {ram} of {total} packets in system memory after {:?}", t.elapsed());
+            all_exact &= ram as i64 >= total.min(packets.len() as i64) && (pics as i64) < total.max(120);
+            let mut st: Vec<Stat> = Vec::new();
+            let n = (packets.len() as i64).min(total);
+            for k in 0..20 {
+                let i = (n - 1) * k / 19;
+                let a = get(&reference, i);
+                play(i);
+                let t0 = Instant::now();
+                let b = loop {
+                    if let Some(f) = src.get(i) {
+                        break f;
+                    }
+                    assert!(t0.elapsed().as_secs() < 10, "frame {i} never came");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                st.resize_with(a.plane_count(), Default::default);
+                for (p, s) in st.iter_mut().enumerate() {
+                    let (data, stride) = b.plane(p);
+                    compare(&a, p, data, (0, stride as u64), s);
+                }
+            }
+            all_exact &= report("20 frames from packets read ahead", &st, bits);
         }
 
         if scrub > 0 && decoded > 0 {

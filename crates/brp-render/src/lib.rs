@@ -23,12 +23,12 @@ pub mod workspace;
 pub mod wake;
 
 pub use color::{video_push, VideoPush};
-pub use context::{GpuContext, GpuDevice, GpuInstance};
+pub use context::{GpuContext, GpuDevice, GpuError, GpuInstance, GpuReject};
 pub use popup::{Backdrop, GlassParams, PopupRenderer};
 pub use deint::{DeintMethod, DeintParams};
 pub use nnedi::{NnediConfig, NnediWeights};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ash::vk;
 use std::sync::Arc;
 use brp_media::{ColorInfo, VideoFrame};
@@ -55,13 +55,32 @@ pub struct OcioSetup {
     pub xyz: ocio::OcioShader,
     /// The display is HDR (PQ, HLG): its XYZ has 1.0 = 100 nits, not SDR white.
     pub hdr_display: bool,
+    /// With effects: the conversion split at the effects' working space (DESIGN.md
+    /// §7d). None: effects work on the player's decoding of the file, as without OCIO.
+    pub split: Option<OcioSplit>,
     /// Identity of the conversion (a new one rebuilds the pass).
     pub key: u64,
 }
 
+/// OCIO's conversion in two (DESIGN.md §7d): the effect chain starts with `pre` (the
+/// input to linear Rec.2020, 1.0 = SDR white) and ends in the file's own encoding of
+/// that light (§7a); `direct` / `xyz` decode it back to linear and finish the
+/// conversion (`OcioShader::from_source` set).
+#[derive(Clone)]
+pub struct OcioSplit {
+    pub pre: ocio::OcioShader,
+    pub direct: ocio::OcioShader,
+    pub xyz: ocio::OcioShader,
+}
+
 struct OcioState {
     setup: OcioSetup,
+    /// The whole conversion (no effects).
     pass: Option<ocio::OcioPass>,
+    /// Its second half, for pictures the effect chain (or the background effects) made
+    /// from `pre`'s light.
+    post: Option<ocio::OcioPass>,
+    pre: Option<Arc<ocio::OcioCompute>>,
 }
 
 /// What to draw for the video this frame.
@@ -203,6 +222,9 @@ pub struct Renderer {
     /// OpenColorIO as the display transform (DESIGN.md §7d), when on.
     ocio: Option<OcioState>,
     ocio_error: Option<String>,
+    /// This frame's video came through the effect chain or the background effects
+    /// (with OCIO split: drawn through its second half).
+    scene_split: bool,
     ctx: Arc<GpuContext>,
 }
 
@@ -241,6 +263,7 @@ impl Renderer {
             }
 
             let formats = ctx.surface_fn.get_physical_device_surface_formats(ctx.physical, ctx.surface)?;
+            anyhow::ensure!(!formats.is_empty(), "the window's surface offers no picture format");
             let format = formats
                 .iter()
                 .find(|f| {
@@ -254,6 +277,16 @@ impl Renderer {
                 .iter()
                 .find(|f| f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT && matches!(f.format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32))
                 .map(|f| f.format);
+            // The pass that puts the window's layers into the HDR10 swapchain. If the
+            // driver cannot build it: no HDR output, the window as on an SDR screen.
+            let composite = hdr10_format.and_then(|f| match test_fail("hdr").and_then(|_| composite::CompositePass::new(device, &[f, format], FRAMES_IN_FLIGHT)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::warn!("HDR output off: its pass could not be built on this GPU: {e:#}");
+                    None
+                }
+            });
+            let hdr10_format = hdr10_format.filter(|_| composite.is_some());
             let hwnd = match window.window_handle().map(|h| h.as_raw()) {
                 Ok(raw_window_handle::RawWindowHandle::Win32(h)) => h.hwnd.get(),
                 _ => 0,
@@ -273,17 +306,33 @@ impl Renderer {
                     *w.lock().unwrap() = now;
                 });
             }
-            let composite = match hdr10_format {
-                Some(f) => Some(composite::CompositePass::new(device, &[f, format], FRAMES_IN_FLIGHT)?),
-                None => None,
-            };
 
             log::debug!("renderer: pools+formats {:?}", t0.elapsed());
-            let video = VideoPass::new(device, format, FRAMES_IN_FLIGHT)?;
+            // Each step is named in the log before it runs: if the driver stops the
+            // program inside one, the log ends with its name.
+            log::info!("startup: video pass ({format:?})");
+            let video = VideoPass::new(device, format, FRAMES_IN_FLIGHT).context("video pass")?;
             let props = ctx.instance.get_physical_device_properties(ctx.physical);
             let integrated = props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU;
-            let deint = Deinterlacer::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, find_nnedi_weights(), props.limits.max_compute_shared_memory_size, integrated)?;
-            let chain = EffectChain::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, props.limits.min_uniform_buffer_offset_alignment, ctx.pipeline_cache)?;
+            // Deinterlacing and effects are not needed to show a picture: when the GPU's
+            // driver cannot build theirs, the window opens without them.
+            log::info!("startup: deinterlacer");
+            let deint = match test_fail("deint").and_then(|_| Deinterlacer::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, find_nnedi_weights(), props.limits.max_compute_shared_memory_size, integrated)) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    log::error!("deinterlacing off: it could not be built on this GPU: {e:#}");
+                    None
+                }
+            };
+            log::info!("startup: effect chain");
+            let chain = match test_fail("effects").and_then(|_| EffectChain::new(device, (*ctx.allocator).clone(), FRAMES_IN_FLIGHT, props.limits.min_uniform_buffer_offset_alignment, ctx.pipeline_cache)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::error!("shader effects off: their chain could not be built on this GPU: {e:#}");
+                    None
+                }
+            };
+            log::info!("startup: interface pass");
             let egui = egui_ash_renderer::Renderer::with_gpu_allocator(
                 (*ctx.allocator).clone(),
                 device.clone(),
@@ -297,7 +346,8 @@ impl Renderer {
                     srgb_framebuffer: false,
                     ..Default::default()
                 },
-            )?;
+            )
+            .context("interface pass")?;
 
             log::debug!("renderer: pipelines {:?}", t0.elapsed());
             let mut r = Renderer {
@@ -305,8 +355,8 @@ impl Renderer {
                 waiter: wake::GpuWaiter::new(device.clone()),
                 free_later: Vec::new(),
                 video: Some(video),
-                deint: Some(deint),
-                effects: Some(chain),
+                deint,
+                effects: chain,
                 chain_last: None,
                 chain_out: None,
                 frame_cache: FrameCache::new(12),
@@ -341,6 +391,7 @@ impl Renderer {
                 swap_format: format,
                 ocio: None,
                 ocio_error: None,
+                scene_split: false,
                 ctx,
             };
             let fp = ctx_props_features(&r.ctx, format);
@@ -351,7 +402,8 @@ impl Renderer {
                 log::info!("popups: no backdrop on this GPU (format {format:?} features {fp:?}, swapchain usage {:?}): plain panels", caps.supported_usage_flags);
             }
             let ts = std::time::Instant::now();
-            r.build_swapchain(width, height)?;
+            log::info!("startup: swapchain ({width}x{height})");
+            r.build_swapchain(width, height).context("swapchain")?;
             log::debug!("renderer: swapchain {:?}", ts.elapsed());
             Ok(r)
         }
@@ -364,9 +416,20 @@ impl Renderer {
             return;
         }
         log::info!("OCIO in the window: {}", if setup.is_some() { "on" } else { "off" });
-        self.ocio = setup.map(|setup| OcioState { setup, pass: None });
+        if self.ocio.is_some() {
+            // Frames in flight may still use the old conversion's pipelines and LUTs.
+            let _ = self.ctx.wait_idle();
+        }
+        self.ocio = setup.map(|setup| OcioState { setup, pass: None, post: None, pre: None });
+        self.chain_last = None;
         self.ocio_error = None;
         self.needs_rebuild = true;
+    }
+
+    /// OCIO's input transform for the background effects (`brp-player`'s worker), on
+    /// this window's device: Some when OCIO is on and split for effects (DESIGN.md §7d).
+    pub fn ocio_pre(&self) -> Option<Arc<OcioCompute>> {
+        self.ocio.as_ref().and_then(|o| o.pre.clone())
     }
 
     /// Why OCIO cannot be shown, if so.
@@ -377,6 +440,19 @@ impl Renderer {
     /// The window is HDR (an HDR10 swapchain on an HDR screen).
     pub fn hdr_screen(&self) -> Option<hdr::HdrScreen> {
         self.hdr.filter(|_| self.hdr10_format.is_some())
+    }
+
+    /// Parts the GPU's driver could not build, so the window runs without them
+    /// (interface string keys; the reasons are in the log).
+    pub fn unavailable(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.deint.is_none() {
+            v.push("gpu_no_deint");
+        }
+        if self.effects.is_none() {
+            v.push("gpu_no_effects");
+        }
+        v
     }
 
     /// Integrated GPU (shared memory with the CPU, usually much slower).
@@ -519,6 +595,7 @@ impl Renderer {
             if self.frame_no % 300 == 0 && std::env::var_os("BRP_MEM_LOG").is_some() {
                 log_gpu_memory(&self.ctx.allocator);
             }
+            self.scene_split = false;
             let video_push = match &video {
                 Some(v) => self.prepare_video(cb, fi, v)?,
                 None => None,
@@ -711,7 +788,11 @@ impl Renderer {
             // OCIO's light per unit of display-referred XYZ (HDR displays: 100 nits).
             let (ocio_scale, ocio_xyz) = self.ocio.as_ref().map_or((1.0, false), |o| (if o.setup.hdr_display { 100.0 / screen.sdr_nits } else { 1.0 }, o.pass.as_ref().is_some_and(|p| p.xyz)));
             let hdr_swap = self.swap_format != self.format;
-            match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+            // With OCIO: the whole conversion, or its second half for a picture the
+            // effects made from OCIO's linear light (DESIGN.md §7d).
+            let split = self.scene_split;
+            let ocio_pass = self.ocio.as_ref().and_then(|o| if split { o.post.as_ref().or(o.pass.as_ref()) } else { o.pass.as_ref() });
+            match ocio_pass {
                 Some(p) => p.bind(fi, self.layers.as_ref().unwrap()),
                 None => self.composite.as_ref().unwrap().bind(fi, self.layers.as_ref().unwrap()),
             }
@@ -722,7 +803,7 @@ impl Renderer {
             device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&a));
             device.cmd_set_viewport(cb, 0, &[viewport]);
             device.cmd_set_scissor(cb, 0, &[area]);
-            match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+            match ocio_pass {
                 Some(p) => {
                     let out = if !ocio_xyz { ocio::OcioOut::Direct } else if hdr_swap { ocio::OcioOut::Hdr10 } else { ocio::OcioOut::SdrFromXyz };
                     p.draw(cb, fi, self.swap_format, out, screen.sdr_nits, ocio_scale, 12.0, self.clear_color);
@@ -747,7 +828,7 @@ impl Renderer {
                 device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&a));
                 device.cmd_set_viewport(cb, 0, &[viewport]);
                 device.cmd_set_scissor(cb, 0, &[area]);
-                match self.ocio.as_ref().and_then(|o| o.pass.as_ref()) {
+                match ocio_pass {
                     Some(p) => {
                         let out = if ocio_xyz { ocio::OcioOut::SdrFromXyz } else { ocio::OcioOut::Direct };
                         p.draw(cb, fi, self.format, out, screen.sdr_nits, ocio_scale, 12.0, self.clear_color);
@@ -808,6 +889,8 @@ impl Renderer {
                 v.source_id.hash(&mut hs);
                 deint.map(|d| (d.method as u8, d.tff, d.light)).hash(&mut hs);
                 v.target.hash(&mut hs);
+                // OCIO's input transform changes the chain's input.
+                self.ocio.as_ref().map(|o| (o.setup.key, o.pre.is_some())).hash(&mut hs);
                 // More history arriving (after a jump) must trigger a re-run.
                 v.history.len().hash(&mut hs);
                 hs.finish()
@@ -831,6 +914,7 @@ impl Renderer {
             }
             if let Some(out) = &self.chain_out {
                 let view = out.view;
+                self.scene_split = true;
                 self.video.as_mut().unwrap().bind(fi, &[view], vk::ImageLayout::GENERAL, v.nearest);
                 let mut push = color::video_push(brp_media::FrameLayout::Rgba16, &v.color, 12.0);
                 if !v.frame.layout.has_alpha() {
@@ -925,6 +1009,7 @@ impl Renderer {
                 v.source_id.hash(&mut hs);
                 (Arc::as_ptr(&pic) as usize).hash(&mut hs);
                 v.target.hash(&mut hs);
+                self.ocio.as_ref().map(|o| (o.setup.key, o.pre.is_some())).hash(&mut hs);
                 hs.finish()
             };
             if self.chain_last != Some((key, v.seq)) || self.chain_out.is_none() {
@@ -941,6 +1026,9 @@ impl Renderer {
                     input: (pic.w, pic.h),
                     space: Space::Source,
                     want: Some(Space::Source),
+                    // A picture the background effects made: already from OCIO's light
+                    // when OCIO is split (the worker ran `pre` on the decoded frame).
+                    ocio: None,
                 };
                 self.chain_out = self.effects.as_mut().unwrap().run(cb, fi, &cf)?;
                 self.chain_last = Some((key, v.seq));
@@ -955,6 +1043,9 @@ impl Renderer {
             self.chain_last = None;
             self.chain_out = None;
         }
+        // Background effects' pictures: from OCIO's light when it is split (the worker
+        // and this window use the same `pre`).
+        self.scene_split = true;
         self.kept[fi] = Some(pic.clone());
         self.video.as_mut().unwrap().bind(fi, &[view], vk::ImageLayout::GENERAL, v.nearest);
         let mut push = color::video_push(brp_media::FrameLayout::Rgba16, &v.color, 12.0);
@@ -983,7 +1074,7 @@ impl Renderer {
         let cur_i = self.frame_cache.find((source, frame.index())).expect("uploaded");
         let sizes: Vec<(u32, u32)> = self.frame_cache.get(cur_i).planes.iter().map(|p| (p.w, p.h)).collect();
         let find_or_cur = |f: Option<&VideoFrame>| f.and_then(|f| self.frame_cache.find((source, f.index()))).unwrap_or(cur_i);
-        if let Some(params) = deint {
+        if let (Some(params), true) = (deint, self.deint.is_some()) {
             let (pi, ni) = (find_or_cur(prev), find_or_cur(next));
             let fc = &self.frame_cache;
             if let Some(out) = self.deint.as_mut().unwrap().run(cb, fi, params, fc.get(pi), fc.get(cur_i), fc.get(ni), &mut self.graveyard, self.frame_no)? {
@@ -1017,6 +1108,7 @@ impl Renderer {
             input: (frame.width(), frame.height()),
             space: Space::Source,
             want: Some(Space::Source),
+            ocio: self.ocio.as_ref().and_then(|o| o.pre.as_deref()),
         };
         self.effects.as_mut().unwrap().run(cb, fi, &cf)
     }
@@ -1101,6 +1193,7 @@ impl Renderer {
             let format = self.format;
             if let Some(o) = self.ocio.as_mut() {
                 o.pass = None;
+                o.post = None;
                 let xyz = hdr10.is_some();
                 match ocio::OcioPass::new(&self.ctx, if xyz { &o.setup.xyz } else { &o.setup.direct }, xyz, &[swap_format, format], FRAMES_IN_FLIGHT) {
                     Ok(p) => {
@@ -1112,7 +1205,26 @@ impl Renderer {
                         self.ocio_error = Some(format!("{e:#}"));
                     }
                 }
+                // Split for effects (DESIGN.md §7d): both halves, or neither (effects
+                // then work on the player's decoding, as without OCIO).
+                if let (Some(sp), true) = (&o.setup.split, o.pass.is_some()) {
+                    let pre = if o.pre.is_none() { ocio::OcioCompute::new(&self.ctx, &sp.pre).map(Some) } else { Ok(o.pre.take()) };
+                    let post = ocio::OcioPass::new(&self.ctx, if xyz { &sp.xyz } else { &sp.direct }, xyz, &[swap_format, format], FRAMES_IN_FLIGHT);
+                    match (pre, post) {
+                        (Ok(pre), Ok(post)) => {
+                            log::info!("OCIO: split for effects (they work on OCIO's linear light)");
+                            o.pre = pre;
+                            o.post = Some(post);
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            log::error!("OCIO split for effects: {e:#}");
+                            o.pre = None;
+                        }
+                    }
+                }
+                self.chain_last = None;
             }
+
             if hdr10.is_some() || self.ocio.as_ref().is_some_and(|o| o.pass.is_some()) {
                 self.layers = Some(composite::Layers::new(device, &self.ctx.allocator, self.format, extent.width, extent.height)?);
             }
@@ -1219,6 +1331,15 @@ pub(crate) fn find_nnedi_weights() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     [dir.join("nnedi3").join("nnedi3_weights.bin"), dir.join("nnedi3_weights.bin")].into_iter().find(|p| p.exists())
+}
+
+/// BRP_TEST_FAIL=hdr,deint,effects : these parts of the renderer fail to build (as on
+/// a GPU whose driver refuses their shaders), to check the window opens without them.
+fn test_fail(part: &str) -> Result<()> {
+    if std::env::var("BRP_TEST_FAIL").is_ok_and(|v| v.split(',').any(|p| p == part)) {
+        anyhow::bail!("BRP_TEST_FAIL");
+    }
+    Ok(())
 }
 
 /// Optimal-tiling features of `format` on the context's GPU.

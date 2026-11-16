@@ -22,6 +22,16 @@
 //!    writes N channels at half size, kept within -1..1, which the next picture's
 //!    `fuse` and `unet` read moved along the motion like the previous output; the state is
 //!    then the picture's 3 planes followed by the memory.
+//! 8. With `acc 1` in config.txt the pre-merge chooses from a fifth picture: the
+//!    accumulated one, a running mix of input pictures only (the pre-merge's own mix
+//!    without the previous output), moved along the motion. `fuse` then reads 27
+//!    channels (the 22, that picture, its two mismatch maps) and gives 5 weights; the
+//!    state is the output's 3 planes, the accumulated picture's 3, then the memory.
+//!
+//! 9. With `flow_match 1` the motion towards the picture before is corrected before it
+//!    is used: the picture is matched against the previous result (clean, and at the
+//!    picture before's time) for 25 offsets within 1 px around the estimate
+//!    (tools/denoise_train/flow_match.py, kernels MATCH_*). No learned part.
 //!
 //! Blind: there is nothing to set but the output mix (`strength`). Checked against
 //! PyTorch by `examples/learnedcheck.rs`.
@@ -87,6 +97,113 @@ void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
 }
 "#;
 
+/// The motion mix's input at the motion's level: this luma, the neighbour's moved by
+/// the estimate and by the prior, prior - estimate. The prior is minus the motion in
+/// `st` (same size): the previous picture's motion towards this one, read where the
+/// estimate says the pixel came from (`same` = 0), or this picture's motion towards
+/// the other neighbour, at the pixel itself (`same` = 1). `scale`: the prior times
+/// this (the picture before is that many frames back, model.py `flows` gap).
+const MIX_IN: &str = r#"
+G3
+layout(push_constant) uniform P { F32 la; F32 lb; F32 f; F32 st; F32 o; int W, H, same; float scale; } p;
+void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
+    int n = p.W * p.H, i = y * p.W + x;
+    vec2 f = vec2(p.f.v[i], p.f.v[n + i]);
+    float sx = float(x) + f.x, sy = float(y) + f.y;
+    vec2 pr = -p.scale * (p.same != 0 ? vec2(p.st.v[i], p.st.v[n + i]) : vec2(bilc(p.st, 0, p.W, p.H, sx, sy), bilc(p.st, n, p.W, p.H, sx, sy)));
+    p.o.v[i] = p.la.v[i];
+    p.o.v[n + i] = bilc(p.lb, 0, p.W, p.H, sx, sy);
+    p.o.v[2 * n + i] = bilc(p.lb, 0, p.W, p.H, float(x) + pr.x, float(y) + pr.y);
+    p.o.v[3 * n + i] = pr.x - f.x;
+    p.o.v[4 * n + i] = pr.y - f.y;
+}
+"#;
+
+/// The mixed motion: estimate + share x (prior - estimate) + correction, from the mix
+/// network's output `d` (share logit, correction) and its input `xi` (channels 3, 4).
+const MIX_OUT: &str = r#"
+G3
+layout(push_constant) uniform P { F32 f; F32 xi; F32 d; int W, H; } p;
+void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
+    int n = p.W * p.H, i = y * p.W + x;
+    float s = 1.0 / (1.0 + exp(-p.d.v[i]));
+    p.f.v[i] += s * p.xi.v[3 * n + i] + p.d.v[n + i];
+    p.f.v[n + i] += s * p.xi.v[4 * n + i] + p.d.v[2 * n + i];
+}
+"#;
+
+/// flow_match.py, step 1: the mean of the 3 channels minus its 5 x 5 mean (edges
+/// repeated).
+const MATCH_NORM: &str = r#"
+G3
+layout(push_constant) uniform P { F32 a; F32 o; int W, H; } p;
+float lum(int x, int y) { int n = p.W * p.H, q = clamp(y, 0, p.H - 1) * p.W + clamp(x, 0, p.W - 1); return (p.a.v[q] + p.a.v[n + q] + p.a.v[2 * n + q]) / 3.0; }
+void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
+    float s = 0.0;
+    for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) s += lum(x + i, y + j);
+    p.o.v[y * p.W + x] = lum(x, y) - s / 25.0;
+}
+"#;
+
+/// flow_match.py, step 2: plane c of 25 is the offset (c % 5, c / 5) x 0.5 - 1 px. The
+/// squared difference between this picture's normalised luma `a` and the reference's
+/// `b` at p + flow + offset, averaged over 4 x 4 blocks. The flow is at 1/k of the
+/// size, in its own pixels.
+const MATCH_COST: &str = r#"
+G3
+layout(push_constant) uniform P { F32 a; F32 b; F32 f; F32 o; int W, H, FW, FH; float k; } p;
+void main() { ID3 int OW = p.W / 4, OH = p.H / 4; if (x >= OW || y >= OH || c >= 25) return;
+    vec2 d = vec2(float(c % 5), float(c / 5)) * 0.5 - 1.0;
+    float s = 0.0;
+    for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {
+        int X = 4 * x + i, Y = 4 * y + j;
+        float sx = (float(X) + 0.5) / p.k - 0.5, sy = (float(Y) + 0.5) / p.k - 0.5;
+        float px = float(X) + p.k * bilc(p.f, 0, p.FW, p.FH, sx, sy) + d.x, py = float(Y) + p.k * bilc(p.f, p.FW * p.FH, p.FW, p.FH, sx, sy) + d.y;
+        float e = p.a.v[Y * p.W + X] - bilc(p.b, 0, p.W, p.H, px, py);
+        s += e * e;
+    }
+    p.o.v[(c * OH + y) * OW + x] = s / 16.0;
+}
+"#;
+
+/// Mean over (2r + 1)^2 pixels of each of C planes, edges repeated.
+const MATCH_BOX: &str = r#"
+G3
+layout(push_constant) uniform P { F32 a; F32 o; int C, W, H, r; } p;
+void main() { ID3 if (x >= p.W || y >= p.H || c >= p.C) return;
+    int n = p.W * p.H;
+    float s = 0.0;
+    for (int j = -p.r; j <= p.r; j++) for (int i = -p.r; i <= p.r; i++) s += p.a.v[c * n + clamp(y + j, 0, p.H - 1) * p.W + clamp(x + i, 0, p.W - 1)];
+    float k = float(2 * p.r + 1);
+    p.o.v[c * n + y * p.W + x] = s / (k * k);
+}
+"#;
+
+/// flow_match.py, step 4: per block the offset of the lowest cost (the first one, as
+/// torch.argmin), refined by a parabola along x and y, times a share that grows with
+/// how much lower that cost is than the cost of no correction (plane 12).
+const MATCH_PICK: &str = r#"
+G3
+layout(push_constant) uniform P { F32 cost; F32 o; int W, H; float soft; } p;
+void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
+    int n = p.W * p.H, q = y * p.W + x;
+    int best = 0;
+    float c0 = p.cost.v[q];
+    for (int k = 1; k < 25; k++) { float v = p.cost.v[k * n + q]; if (v < c0) { c0 = v; best = k; } }
+    int ix = best % 5, iy = best / 5;
+    float sx = 0.0, sy = 0.0;
+    if (ix > 0 && ix < 4) { float cm = p.cost.v[(best - 1) * n + q], cp = p.cost.v[(best + 1) * n + q]; sx = clamp(0.5 * (cm - cp) / max(cm + cp - 2.0 * c0, 1e-12), -0.5, 0.5); }
+    if (iy > 0 && iy < 4) { float cm = p.cost.v[(best - 5) * n + q], cp = p.cost.v[(best + 5) * n + q]; sy = clamp(0.5 * (cm - cp) / max(cm + cp - 2.0 * c0, 1e-12), -0.5, 0.5); }
+    float none = p.cost.v[12 * n + q];
+    float share = clamp((none - c0) / (none * p.soft + 1e-12), 0.0, 1.0);
+    p.o.v[q] = ((float(ix) + sx) * 0.5 - 1.0) * share;
+    p.o.v[n + q] = ((float(iy) + sy) * 0.5 - 1.0) * share;
+}
+"#;
+
+/// flow_match.py SOFT.
+const MATCH_SOFT: f32 = 0.03;
+
 const ADD: &str = r#"
 G1
 layout(push_constant) uniform P { F32 f; F32 d; int n; } p;
@@ -116,7 +233,7 @@ void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
 }
 "#;
 
-/// The memory (C planes at half size, after the 3 picture planes of the state) moved
+/// The memory (C planes at half size: the planes of the state after the pictures) moved
 /// onto this picture: sampled at p + flow / 2, the flow (at 1/k of the picture, in
 /// its own pixels) taken as the mean over the 2 x 2 pixels a memory pixel covers, as
 /// model.py does. Zeros without a previous picture (`zero`, or flag 2 off: a cut).
@@ -132,17 +249,19 @@ void main() { ID3 int w = p.W / 2, h = p.H / 2; if (x >= w || y >= h || c > 0) r
         f += vec2(bilc(p.f, 0, p.FW, p.FH, sx, sy), bilc(p.f, p.FW * p.FH, p.FW, p.FH, sx, sy));
     }
     f *= p.k * 0.125;
-    int base = 3 * p.W * p.H;
-    for (int ch = 0; ch < p.C; ch++) p.o.v[ch * n + i] = bilc(p.st, base + ch * n, w, h, float(x) + f.x, float(y) + f.y);
+    for (int ch = 0; ch < p.C; ch++) p.o.v[ch * n + i] = bilc(p.st, ch * n, w, h, float(x) + f.x, float(y) + f.y);
 }
 "#;
 
-/// The state for the next picture: the denoised picture's planes (n values), then
-/// the memory (m values) kept within -1..1.
+/// The state for the next picture: the denoised picture's planes (n values), the
+/// accumulated picture's (a values, 0: none), the memory (m values) kept within
+/// -1..1, then the motion towards the next picture (f values, 0: none; the rest of
+/// its plane is not used).
 const PACK: &str = r#"
 G1
-layout(push_constant) uniform P { F32 den; F32 mem; F32 o; int n, m; } p;
-void main() { ID1 if (i >= p.n + p.m) return; p.o.v[i] = i < p.n ? p.den.v[i] : clamp(p.mem.v[i - p.n], -1.0, 1.0); }
+layout(push_constant) uniform P { F32 den; F32 acc; F32 mem; F32 flow; F32 o; int n, a, m, f; } p;
+void main() { ID1 int e = p.n + p.a + p.m; if (i >= e + p.f) return;
+    p.o.v[i] = i < p.n ? p.den.v[i] : i < p.n + p.a ? p.acc.v[i - p.n] : i < e ? clamp(p.mem.v[i - p.n - p.a], -1.0, 1.0) : p.flow.v[i - e]; }
 "#;
 
 /// |mean of a - mean of b| over k x k blocks, averaged over the 3 channels.
@@ -188,11 +307,13 @@ void main() {
 
 /// The 22 channels both networks read: picture, moved before / after / previous
 /// output (a cut neighbour replaced by the picture, no previous output: zeros), the
-/// 4 flags, the mismatch maps (block differences upsampled, x 8).
+/// 4 flags, the mismatch maps (block differences upsampled, x 8). With the
+/// accumulated picture (C = 27) the pre-merge also reads it (zeros without a
+/// previous picture) and its two mismatch maps.
 const ASSEMBLE: &str = r#"
 G3
-layout(push_constant) uniform P { F32 cur; F32 wb; F32 wa; F32 wp; F32 fl; F32 d4; F32 d16; F32 o; int W, H; } p;
-void main() { ID3 if (x >= p.W || y >= p.H || c >= 22) return;
+layout(push_constant) uniform P { F32 cur; F32 wb; F32 wa; F32 wp; F32 wc; F32 fl; F32 d4; F32 d16; F32 o; int W, H, C; } p;
+void main() { ID3 if (x >= p.W || y >= p.H || c >= p.C) return;
     int n = p.W * p.H, i = y * p.W + x;
     float v;
     if (c < 3) v = p.cur.v[c * n + i];
@@ -200,8 +321,9 @@ void main() { ID3 if (x >= p.W || y >= p.H || c >= 22) return;
     else if (c < 9) v = p.fl.v[5] > 0.5 ? p.cur.v[(c - 6) * n + i] : p.wa.v[(c - 6) * n + i];
     else if (c < 12) v = p.fl.v[2] > 0.5 ? p.wp.v[(c - 9) * n + i] : 0.0;
     else if (c < 16) v = p.fl.v[c - 12];
+    else if (c >= 22 && c < 25) v = p.fl.v[2] > 0.5 ? p.wc.v[(c - 22) * n + i] : 0.0;
     else {
-        int j = c - 16, pic = j / 2, k = (j & 1) == 0 ? 4 : 16, w = p.W / k, h = p.H / k;
+        int j = c < 22 ? c - 16 : c - 19, pic = j / 2, k = (j & 1) == 0 ? 4 : 16, w = p.W / k, h = p.H / k;
         float sx = (float(x) + 0.5) / float(k) - 0.5, sy = (float(y) + 0.5) / float(k) - 0.5;
         v = 8.0 * ((j & 1) == 0 ? bilc(p.d4, pic * w * h, w, h, sx, sy) : bilc(p.d16, pic * w * h, w, h, sx, sy));
     }
@@ -209,26 +331,33 @@ void main() { ID3 if (x >= p.W || y >= p.H || c >= 22) return;
 }
 "#;
 
-/// The pre-merge: the four pictures mixed by the softmax of the network's weights
-/// (slots without a picture get none).
+/// The pre-merge: the N pictures (4, or 5 with the accumulated one, which shares the
+/// previous output's flag) mixed by the softmax of the network's weights (slots
+/// without a picture get none). With 5, also the accumulated picture's next value:
+/// the same mix without the previous output.
 const BLEND: &str = r#"
 G3
-layout(push_constant) uniform P { F32 xs; F32 lg; F32 o; int W, H; } p;
+layout(push_constant) uniform P { F32 xs; F32 lg; F32 o; F32 acc; int W, H, N; } p;
 void main() { ID3 if (x >= p.W || y >= p.H || c > 0) return;
     int n = p.W * p.H, i = y * p.W + x;
-    float l[4];
+    float l[5];
     float m = -1e30;
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < p.N; k++) {
         l[k] = p.lg.v[k * n + i];
-        if (k > 0 && p.xs.v[(11 + k) * n + i] < 0.5) l[k] = -1e4;
+        if (k > 0 && p.xs.v[(11 + min(k, 3)) * n + i] < 0.5) l[k] = -1e4;
         m = max(m, l[k]);
     }
     float s = 0.0;
-    for (int k = 0; k < 4; k++) { l[k] = exp(l[k] - m); s += l[k]; }
+    for (int k = 0; k < p.N; k++) { l[k] = exp(l[k] - m); s += l[k]; }
     for (int ch = 0; ch < 3; ch++) {
-        float v = 0.0;
-        for (int k = 0; k < 4; k++) v += l[k] * p.xs.v[(3 * k + ch) * n + i];
+        float v = 0.0, a = 0.0;
+        for (int k = 0; k < p.N; k++) {
+            float px = p.xs.v[((k < 4 ? 3 * k : 22) + ch) * n + i];
+            v += l[k] * px;
+            if (k != 3) a += l[k] * px;
+        }
         p.o.v[ch * n + i] = v / s;
+        if (p.N == 5) p.acc.v[ch * n + i] = a / max(s - l[3], 1e-4 * s);
     }
 }
 "#;
@@ -261,6 +390,25 @@ pub struct Learned {
     cut_thr: f32,
     /// Channels of the memory carried beside the previous output (0: none).
     mem: usize,
+    /// The accumulated picture is carried too (a fifth picture for the pre-merge).
+    acc: bool,
+    /// The motion towards the picture before is estimated against the previous output
+    /// (the state's picture), where there is one, instead of the picture before: that
+    /// lines the history itself up with the new picture.
+    flow_prev: bool,
+    /// The motion mix (model.py `Motion.mix`): each motion estimate is mixed with a
+    /// prior, the motion of the picture before carried over; the state then has one
+    /// more plane, holding the motion towards the next picture.
+    mix: Option<Net>,
+    mix_in: Arc<Kernel>,
+    mix_out: Arc<Kernel>,
+    /// The motion towards the picture before is corrected by matching the picture
+    /// against the previous result (flow_match.py).
+    flow_match: bool,
+    match_norm: Arc<Kernel>,
+    match_cost: Arc<Kernel>,
+    match_box: Arc<Kernel>,
+    match_pick: Arc<Kernel>,
     /// The checkpoint the files were written from (for logs).
     pub source: String,
     prep: Arc<Kernel>,
@@ -284,11 +432,21 @@ fn g(k: &Kernel, w: usize, h: usize, c: usize) -> [u32; 3] {
 
 impl Learned {
     pub fn available(models: &Path) -> bool {
-        models.join("brpdn").join("unet.param").exists()
+        Self::available_in(&models.join("brpdn"))
+    }
+
+    /// Whether `dir` holds an exported model.
+    pub fn available_in(dir: &Path) -> bool {
+        dir.join("unet.param").exists()
     }
 
     pub fn new(ops: &Arc<Ops>, models: &Path) -> Result<Self> {
-        let dir = models.join("brpdn");
+        Self::open(ops, &models.join("brpdn"))
+    }
+
+    /// The model exported into `dir` (`models/brpdn` is the default one; the player
+    /// keeps others beside it, see its `LEARNED_MODELS`).
+    pub fn open(ops: &Arc<Ops>, dir: &Path) -> Result<Self> {
         let net = |name: &str, half: bool| -> Result<Net> {
             let base = dir.join(name);
             let param = std::fs::read_to_string(base.with_extension("param")).with_context(|| format!("{}.param", base.display()))?;
@@ -313,6 +471,16 @@ impl Learned {
             base: int("motion_base")?,
             cut_thr: value("cut_thr").and_then(|v| v.parse().ok()).context("brpdn/config.txt: cut_thr")?,
             mem: value("state").and_then(|v| v.parse().ok()).unwrap_or(0),
+            acc: value("acc").is_some_and(|v| v == "1"),
+            flow_prev: value("flow_prev").is_some_and(|v| v == "1"),
+            mix: if value("flow_mix").is_some_and(|v| v == "1") { Some(net("mix", false)?) } else { None },
+            mix_in: k("mix_in", MIX_IN)?,
+            mix_out: k("mix_out", MIX_OUT)?,
+            flow_match: value("flow_match").is_some_and(|v| v == "1"),
+            match_norm: k("match_norm", MATCH_NORM)?,
+            match_cost: k("match_cost", MATCH_COST)?,
+            match_box: k("match_box", MATCH_BOX)?,
+            match_pick: k("match_pick", MATCH_PICK)?,
             source: value("source").unwrap_or("").to_string(),
             prep: k("prep", PREP)?,
             pool: k("pool", POOL)?,
@@ -346,8 +514,8 @@ impl Learned {
     }
 
     /// Where each pixel of `a` is in `b` (both PQ pictures), at 1/base of the size, in
-    /// that level's pixels.
-    fn motion(&self, rec: &mut Recorder, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    /// that level's pixels; and the two lumas at that level (for the mix).
+    fn motion(&self, rec: &mut Recorder, a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let ops = &self.ops;
         let mut pa = vec![self.pooled(rec, a, self.base)?];
         let mut pb = vec![self.pooled(rec, b, self.base)?];
@@ -382,10 +550,58 @@ impl Learned {
                 }
             }
         }
+        let (la, lb) = (pa.remove(0), pb.remove(0));
         for t in pa.into_iter().chain(pb) {
             ops.recycle(rec, t);
         }
-        flow.context("no motion level")
+        Ok((flow.context("no motion level")?, la, lb))
+    }
+
+    /// `flow` (an estimate, with its lumas) mixed in place with its prior: minus the
+    /// motion in `st`, times `scale` (see MIX_IN).
+    #[allow(clippy::too_many_arguments)]
+    fn mixed(&self, rec: &mut Recorder, mix: &Net, flow: &Tensor, la: &Tensor, lb: &Tensor, st: &Tensor, same: bool, scale: f32) -> Result<()> {
+        let (w, h) = (flow.w, flow.h);
+        let x = self.ops.tensor(5, h, w)?;
+        rec.dispatch(&self.mix_in, g(&self.mix_in, w, h, 1), &Push::new().t(la).t(lb).t(flow).t(st).t(&x).i(w as i32).i(h as i32).i(same as i32).f(scale))?;
+        let d = mix.record(rec, &[("x", &x)], &["out"])?.remove(0);
+        ensure!(!d.half && (d.c, d.h, d.w) == (3, h, w), "motion mix network output");
+        rec.dispatch(&self.mix_out, g(&self.mix_out, w, h, 1), &Push::new().t(flow).t(&x).t(&d).i(w as i32).i(h as i32))?;
+        self.ops.recycle(rec, x);
+        self.ops.recycle(rec, d);
+        Ok(())
+    }
+
+    /// flow_match.py: `flow` (towards the picture before, at 1/base of the size)
+    /// corrected in place by matching this picture `x` against the previous result
+    /// `reference` (both PQ, 3 planes of the padded size).
+    fn matched(&self, rec: &mut Recorder, flow: &Tensor, x: &Tensor, reference: &Tensor) -> Result<()> {
+        let ops = &self.ops;
+        let (w, h) = (x.w, x.h);
+        let (qw, qh) = (w / 4, h / 4);
+        let (a, b) = (ops.tensor(1, h, w)?, ops.tensor(1, h, w)?);
+        for (src, dst) in [(x, &a), (reference, &b)] {
+            rec.dispatch(&self.match_norm, g(&self.match_norm, w, h, 1), &Push::new().t(src).t(dst).i(w as i32).i(h as i32))?;
+        }
+        let cost = ops.tensor(25, qh, qw)?;
+        let push = Push::new().t(&a).t(&b).t(flow).t(&cost).i(w as i32).i(h as i32).i(flow.w as i32).i(flow.h as i32).f(self.base as f32);
+        rec.dispatch(&self.match_cost, g(&self.match_cost, qw, qh, 25), &push)?;
+        let mean = ops.tensor(25, qh, qw)?;
+        rec.dispatch(&self.match_box, g(&self.match_box, qw, qh, 25), &Push::new().t(&cost).t(&mean).i(25).i(qw as i32).i(qh as i32).i(2))?;
+        let d = ops.tensor(2, qh, qw)?;
+        rec.dispatch(&self.match_pick, g(&self.match_pick, qw, qh, 1), &Push::new().t(&mean).t(&d).i(qw as i32).i(qh as i32).f(MATCH_SOFT))?;
+        let ds = ops.tensor(2, qh, qw)?;
+        rec.dispatch(&self.match_box, g(&self.match_box, qw, qh, 2), &Push::new().t(&d).t(&ds).i(2).i(qw as i32).i(qh as i32).i(1))?;
+        // To the motion's own size and pixels, and added there (the motion is enlarged
+        // wherever it is used, the correction with it).
+        let dr = ops.tensor(2, flow.h, flow.w)?;
+        let push = Push::new().t(&ds).t(&dr).i(2).i(qw as i32).i(qh as i32).i(flow.w as i32).i(flow.h as i32).f(1.0 / self.base as f32);
+        rec.dispatch(&self.resize, g(&self.resize, flow.w, flow.h, 2), &push)?;
+        rec.dispatch(&self.add, Recorder::groups(&self.add, [flow.len() as u32, 1, 1]), &Push::new().t(flow).t(&dr).i(flow.len() as i32))?;
+        for t in [a, b, cost, mean, d, ds, dr] {
+            ops.recycle(rec, t);
+        }
+        Ok(())
     }
 
     fn warped(&self, rec: &mut Recorder, img: &Tensor, flow: &Tensor) -> Result<Tensor> {
@@ -410,25 +626,59 @@ impl Learned {
     /// ends) or to use the picture alone. `prev`: the state from the picture before
     /// (None at a start: then give no `before` either on that picture, as in
     /// training, where a clip's first frame has neither). `cuts`: the cut test.
+    /// `gap`: how many frames back `before` (and `prev`) are; 1 unless playback
+    /// skipped frames. The carried motion is over one frame, so the prior it gives
+    /// is scaled by it.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&self, rec: &mut Recorder, cur: &Tensor, before: Option<&Tensor>, after: Option<&Tensor>, prev: Option<&Tensor>, sdr: bool, strength: f32, cuts: bool) -> Result<(Tensor, Tensor)> {
+    pub fn record(&self, rec: &mut Recorder, cur: &Tensor, before: Option<&Tensor>, after: Option<&Tensor>, prev: Option<&Tensor>, sdr: bool, strength: f32, cuts: bool, gap: f32) -> Result<(Tensor, Tensor)> {
+        let gap = if gap.is_finite() { gap.max(1.0) } else { 1.0 };
         let ops = &self.ops;
         ensure!(cur.c >= 3 && !cur.half, "denoise: {} channels", cur.c);
         rec.label = "denoise (learned): motion".into();
         let x = self.encode(rec, cur, sdr)?;
         let (pw, ph) = (x.w, x.h);
         ensure!(self.mem % 4 == 0, "denoise: memory of {} channels", self.mem);
-        let prev = prev.filter(|p| (p.c, p.h, p.w) == (3 + self.mem / 4, ph, pw));
+        ensure!(!self.acc || self.mem > 0, "denoise: accumulated picture without a memory");
+        let pics = if self.acc { 6 } else { 3 };
+        ensure!(self.mix.is_none() || self.mem > 0, "denoise: motion mix without a memory");
+        let planes = pics + self.mem / 4 + self.mix.is_some() as usize;
+        let prev = prev.filter(|p| (p.c, p.h, p.w) == (planes, ph, pw));
         // A missing neighbour is the picture itself, flagged off (as in training).
         let xb = before.map(|b| self.encode(rec, b, sdr)).transpose()?;
         let xa = after.map(|a| self.encode(rec, a, sdr)).transpose()?;
-        let fb = self.motion(rec, &x, xb.as_ref().unwrap_or(&x))?;
-        let fa = self.motion(rec, &x, xa.as_ref().unwrap_or(&x))?;
+        let (fb, la, lb) = match prev.filter(|_| self.flow_prev && before.is_some()) {
+            Some(p) => self.motion(rec, &x, &p.view(0, 3))?,
+            None => self.motion(rec, &x, xb.as_ref().unwrap_or(&x))?,
+        };
+        // The prior for the motion towards the picture before: the previous picture's
+        // motion towards this one (the state's last plane), negated.
+        if let (Some(mix), Some(p), true) = (&self.mix, prev, before.is_some()) {
+            ensure!(2 * fb.w * fb.h <= pw * ph, "denoise: motion level larger than a plane");
+            self.mixed(rec, mix, &fb, &la, &lb, &p.view(planes - 1, 1), false, gap)?;
+        }
+        ops.recycle(rec, la);
+        ops.recycle(rec, lb);
+        let (fa, la, lb) = self.motion(rec, &x, xa.as_ref().unwrap_or(&x))?;
+        // And for the motion towards the picture after: minus the motion towards the
+        // one before (motion going on as it was).
+        if let (Some(mix), true, true) = (&self.mix, before.is_some(), after.is_some()) {
+            self.mixed(rec, mix, &fa, &la, &lb, &fb, true, 1.0 / gap)?;
+        }
+        ops.recycle(rec, la);
+        ops.recycle(rec, lb);
+        // The motion towards the picture before, corrected against the previous result
+        // (after the mix above, which takes it as it was estimated, as model.py does).
+        if let (true, Some(p), true) = (self.flow_match, prev, before.is_some()) {
+            ensure!(pw % 4 == 0 && ph % 4 == 0, "denoise: padded size");
+            self.matched(rec, &fb, &x, &p.view(0, 3))?;
+        }
         let wb = self.warped(rec, xb.as_ref().unwrap_or(&x), &fb)?;
         let wa = self.warped(rec, xa.as_ref().unwrap_or(&x), &fa)?;
         // The previous output lines up with the picture before: the same motion.
         let wp = prev.map(|p| self.warped(rec, p, &fb)).transpose()?;
-        for t in [fa].into_iter().chain(xb).chain(xa) {
+        // The accumulated picture, the same way.
+        let wc = prev.filter(|_| self.acc).map(|p| self.warped(rec, &p.view(3, 3), &fb)).transpose()?;
+        for t in xb.into_iter().chain(xa) {
             ops.recycle(rec, t);
         }
 
@@ -446,22 +696,26 @@ impl Learned {
         // The memory moved like the previous output (none: zeros).
         let h = if self.mem > 0 {
             let h = ops.tensor(self.mem, ph / 2, pw / 2)?;
-            let push = Push::new().t(prev.unwrap_or(&x)).t(&fb).t(&fl).t(&h).i(self.mem as i32).i(pw as i32).i(ph as i32).i(fb.w as i32).i(fb.h as i32).i(prev.is_none() as i32).f(self.base as f32);
+            let mem = prev.map(|p| p.view(pics, self.mem / 4));
+            let push = Push::new().t(mem.as_ref().unwrap_or(&x)).t(&fb).t(&fl).t(&h).i(self.mem as i32).i(pw as i32).i(ph as i32).i(fb.w as i32).i(fb.h as i32).i(prev.is_none() as i32).f(self.base as f32);
             rec.dispatch(&self.mem_warp, g(&self.mem_warp, pw / 2, ph / 2, 1), &push)?;
             Some(h)
         } else {
             None
         };
         ops.recycle(rec, fb);
-        let (d4, d16) = (ops.tensor(3, ph / 4, pw / 4)?, ops.tensor(3, bh, bw)?);
-        for (i, (w, same, valid)) in [(&wb, 4, -1), (&wa, 5, -1), (wp.as_ref().unwrap_or(&x), -1, 2)].into_iter().enumerate() {
+        let moved = if self.acc { 4 } else { 3 };
+        let (d4, d16) = (ops.tensor(moved, ph / 4, pw / 4)?, ops.tensor(moved, bh, bw)?);
+        let list = [(&wb, 4, -1), (&wa, 5, -1), (wp.as_ref().unwrap_or(&x), -1, 2), (wc.as_ref().unwrap_or(&x), -1, 2)];
+        for (i, (w, same, valid)) in list.into_iter().take(moved).enumerate() {
             self.block_diff(rec, &x, w, &fl, &d4.view(i, 1), 4, same, valid)?;
             self.block_diff(rec, &x, w, &fl, &d16.view(i, 1), 16, same, valid)?;
         }
-        let xs = ops.tensor(22, ph, pw)?;
-        let push = Push::new().t(&x).t(&wb).t(&wa).t(wp.as_ref().unwrap_or(&x)).t(&fl).t(&d4).t(&d16).t(&xs).i(pw as i32).i(ph as i32);
-        rec.dispatch(&self.assemble, g(&self.assemble, pw, ph, 22), &push)?;
-        for t in [wb, wa, fl, d4, d16].into_iter().chain(wp) {
+        let chans = if self.acc { 27 } else { 22 };
+        let xs = ops.tensor(chans, ph, pw)?;
+        let push = Push::new().t(&x).t(&wb).t(&wa).t(wp.as_ref().unwrap_or(&x)).t(wc.as_ref().unwrap_or(&x)).t(&fl).t(&d4).t(&d16).t(&xs).i(pw as i32).i(ph as i32).i(chans as i32);
+        rec.dispatch(&self.assemble, g(&self.assemble, pw, ph, chans), &push)?;
+        for t in [wb, wa, fl, d4, d16].into_iter().chain(wp).chain(wc) {
             ops.recycle(rec, t);
         }
 
@@ -471,31 +725,43 @@ impl Learned {
             None => self.fuse.record(rec, &[("x", &xs)], &["out"])?,
         }
         .remove(0);
-        ensure!(!lg.half && (lg.c, lg.h, lg.w) == (4, ph, pw), "pre-merge network output");
+        let n = if self.acc { 5 } else { 4 };
+        ensure!(!lg.half && (lg.c, lg.h, lg.w) == (n, ph, pw), "pre-merge network output");
         let base = ops.tensor(3, ph, pw)?;
-        rec.dispatch(&self.blend, g(&self.blend, pw, ph, 1), &Push::new().t(&xs).t(&lg).t(&base).i(pw as i32).i(ph as i32))?;
+        let acc = if self.acc { Some(ops.tensor(3, ph, pw)?) } else { None };
+        rec.dispatch(&self.blend, g(&self.blend, pw, ph, 1), &Push::new().t(&xs).t(&lg).t(&base).t(acc.as_ref().unwrap_or(&base)).i(pw as i32).i(ph as i32).i(n as i32))?;
         ops.recycle(rec, lg);
 
         rec.label = "denoise (learned): merge".into();
-        let mut made = match &h {
-            Some(h) => self.unet.record(rec, &[("x", &xs), ("base", &base), ("h", h)], &["out", "state"])?,
-            None => self.unet.record(rec, &[("x", &xs), ("base", &base)], &["out"])?,
+        // The merge reads the first 22 channels.
+        let mut made = {
+            let x22 = xs.view(0, 22);
+            match &h {
+                Some(h) => self.unet.record(rec, &[("x", &x22), ("base", &base), ("h", h)], &["out", "state"])?,
+                None => self.unet.record(rec, &[("x", &x22), ("base", &base)], &["out"])?,
+            }
         };
         let den = made.remove(0);
         ensure!(!den.half && (den.c, den.h, den.w) == (3, ph, pw), "merge network output");
         ops.recycle(rec, xs);
         ops.recycle(rec, base);
-        // The state: the picture, and behind it the new memory.
+        // The state: the picture, the accumulated one, and behind them the new memory.
         let state = match made.pop() {
             Some(m) => {
                 ensure!(!m.half && (m.c, m.h, m.w) == (self.mem, ph / 2, pw / 2), "merge network memory");
-                let st = ops.tensor(3 + self.mem / 4, ph, pw)?;
-                rec.dispatch(&self.pack, Recorder::groups(&self.pack, [st.len() as u32, 1, 1]), &Push::new().t(&den).t(&m).t(&st).i(den.len() as i32).i(m.len() as i32))?;
+                let st = ops.tensor(planes, ph, pw)?;
+                let fl = if self.mix.is_some() { fa.len() } else { 0 };
+                let push = Push::new().t(&den).t(acc.as_ref().unwrap_or(&den)).t(&m).t(&fa).t(&st).i(den.len() as i32).i(acc.as_ref().map_or(0, |a| a.len()) as i32).i(m.len() as i32).i(fl as i32);
+                rec.dispatch(&self.pack, Recorder::groups(&self.pack, [st.len() as u32, 1, 1]), &push)?;
                 ops.recycle(rec, m);
                 Some(st)
             }
             None => None,
         };
+        if let Some(a) = acc {
+            ops.recycle(rec, a);
+        }
+        ops.recycle(rec, fa);
         if let Some(h) = h {
             ops.recycle(rec, h);
         }

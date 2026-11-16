@@ -170,9 +170,10 @@ impl AiKind {
                 p("Impulses", "Removes isolated pixels far brighter or darker than those around them: fireflies in 3D renders, salt and pepper, hot or dead pixels (0: off; higher catches fainter ones). A small highlight also in the neighbouring pictures, such as a star or a glint, is kept", ParamKind::Float, 0.5, 0.0, 1.0),
             ],
             AiKind::DenoiseAi => vec![
-                p("Strength", "Test model, still being trained: results will change in later versions. How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
+                p("Strength", "Beta: the model is still being trained, results will change in later versions. How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
                 p("Temporal", "On: each frame is merged with the frame before, the frame after and its own previous result, moved onto it along the motion: cleaner and steadier. Off: each frame alone (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
                 p("Scene cuts", "On: a neighbouring frame that does not match this one at all (another shot) is left out, and the result starts afresh there. Off: the network alone decides what to take from each frame (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
+                p("Model", "Fast: the small network, about 0.04 s per 1080p frame on a fast card. Quality: a much larger network, cleaner, steadier and keeps more faint detail, about 0.2 s per 1080p frame (options: Fast|Quality)", ParamKind::Int, 0.0, 0.0, 1.0),
             ],
             AiKind::Deblur => vec![p(
                 "Strength",
@@ -296,6 +297,15 @@ const LEARNED_GAP: i64 = 3;
 
 fn learned_temporal(params: &[f64]) -> bool {
     params.get(1).is_none_or(|&v| v >= 0.5)
+}
+
+/// Denoise (AI)'s models, by its Model parameter: folders of `models/`, each written
+/// by `tools/denoise_train/export_player.py`.
+const LEARNED_MODELS: [&str; 2] = ["brpdn", "brpdn_quality"];
+
+fn learned_model(params: &[f64]) -> usize {
+    // 1: Quality. Anything else is Fast (also the third choice an earlier build had).
+    params.get(3).map_or(0, |v| (v.round() as i64 == 1) as usize)
 }
 
 /// Steady Detail: frames each way.
@@ -464,6 +474,9 @@ pub(crate) struct Job {
     /// Stopped when a setting changes before it is done (pictures that take long; a
     /// quick one finishes, so dragging a slider keeps showing its effect).
     stoppable: bool,
+    /// OpenColorIO's input transform, run on the decoded frames before the stack, when
+    /// OCIO is on (DESIGN.md §7d): the effects then work on OCIO's linear light.
+    ocio: Option<Arc<brp_render::OcioCompute>>,
 }
 
 /// A picture taking longer than this is stopped when a setting changes meanwhile.
@@ -477,7 +490,14 @@ impl Job {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(stages: Arc<Vec<Stage>>, transfer: Transfer, deint: Option<SourceDeint>, tick: i64, frames: Vec<Arc<VideoFrame>>, last_frame: i64, color: ColorInfo, ctx: Arc<GpuContext>) -> Job {
         let subs = subs_of(&stages, deint);
-        Job { key: stack_key(&stages, transfer, deint, 0), source: 0, spaces: stage_spaces(&stages, &color), pos: (tick.div_euclid(subs), tick.rem_euclid(subs) as u8), stages, transfer, subs, frames, last_frame, color, ctx, deint, stoppable: false }
+        Job { key: stack_key(&stages, transfer, deint, 0), source: 0, spaces: stage_spaces(&stages, &color), pos: (tick.div_euclid(subs), tick.rem_euclid(subs) as u8), stages, transfer, subs, frames, last_frame, color, ctx, deint, stoppable: false, ocio: None }
+    }
+
+    /// With OpenColorIO's input transform on the decoded frames (DESIGN.md §7d).
+    pub(crate) fn with_ocio(mut self, ocio: Option<Arc<brp_render::OcioCompute>>) -> Job {
+        self.key = ocio_key(self.key, &ocio);
+        self.ocio = ocio;
+        self
     }
 
     /// Source pictures per frame: 2 when each field becomes a picture.
@@ -619,6 +639,9 @@ pub struct Ai {
     pub error: Option<String>,
     /// The window's GPU device.
     pub ctx: Option<Arc<GpuContext>>,
+    /// OpenColorIO's input transform for the decoded frames (the window's, on its
+    /// device), when OCIO is on (DESIGN.md §7d).
+    ocio: Option<Arc<brp_render::OcioCompute>>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -672,6 +695,7 @@ impl Ai {
             exact: None,
             error: None,
             ctx: None,
+            ocio: None,
             threads: vec![worker, restorer],
         }
     }
@@ -699,9 +723,20 @@ impl Ai {
         self.rekey()
     }
 
+    /// OpenColorIO's input transform for the decoded frames (the window's
+    /// `Renderer::ocio_pre`), or None: the effects then work on OCIO's linear light
+    /// (DESIGN.md §7d). A new one makes new pictures.
+    pub fn set_ocio(&mut self, ocio: Option<Arc<brp_render::OcioCompute>>) {
+        if ocio_id(&ocio) == ocio_id(&self.ocio) {
+            return;
+        }
+        self.ocio = ocio;
+        self.rekey();
+    }
+
     /// New key (cache identity) and pictures per frame after a setting changed.
     fn rekey(&mut self) -> bool {
-        let key = stack_key(&self.stages, self.transfer, self.deint, self.source);
+        let key = ocio_key(stack_key(&self.stages, self.transfer, self.deint, self.source), &self.ocio);
         let subs = subs_of(&self.stages, self.deint);
         let changed = subs != self.subs;
         if key != self.key {
@@ -978,6 +1013,7 @@ impl Ai {
             ctx,
             deint: self.deint,
             stoppable: self.cost > STOP_AFTER,
+            ocio: self.ocio.clone(),
         })
     }
 
@@ -1174,6 +1210,8 @@ const SIMS: usize = 16384;
 struct LearnedState {
     /// Tick of that picture.
     last: i64,
+    /// The model that made it (index into `LEARNED_MODELS`): another model starts afresh.
+    model: usize,
     /// Its denoised picture, as the network keeps it (PQ, padded).
     prev: Tensor,
 }
@@ -1200,6 +1238,24 @@ fn source_key(job: &Job) -> u64 {
     job.transfer.hash(&mut h);
     job.deint.map(|d| (d.method as u8, d.tff, d.fields)).hash(&mut h);
     job.subs.hash(&mut h);
+    ocio_id(&job.ocio).hash(&mut h);
+    h.finish()
+}
+
+/// Identity of OCIO's input transform (DESIGN.md §7d): which conversion made the
+/// source pictures (0: the player's own decoding).
+fn ocio_id(o: &Option<Arc<brp_render::OcioCompute>>) -> usize {
+    o.as_ref().map_or(0, |o| Arc::as_ptr(o) as usize)
+}
+
+/// A stack key with OCIO's input transform in it (unchanged without).
+fn ocio_key(key: u64, o: &Option<Arc<brp_render::OcioCompute>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if o.is_none() {
+        return key;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (key, ocio_id(o)).hash(&mut h);
     h.finish()
 }
 
@@ -1209,6 +1265,7 @@ fn stage_keys(job: &Job) -> Vec<u64> {
     job.transfer.hash(&mut h);
     job.deint.map(|d| (d.method as u8, d.tff, d.fields)).hash(&mut h);
     job.subs.hash(&mut h);
+    ocio_id(&job.ocio).hash(&mut h);
     job.stages.iter().map(|s| {
         s.hash(&mut h);
         h.finish()
@@ -1251,7 +1308,8 @@ pub(crate) struct Worker {
     cleanup: Option<brp_ai::restore::Restorer>,
     /// The learned denoiser, loaded when first asked for, and per stage input its
     /// state (the previous result).
-    learned: Option<brp_ai::learned::Learned>,
+    /// The learned denoisers loaded so far, by index into `LEARNED_MODELS`.
+    learned: HashMap<usize, brp_ai::learned::Learned>,
     learned_state: HashMap<usize, LearnedState>,
     /// Depth: per stage input, the model (its frame history) and the last picture fed.
     depth: HashMap<usize, DepthState>,
@@ -1763,6 +1821,8 @@ impl Worker {
         }
         let gpu = self.gpu.as_ref().unwrap();
         let fx = &mut self.merge.as_mut().unwrap().1;
+        // OCIO on: the stack starts from OCIO's linear light (DESIGN.md §7d).
+        fx.set_ocio_input(job.ocio.clone());
         let input = FxInput::Frame { frame: &f, prev: prev.as_deref(), next: next.as_deref(), deint };
         run_fx(fx, &mut self.begun, MERGE, gpu, rec, job, input, tick / Self::grid(job, 0), (f.width(), f.height()), channels_of(&f), (Space::Source, job.spaces[0]))
     }
@@ -2008,14 +2068,15 @@ impl Worker {
     #[allow(clippy::too_many_arguments)]
     fn run_learned(&mut self, rec: &mut Recorder, job: &Job, s: usize, params: &[f64], tick: i64, g: i64) -> anyhow::Result<Tensor> {
         use brp_ai::learned::Learned;
-        if self.learned.is_none() {
-            let models = brp_ai::models_dir();
-            if !Learned::available(&models) {
-                anyhow::bail!("denoise model not found in {}", models.display());
+        let model = learned_model(params);
+        if !self.learned.contains_key(&model) {
+            let dir = brp_ai::models_dir().join(LEARNED_MODELS[model]);
+            if !Learned::available_in(&dir) {
+                anyhow::bail!("denoise model not found in {}", dir.display());
             }
-            let net = Learned::new(&self.gpu().ops, &models)?;
+            let net = Learned::open(&self.gpu().ops, &dir)?;
             log::info!("AI: learned denoiser {}", net.source);
-            self.learned = Some(net);
+            self.learned.insert(model, net);
         }
         let strength = params.first().copied().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
         let cuts = params.get(2).is_none_or(|&v| v >= 0.5);
@@ -2023,14 +2084,14 @@ impl Worker {
         let end = job.last_frame * job.subs;
         if !learned_temporal(params) {
             let img = self.eval(rec, job, s, tick)?;
-            let made = self.learned.as_ref().unwrap().record(rec, &img, None, None, None, sdr, strength, false);
+            let made = self.learned[&model].record(rec, &img, None, None, None, sdr, strength, false, 1.0);
             self.put(rec, img);
             let (out, state) = made?;
             self.put(rec, state);
             return Ok(out);
         }
         // Where to carry on from: the last picture made, if this one follows it closely.
-        let mut state = self.learned_state.remove(&s).filter(|st| st.last < tick && tick - st.last <= LEARNED_GAP * g);
+        let mut state = self.learned_state.remove(&s).filter(|st| st.model == model && st.last < tick && tick - st.last <= LEARNED_GAP * g);
         let mut before = None;
         if let Some(st) = &state {
             match self.eval(rec, job, s, st.last) {
@@ -2052,13 +2113,13 @@ impl Worker {
                 let b = if state.is_some() { self.eval(rec, job, s, t - g).ok() } else { None };
                 let a = self.eval(rec, job, s, t + g).ok();
                 let prev = state.as_ref().filter(|_| b.is_some()).map(|st| &st.prev);
-                let made = self.learned.as_ref().unwrap().record(rec, &cur, b.as_ref().filter(|_| prev.is_some()), a.as_ref(), prev, sdr, 1.0, cuts);
+                let made = self.learned[&model].record(rec, &cur, b.as_ref().filter(|_| prev.is_some()), a.as_ref(), prev, sdr, 1.0, cuts, 1.0);
                 for x in [Some(cur), b, a].into_iter().flatten() {
                     self.put(rec, x);
                 }
                 let (out, st) = made?;
                 self.put(rec, out);
-                if let Some(old) = state.replace(LearnedState { last: t, prev: st }) {
+                if let Some(old) = state.replace(LearnedState { last: t, model, prev: st }) {
                     self.put(rec, old.prev);
                 }
             }
@@ -2071,7 +2132,9 @@ impl Worker {
         }
         let img = self.eval(rec, job, s, tick)?;
         let after = if tick + g <= end { Some(self.eval(rec, job, s, tick + g)?) } else { None };
-        let made = self.learned.as_ref().unwrap().record(rec, &img, before.as_ref(), after.as_ref(), state.as_ref().map(|st| &st.prev), sdr, strength, cuts);
+        // How many frames back the picture before is (more than 1: playback skipped some).
+        let gap = state.as_ref().map_or(1.0, |st| (tick - st.last) as f32 / g.max(1) as f32);
+        let made = self.learned[&model].record(rec, &img, before.as_ref(), after.as_ref(), state.as_ref().map(|st| &st.prev), sdr, strength, cuts, gap);
         for x in [Some(img), before, after].into_iter().flatten() {
             self.put(rec, x);
         }
@@ -2079,7 +2142,7 @@ impl Worker {
             self.put(rec, old.prev);
         }
         let (out, st) = made?;
-        self.learned_state.insert(s, LearnedState { last: tick, prev: st });
+        self.learned_state.insert(s, LearnedState { last: tick, model, prev: st });
         Ok(out)
     }
 

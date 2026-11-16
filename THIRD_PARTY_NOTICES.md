@@ -8,8 +8,6 @@ licenses, which take precedence for them.
 | Component | License | Notes |
 |---|---|---|
 | FFmpeg 7.1.5 libraries (avcodec, avformat, avfilter, avdevice, avutil, swresample, swscale) | LGPL-3.0-or-later | LGPL build by BtbN/FFmpeg-Builds (`n7.1.5-12-g1fdbca85aa`, win64-lgpl-shared-7.1), dynamically linked and replaceable. Source: https://github.com/FFmpeg/FFmpeg/tree/n7.1.5 , build scripts: https://github.com/BtbN/FFmpeg-Builds . Its license texts are in `licenses/ffmpeg-lgpl/`. |
-| `shaders/Builtin_Temporal_Denoiser.glsl` | LGPL-3.0-or-later | Copyright (c) 2022 an3223, (c) 2016 Clément Bœsch |
-| `shaders/upscale4x.glsl` | MIT | Copyright (c) 2019-2021 bloc97 (Anime4K) |
 | OpenColorIO 2.5.2 (`OpenColorIO_2_5.dll`) | BSD-3-Clause | Copyright Contributors to the OpenColorIO Project, https://github.com/AcademySoftwareFoundation/OpenColorIO . Built by `tools/build_ocio.ps1` with its bundled dependencies (yaml-cpp MIT, pystring BSD-3, Imath BSD-3, minizip-ng and zlib Zlib, expat MIT). Includes OCIO's built-in ACES studio config. License text in `licenses/opencolorio/`. |
 | Rust crates | MIT / Apache-2.0 / BSD / Zlib / MPL-2.0 (see `Cargo.lock`) | winit, egui, ash, gpu-allocator, cpal, ureq, zip, sha2 and others |
 

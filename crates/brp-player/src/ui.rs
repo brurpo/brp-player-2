@@ -134,7 +134,7 @@ pub struct UiState {
     /// Popups are separate glass windows (false: drawn inside the player window).
     pub detached: bool,
     pub fx_status: Vec<(u64, brp_render::EffectStatus)>,
-    fx_library: Vec<std::path::PathBuf>,
+    fx_library: Vec<crate::effects::LibraryFile>,
     /// Output devices, listed when Settings opens.
     audio_devices: Vec<String>,
     /// GPUs (name, dedicated), listed when Settings opens.
@@ -2606,12 +2606,6 @@ fn paint_redo_icon(p: &egui::Painter, c: Pos2, color: Color32) {
     paint_turn_arrow(p, c, color, true);
 }
 
-/// A small-caps group heading inside a menu.
-fn menu_heading(ui: &mut egui::Ui, text: &str, tip: &str) {
-    ui.add_space(2.0);
-    ui.label(RichText::new(text.to_uppercase()).size(10.5).strong().color(Color32::from_gray(150))).on_hover_text(tip);
-}
-
 /// A four-point sparkle with a small companion (marks AI effects).
 fn paint_sparkle(p: &egui::Painter, c: Pos2, color: Color32) {
     let star = |at: Pos2, a: f32, b: f32| {
@@ -2622,34 +2616,96 @@ fn paint_sparkle(p: &egui::Painter, c: Pos2, color: Color32) {
     star(c + vec2(4.5, -4.0), 2.5, 0.8);
 }
 
-/// The list "+ Add effect" opens inside the Effects window: AI effects, then shader
-/// effects, each group labelled; picking one adds it and closes the list.
+/// What an entry of the "Add effect" tree adds.
+enum FxPick {
+    Ai(crate::ai::AiKind),
+    File(std::path::PathBuf),
+}
+
+/// A folder of the "Add effect" tree: its name as shown, the folders in it, and the
+/// effects in it (indices into the list of entries).
+#[derive(Default)]
+struct FxFolder {
+    name: String,
+    folders: Vec<FxFolder>,
+    items: Vec<usize>,
+}
+
+impl FxFolder {
+    /// The folder at `path` below this one (names compared ignoring case), made if needed.
+    fn at(&mut self, path: &[String]) -> &mut FxFolder {
+        let Some((first, rest)) = path.split_first() else { return self };
+        let i = match self.folders.iter().position(|f| f.name.eq_ignore_ascii_case(first)) {
+            Some(i) => i,
+            None => {
+                self.folders.push(FxFolder { name: first.clone(), ..Default::default() });
+                self.folders.len() - 1
+            }
+        };
+        self.folders[i].at(rest)
+    }
+
+    /// Folders by name; at the top, the groups every install has first, in their order.
+    fn sort(&mut self, top: bool) {
+        let rank = |f: &FxFolder| if top { crate::effects::GROUPS.iter().position(|g| g.eq_ignore_ascii_case(&f.name)).unwrap_or(usize::MAX) } else { 0 };
+        self.folders.sort_by_key(|f| (rank(f), f.name.to_lowercase()));
+        for f in &mut self.folders {
+            f.sort(false);
+        }
+    }
+
+    /// The folders (folding, closed at first), then the effects of this one.
+    fn show(&self, ui: &mut egui::Ui, l: crate::i18n::Lang, top: bool, id: &str, entries: &[(String, FxPick)], unfolded: bool, picked: &mut Option<usize>) {
+        for f in &self.folders {
+            // The groups every install has are named in the interface's language.
+            let known = crate::effects::GROUPS.iter().find(|g| top && g.eq_ignore_ascii_case(&f.name));
+            let label = known.map_or_else(|| f.name.clone(), |g| l.t(&format!("fx_cat_{}", g.to_lowercase())).to_string());
+            let id = format!("{id}/{}", f.name.to_lowercase());
+            egui::CollapsingHeader::new(RichText::new(label).color(Color32::from_gray(225))).id_salt(("fx_add_folder", &id)).default_open(unfolded).show(ui, |ui| {
+                f.show(ui, l, false, &id, entries, unfolded, picked);
+            });
+        }
+        for &i in &self.items {
+            let (name, pick) = &entries[i];
+            let ai = matches!(pick, FxPick::Ai(_));
+            // Room in front of every name, so they line up; a sparkle there marks the AI effects.
+            let r = ui.add(egui::Button::selectable(false, format!("      {name}")).min_size(vec2(ui.available_width(), 0.0))).on_hover_text(l.t(if ai { "fx_ai_tip" } else { "fx_shader_tip" }));
+            if ai {
+                paint_sparkle(ui.painter(), pos2(r.rect.left() + 13.0, r.rect.center().y), ACCENT.lerp_to_gamma(Color32::WHITE, 0.35));
+            }
+            if r.clicked() {
+                *picked = Some(i);
+            }
+        }
+    }
+}
+
+/// The tree "+ Add effect" opens inside the Effects window. It mirrors the shader
+/// folders (next to the executable and the user's): a folder there is a folding entry
+/// here, to any depth, with its effects by name; files right in a shader folder come
+/// after the folders. AI effects sit in their groups (`effects::ai_group`) among the
+/// others, marked by a sparkle. Picking an effect adds it and closes the tree.
 fn add_effect_list(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions: &mut Vec<Action>) {
     let l = s.lang;
-    let mut ais: Vec<(String, crate::ai::AiKind)> = crate::ai::AiKind::ALL.into_iter().map(|k| (l.t(k.title_key()).to_string(), k)).collect();
-    ais.sort_by_key(|(n, _)| n.to_lowercase());
-    let mut shaders: Vec<(String, std::path::PathBuf)> = s.fx_library.iter().map(|f| (p.fx.title_of(f, l), f.clone())).collect();
-    shaders.sort_by_key(|(n, _)| n.to_lowercase());
-    let mut add: Option<std::path::PathBuf> = None;
-    let mut add_ai: Option<crate::ai::AiKind> = None;
+    // (name, what it adds) by name, then filed into the tree.
+    let mut filed: Vec<(Vec<String>, String, FxPick)> = crate::ai::AiKind::ALL.into_iter().map(|k| (vec![crate::effects::ai_group(k).to_string()], l.t(k.title_key()).to_string(), FxPick::Ai(k))).collect();
+    for f in &s.fx_library {
+        filed.push((f.folders.clone(), p.fx.title_of(&f.path, l), FxPick::File(f.path.clone())));
+    }
+    filed.sort_by_key(|(_, n, _)| n.to_lowercase());
+    let mut root = FxFolder::default();
+    let mut entries: Vec<(String, FxPick)> = Vec::new();
+    for (folders, name, pick) in filed {
+        root.at(&folders).items.push(entries.len());
+        entries.push((name, pick));
+    }
+    root.sort(true);
+    // BRP_TEST_FX_MENU=open: every folder unfolded (checking the layout).
+    let unfolded = std::env::var_os("BRP_TEST_FX_MENU").is_some_and(|v| v == "open");
+    let mut picked: Option<usize> = None;
     Frame::new().fill(Color32::from_black_alpha(70)).stroke(Stroke::new(1.0, Color32::from_white_alpha(18))).corner_radius(8.0).inner_margin(Margin::same(6)).show(ui, |ui| {
         egui::ScrollArea::vertical().max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
-            menu_heading(ui, l.t("fx_group_ai"), l.t("fx_ai_tip"));
-            for (name, k) in ais {
-                let r = ui.add(egui::Button::selectable(false, format!("      {name}")).min_size(vec2(ui.available_width(), 0.0))).on_hover_text(l.t("fx_ai_tip"));
-                // A sparkle in front of the name marks the AI effects.
-                paint_sparkle(ui.painter(), pos2(r.rect.left() + 13.0, r.rect.center().y), ACCENT.lerp_to_gamma(Color32::WHITE, 0.35));
-                if r.clicked() {
-                    add_ai = Some(k);
-                }
-            }
-            ui.add_space(4.0);
-            menu_heading(ui, l.t("fx_group_shaders"), l.t("fx_shader_tip"));
-            for (name, path) in shaders {
-                if ui.add(egui::Button::selectable(false, name).min_size(vec2(ui.available_width(), 0.0))).on_hover_text(l.t("fx_shader_tip")).clicked() {
-                    add = Some(path);
-                }
-            }
+            root.show(ui, l, true, "", &entries, unfolded, &mut picked);
             ui.separator();
             if ui.add(egui::Button::selectable(false, l.t("fx_browse")).min_size(vec2(ui.available_width(), 0.0))).clicked() {
                 actions.push(Action::FxBrowse);
@@ -2657,15 +2713,18 @@ fn add_effect_list(ui: &mut egui::Ui, p: &mut Player, s: &mut UiState, actions: 
             }
         });
     });
-    if let Some(path) = add {
-        if let Err(e) = p.fx.add(&path) {
-            log::error!("add effect: {e:#}");
+    match picked.map(|i| entries.swap_remove(i).1) {
+        Some(FxPick::File(path)) => {
+            if let Err(e) = p.fx.add(&path) {
+                log::error!("add effect: {e:#}");
+            }
+            s.fx_add_open = false;
         }
-        s.fx_add_open = false;
-    }
-    if let Some(k) = add_ai {
-        p.fx.add_ai(k);
-        s.fx_add_open = false;
+        Some(FxPick::Ai(k)) => {
+            p.fx.add_ai(k);
+            s.fx_add_open = false;
+        }
+        None => {}
     }
 }
 
@@ -2677,5 +2736,31 @@ impl UiState {
         }
         let lib = self.ocio.loaded()?;
         Some(crate::export::OcioJob { lib, choices: self.ocio.choices(), settings: self.settings.clone() })
+    }
+}
+
+#[cfg(test)]
+mod fx_tree_tests {
+    use super::*;
+
+    /// The "Add effect" tree is the folders: the groups every install has first, in
+    /// their order, then other folders by name; folders inside folders; names
+    /// compared ignoring case; files right in a shader folder at the top.
+    #[test]
+    fn folders_become_tree_entries() {
+        let files: [(&[&str], usize); 9] = [(&["My Looks", "Vintage"], 0), (&["Utility"], 1), (&["effects"], 2), (&["Effects"], 3), (&[], 4), (&["Restore"], 5), (&["my looks"], 6), (&["Archive"], 7), (&["Damage"], 8)];
+        let mut root = FxFolder::default();
+        for (folders, i) in files {
+            let path: Vec<String> = folders.iter().map(|f| f.to_string()).collect();
+            root.at(&path).items.push(i);
+        }
+        root.sort(true);
+        let names = |f: &FxFolder| f.folders.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&root), ["Restore", "Damage", "effects", "Utility", "Archive", "My Looks"]);
+        assert_eq!(root.items, [4]);
+        let looks = &root.folders[5];
+        assert_eq!((names(looks), looks.items.clone()), (vec!["Vintage".to_string()], vec![6]));
+        assert_eq!(looks.folders[0].items, [0]);
+        assert_eq!(root.folders[2].items, [2, 3]);
     }
 }

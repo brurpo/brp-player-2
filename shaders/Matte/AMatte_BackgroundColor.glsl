@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Background Color (AMatte)
 // @brp pt.title Cor de fundo (AMatte)
 // @brp pt.param ColorR Cor de fundo | Cor sólida posta atrás das áreas transparentes.
 //!PARAM ColorR

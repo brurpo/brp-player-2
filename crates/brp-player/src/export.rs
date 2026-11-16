@@ -1048,7 +1048,7 @@ fn detect_deint(src: &Source, mode: DeintMode, field_rate: bool, cancel: &Atomic
     // frame): decode the start of the file until it decides.
     let last = src.frame_count() - 1;
     let upto = last.min(125);
-    src.request(Request { frame: 0, playing: true, dir: 1, ahead: upto + 1, fill: false });
+    src.request(Request { frame: 0, playing: true, dir: 1, ahead: upto + 1, fill: false, range: (0, i64::MAX), looping: false });
     let t = Instant::now();
     while src.field_detection().1.is_none() && t.elapsed() < Duration::from_secs(20) && !cancel.load(Ordering::Relaxed) {
         if src.get(upto).is_some() {
@@ -1064,7 +1064,7 @@ fn detect_deint(src: &Source, mode: DeintMode, field_rate: bool, cancel: &Atomic
 
 /// The decoded frames `lo..=hi`, waiting for the decoder (exact frames only).
 fn frames(src: &Source, lo: i64, hi: i64, cancel: &AtomicBool) -> anyhow::Result<Vec<Arc<VideoFrame>>> {
-    src.request(Request { frame: lo, playing: true, dir: 1, ahead: hi - lo + 12, fill: false });
+    src.request(Request { frame: lo, playing: true, dir: 1, ahead: hi - lo + 12, fill: false, range: (0, i64::MAX), looping: false });
     let mut out = Vec::with_capacity((hi - lo + 1) as usize);
     for i in lo..=hi {
         let t = Instant::now();
@@ -1220,7 +1220,8 @@ fn plan(job: &ExportJob, src: &Source, deint: Option<SourceDeint>, gpu_name: &st
             } else {
                 Output::SdrVideo
             };
-            Some(crate::color::export_ocio(&o.lib, &o.choices, &o.settings, info, kind).map_err(crate::color::friendly)?)
+            // With effects the conversion is split at their working space (§7d).
+            Some(crate::color::export_ocio(&o.lib, &o.choices, &o.settings, info, kind, !job.stack.is_empty()).map_err(crate::color::friendly)?)
         }
         None => None,
     };
@@ -1604,6 +1605,8 @@ fn run(job: &ExportJob, ctx: &Arc<GpuContext>, progress: &Mutex<Progress>, cance
     let mut worker = Worker::default();
     // OpenColorIO's output transform on the GPU, when on.
     let ocio = p.ocio.as_ref().map(|o| brp_render::OcioCompute::new(ctx, &o.shader)).transpose()?;
+    // With effects: OCIO's input transform before the stack (DESIGN.md §7d).
+    let ocio_pre = p.ocio.as_ref().and_then(|o| o.pre.as_ref()).map(|s| brp_render::OcioCompute::new(ctx, s)).transpose()?;
     if let Some(o) = &p.ocio {
         log::info!("export: OCIO {}", o.label);
     }
@@ -1612,7 +1615,7 @@ fn run(job: &ExportJob, ctx: &Arc<GpuContext>, progress: &Mutex<Progress>, cance
     let first_tick = tm.first_tick;
     let sample_of = |i: i64| tm.sample(i);
     let span = |s: Sample| tm.span(s);
-    let job_for = |tick: i64, frames: Vec<Arc<VideoFrame>>| Job::new(stages.clone(), transfer, deint, tick, frames, last, src.info.color, ctx.clone());
+    let job_for = |tick: i64, frames: Vec<Arc<VideoFrame>>| Job::new(stages.clone(), transfer, deint, tick, frames, last, src.info.color, ctx.clone()).with_ocio(ocio_pre.clone());
 
     // Stateful shader effects: their history before the first picture, as after a
     // jump in the player.
@@ -2262,13 +2265,15 @@ fn verify_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) 
     let sequential = warm > 0 || stages.iter().any(|s| matches!(s, Stage::Ai { kind: AiKind::Matting | AiKind::Depth | AiKind::DenoiseAi, .. }));
     let tol = get("tolerance").and_then(|t| t.parse::<f64>().ok()).unwrap_or(1.5);
     let transfer = transfer_of(&src.info.color);
+    // OCIO split for effects: the player's picture is made from OCIO's linear light too.
+    let ocio_pre = p.ocio.as_ref().and_then(|o| o.pre.as_ref()).map(|s| brp_render::OcioCompute::new(&ctx, s)).transpose()?;
     let job_at = |s: Sample| -> anyhow::Result<Job> {
         let (lo, hi) = tm.span(s);
         let tick = match s {
             Sample::Tick(t) => t,
             Sample::Blend(t) | Sample::Motion { tau: t, .. } => t.floor() as i64,
         };
-        Ok(Job::new(stages.clone(), transfer, deint, tick, frames(&src, lo, hi, &never)?, last, src.info.color, ctx.clone()))
+        Ok(Job::new(stages.clone(), transfer, deint, tick, frames(&src, lo, hi, &never)?, last, src.info.color, ctx.clone()).with_ocio(ocio_pre.clone()))
     };
     let list: Vec<i64> = list.into_iter().filter(|&i| i >= 0 && i < p.total.min(n_out)).collect();
     let order: Vec<i64> = if sequential {
@@ -2313,7 +2318,15 @@ fn verify_inner(args: &[String], saved: &[ExportSettings], gpu: Option<String>) 
         // OCIO: the same conversion, on the CPU (checks the GPU's shader too).
         if let Some(o) = &p.ocio {
             let mut px: Vec<f32> = (0..n).flat_map(|k| [r.data[k], r.data[n + k], r.data[2 * n + k]]).collect();
+            // Split for effects: the picture is the file's own encoding of OCIO's
+            // linear light; the CPU half starts from that light.
+            if let Some(sc) = o.shader.from_source {
+                for c in px.chunks_exact_mut(3) {
+                    c.copy_from_slice(&sc.source_to_linear([c[0], c[1], c[2]]));
+                }
+            }
             o.cpu.apply(&mut px);
+
             for k in 0..n {
                 for c in 0..3 {
                     r.data[c * n + k] = px[k * 3 + c];

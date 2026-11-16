@@ -6,8 +6,8 @@ use brp_render::usershader::{self, Transfer};
 fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "old/shaders".into());
     let show = std::env::args().skip_while(|a| a != "--show").nth(1);
-    let mut files: Vec<_> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "glsl")).collect();
-    files.sort();
+    // Subfolders too (effects are grouped in folders).
+    let files = usershader::glsl_files(std::path::Path::new(&dir));
     let (mut ok, mut bad, mut passes_total) = (0, 0, 0);
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();

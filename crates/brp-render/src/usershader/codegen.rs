@@ -164,6 +164,8 @@ vec3 linearize(vec3 c) { return _brp_lin(c); }
 vec3 delinearize(vec3 c) { return _brp_delin(c); }
 ";
     }
+    // `_BRP_TRANSFER` is also read by shaders that must know the source's curve
+    // (shaders/Damage/Builtin_SensorNoise.glsl: sRGB decoding for SDR): keep the name and values.
     let t = match transfer {
         Transfer::Sdr => 0,
         Transfer::Pq => 1,

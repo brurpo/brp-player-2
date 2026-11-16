@@ -38,7 +38,7 @@ pub fn start(ctx: &Arc<GpuContext>) {
             // After the first pictures are up: start-up stays as fast as before.
             std::thread::sleep(Duration::from_millis(1000));
             let t = Instant::now();
-            let files = crate::effects::library();
+            let files: Vec<std::path::PathBuf> = crate::effects::library().into_iter().map(|f| f.path).collect();
             let fx_total = files.len() * TRANSFERS.len();
             set(0, fx_total);
             // (file, transfer) pairs on several threads (each has its own compiler),

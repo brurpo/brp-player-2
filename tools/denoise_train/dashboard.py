@@ -234,7 +234,7 @@ async function j(u,o){const r=await fetch(u,o);return r.json()}
 async function poll(){try{const runs=await j('/api/runs');const sel=$('run');
 if(!runs.length){$('main').innerHTML='<div class="empty wide">No runs yet. Start one with <code>python train.py --run D:/denoise_data/runs/&lt;name&gt;</code>.</div>';run=null;return}
 const names=runs.map(r=>r.name);if(sel.options.length!==names.length||[...sel.options].some((o,i)=>o.value!==names[i])){sel.innerHTML=names.map(n=>`<option>${n}</option>`).join('')}
-if(!run||!names.includes(run)){run=names[0];sel.value=run;M=[];V=[];mNext=0;vNext=0;layout()}
+if(!run||!names.includes(run)){run=names[0];sel.value=run;M=[];V=[];mNext=0;vNext=0;samples=[];real={rows:[],files:[]};layout()}
 const st=await j(`/api/run/${encodeURIComponent(run)}/status`);const state=st.paused_file&&st.state==='running'?'pausing':st.state||'—';
 $('state').textContent=state;$('state').className='badge '+(st.state||'');$('state').title=st.error||'';
 // A run whose status has not changed for 5 minutes while "running" has probably died.
@@ -247,7 +247,7 @@ const v=await j(`/api/run/${encodeURIComponent(run)}/val?from=${vNext}`);V=V.con
 const s=await j(`/api/run/${encodeURIComponent(run)}/samples`);const atEnd=+$('s_rng').value>=samples.length-1;if(s.length!==samples.length){samples=s;$('s_rng').max=Math.max(0,s.length-1);if(atEnd){$('s_rng').value=s.length-1;showSample(s.length-1)}}
 const rr=await j(`/api/run/${encodeURIComponent(run)}/realtest`);if(rr.files.length!==real.files.length){const atEnd=+$('r_rng').value>=real.files.length-1;real=rr;$('r_rng').max=Math.max(0,rr.files.length-1);if(atEnd){$('r_rng').value=rr.files.length-1;showReal(rr.files.length-1)}}
 draw()}catch(e){console.error(e)}}
-$('run').onchange=()=>{run=$('run').value;M=[];V=[];mNext=0;vNext=0;samples=[];layout();poll()};
+$('run').onchange=()=>{run=$('run').value;M=[];V=[];mNext=0;vNext=0;samples=[];real={rows:[],files:[]};layout();poll()};
 for(const a of['pause','resume','stop'])$(a).onclick=async()=>{if(!run)return;if(a==='stop'&&!confirm('Stop this run? It saves a checkpoint and exits; --resume continues it.'))return;await j(`/api/run/${encodeURIComponent(run)}/${a}`,{method:'POST'});poll()};
 window.onresize=()=>draw();layout();poll();setInterval(poll,4000);
 </script></body></html>"""

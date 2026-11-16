@@ -9,14 +9,12 @@ fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "shaders".into());
     let t = std::time::Instant::now();
     let mut files = Vec::new();
-    for e in std::fs::read_dir(&dir)?.flatten() {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("glsl")) {
-            let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            match brp_render::usershader::parse::parse(&name, &std::fs::read_to_string(&p)?) {
-                Ok(f) => files.push(f),
-                Err(e) => println!("{name}: {e:#}"),
-            }
+    // Subfolders too (effects are grouped in folders).
+    for p in brp_render::usershader::glsl_files(std::path::Path::new(&dir)) {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        match brp_render::usershader::parse::parse(&name, &std::fs::read_to_string(&p)?) {
+            Ok(f) => files.push(f),
+            Err(e) => println!("{name}: {e:#}"),
         }
     }
     let jobs: Vec<_> = files.iter().flat_map(|f| [Transfer::Sdr, Transfer::Pq, Transfer::Hlg, Transfer::Linear].map(|t| (f, t))).collect();

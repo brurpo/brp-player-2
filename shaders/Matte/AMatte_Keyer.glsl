@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Keyer (AMatte)
 // @brp pt.title Chroma key (AMatte)
 // @brp pt.param SplitView Tela dividida | Tela dividida para escolher a cor.
 // @brp pt.param DistanceOrDifference Tipo de keyer | 0 = Delta Keyer (rápido), 1 = IBK Keyer (usa a placa limpa gerada, mais pesado).

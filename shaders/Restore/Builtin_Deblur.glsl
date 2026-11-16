@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Deblur (Deconvolution)
 // @brp pt.title Remover desfoque
 // @brp pt.param Iterations Iterações | Número de iterações da deconvolução. Mais deixa mais nítido, porém mais lento.
 // @brp pt.param BlurRadius Raio do desfoque | Raio estimado do desfoque do vídeo, em pixels. O ajuste mais importante.

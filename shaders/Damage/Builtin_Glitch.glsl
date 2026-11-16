@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Glitch
 // @brp pt.title Glitch
 // @brp pt.param MasterIntensity Intensidade geral | Força geral de todos os efeitos de glitch juntos.
 // @brp pt.param Speed Velocidade | Velocidade geral das animações e da evolução do glitch.

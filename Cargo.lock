@@ -394,6 +394,7 @@ dependencies = [
  "ash",
  "ash-window",
  "brp-media",
+ "brp-ocio",
  "crossbeam-channel",
  "egui",
  "egui-ash-renderer",

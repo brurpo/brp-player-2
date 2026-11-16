@@ -49,6 +49,8 @@ pub struct OfflineEffects {
     deint: Option<Deinterlacer>,
     /// Deinterlacer runs recorded since `begin` (each uses its own slot).
     deint_runs: usize,
+    /// OpenColorIO's input transform for decoded frames (DESIGN.md §7d).
+    ocio_in: Option<std::sync::Arc<crate::ocio::OcioCompute>>,
 }
 
 /// Deinterlaced pictures one recording may hold: each run needs its own descriptor
@@ -65,7 +67,7 @@ impl OfflineEffects {
             )?;
             let props = ctx.instance.get_physical_device_properties(ctx.physical);
             let chain = EffectChain::new(&ctx.device, (*ctx.allocator).clone(), 1, props.limits.min_uniform_buffer_offset_alignment, ctx.pipeline_cache)?;
-            Ok(OfflineEffects { ctx, pool, cache: FrameCache::new(16), staging: Staging::new(), graveyard: Graveyard::default(), chain: Some(chain), frame_no: 0, deint: None, deint_runs: 0 })
+            Ok(OfflineEffects { ctx, pool, cache: FrameCache::new(16), staging: Staging::new(), graveyard: Graveyard::default(), chain: Some(chain), frame_no: 0, deint: None, deint_runs: 0, ocio_in: None })
         }
     }
 
@@ -91,6 +93,13 @@ impl OfflineEffects {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// OpenColorIO's input transform, run on decoded frames before the effects (the
+    /// chain then starts from its linear light; DESIGN.md §7d). None: the player's own
+    /// decoding.
+    pub fn set_ocio_input(&mut self, o: Option<std::sync::Arc<crate::ocio::OcioCompute>>) {
+        self.ocio_in = o;
     }
 
     pub fn reset_history(&mut self) {
@@ -159,6 +168,7 @@ impl OfflineEffects {
                     input: (frame.width(), frame.height()),
                     space,
                     want,
+                    ocio: self.ocio_in.as_deref(),
                 };
                 chain.run_merge(cb, 0, &cf)?.context("chain produced nothing")
             }
@@ -175,6 +185,7 @@ impl OfflineEffects {
                     input: (pic.w, pic.h),
                     space,
                     want,
+                    ocio: None,
                 };
                 chain.run_merge(cb, 0, &cf)?.context("chain produced nothing")
             }
@@ -200,6 +211,11 @@ impl OfflineEffects {
     /// Run the chain on `frame` (picture number `seq`) and read the output back.
     /// Also returns the GPU time of the submission.
     pub fn run(&mut self, frame: &VideoFrame, color: ColorInfo, seq: i64, target: (u32, u32)) -> Result<(Rgba, std::time::Duration)> {
+        self.run_to(frame, color, seq, target, Space::Source)
+    }
+
+    /// `run`, the output in colour space `want`.
+    pub fn run_to(&mut self, frame: &VideoFrame, color: ColorInfo, seq: i64, target: (u32, u32), want: Space) -> Result<(Rgba, std::time::Duration)> {
         let device = self.ctx.device.clone();
         let alloc = (*self.ctx.allocator).clone();
         self.frame_no += 1;
@@ -226,7 +242,8 @@ impl OfflineEffects {
                 target,
                 input: (frame.width(), frame.height()),
                 space: Space::Source,
-                want: Some(Space::Source),
+                want: Some(want),
+                ocio: self.ocio_in.as_deref(),
             };
             let out = chain.run(cb, 0, &cf)?.context("no active effect")?;
             let (w, h) = (out.w, out.h);

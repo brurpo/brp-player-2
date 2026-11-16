@@ -63,6 +63,7 @@ pub struct ShaderFile {
     pub warmup: Option<u32>,
     /// Translations (our extension, plain comments so mpv/libplacebo still accept the
     /// file; usually at the top, before the first `//!` line):
+    ///   `// @brp en.title Color Correction` (without it: the file's name)
     ///   `// @brp pt.title Correção de cor`
     ///   `// @brp pt.param STRENGTH Intensidade | Quanto o efeito age (cat: Geral)`
     /// The language is a code ("pt"); the description after `|` is optional.
@@ -424,21 +425,19 @@ mod tests {
 mod bundled {
     use super::*;
 
-    /// The shaders shipped in the repo's `shaders/` parse, name only parameters they
-    /// have, and give every parameter the panel shows a Portuguese label (the G and B
+    /// The shaders shipped in the repo's `shaders/` (in its group folders) parse, have
+    /// a name in both languages, name only parameters they have, and give every
+    /// parameter the panel shows a Portuguese label (the G and B
     /// of a colour are shown with its R).
     #[test]
     fn bundled_shaders_translated() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shaders");
         let mut n = 0;
-        for e in std::fs::read_dir(&dir).unwrap().flatten() {
-            let p = e.path();
-            if p.extension().is_none_or(|x| x != "glsl") {
-                continue;
-            }
+        for p in crate::usershader::glsl_files(&dir) {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let f = parse(&name, &std::fs::read_to_string(&p).unwrap()).unwrap();
             assert!(f.title("pt").is_some(), "{name}: no pt.title");
+            assert!(f.title("en").is_some_and(|t| !t.contains("Builtin")), "{name}: no en.title");
             for l in &f.l10n {
                 if let Some(pn) = &l.param {
                     assert!(f.params.iter().any(|q| &q.name == pn), "{name}: pt.param {pn} is not a parameter");

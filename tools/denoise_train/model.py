@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import flow_match
+
 
 def conv(cin, cout, k=3, stride=1):
     return nn.Conv2d(cin, cout, k, stride, k // 2)
@@ -31,7 +33,12 @@ class FlowLevel(nn.Module):
 
     def __init__(s, c=(16, 32, 16), k=5):
         super().__init__()
-        s.net = nn.Sequential(conv(4, c[0], k), nn.ReLU(), conv(c[0], c[1], k), nn.ReLU(), conv(c[1], c[2], k), nn.ReLU(), conv(c[2], 2, k))
+        # Any number of widths (three: the layers' names are those of older checkpoints).
+        layers, cin = [], 4
+        for w in c:
+            layers += [conv(cin, w, k), nn.ReLU()]
+            cin = w
+        s.net = nn.Sequential(*layers, conv(cin, 2, k))
 
     def forward(s, a, b_warped, flow):
         return flow + s.net(torch.cat([a, b_warped, flow], 1))
@@ -58,15 +65,29 @@ class Motion(nn.Module):
     1/`base` of the size and up to it in pixels of the full picture. Levels until the
     coarsest side is <= `min_side` px."""
 
-    def __init__(s, c=(16, 32, 16), k=5, min_side=32, iters=1, base=4):
+    def __init__(s, c=(16, 32, 16), k=5, min_side=32, iters=1, base=4, mix=False):
         super().__init__()
         s.level = FlowLevel(c, k)
+        # mix: the estimate from one noisy pair is noise-limited (0.85 px from the true
+        # motion on the classroom at 16 samples, median), and motion mostly changes
+        # slowly: the frame before's motion, carried over, is a far better guess on a
+        # camera move (0.18 px) and a wrong one where motion changes. A small network
+        # sees both guesses and what each makes of the neighbour, and gives per pixel
+        # the share of the prior (and a correction). Without a prior: the estimate.
+        s.mix = None
+        if mix:
+            s.mix = nn.Sequential(conv(5, 16), nn.ReLU(), conv(16, 32), nn.ReLU(), conv(32, 16), nn.ReLU(), conv(16, 3))
+            nn.init.zeros_(s.mix[-1].weight)
+            nn.init.zeros_(s.mix[-1].bias)
+            s.mix[-1].bias.data[0] = -2.0  # a share of 0.12 at the start
         # Pyramid levels are added until the coarsest side is <= min_side px; each level
         # refines the flow `iters` times (same weights).
         # base: the finest level's size, as a divisor of the picture (4 or 2).
         s.min_side, s.iters, s.base = min_side, iters, base
 
-    def forward(s, a, b):
+    def raw(s, a, b):
+        """The estimate at 1/base of the size, in that level's pixels, and the two
+        lumas at that level."""
         # Always in float32: the stage is tiny, and half precision costs flow accuracy.
         with torch.autocast("cuda", enabled=False):
             a, b = luma(a.float()), luma(b.float())
@@ -80,7 +101,22 @@ class Motion(nn.Module):
                     flow = F.interpolate(flow, size=la.shape[2:], mode="bilinear", align_corners=False) * 2.0
                 for _ in range(s.iters):
                     flow = s.level(la, warp(lb, flow), flow)
-            return F.interpolate(flow, scale_factor=s.base, mode="bilinear", align_corners=False) * float(s.base)
+            return flow, pa[0], pb[0]
+
+    def up(s, flow):
+        with torch.autocast("cuda", enabled=False):
+            return F.interpolate(flow.float(), scale_factor=s.base, mode="bilinear", align_corners=False) * float(s.base)
+
+    def mixed(s, flow, prior, valid, la, lb):
+        """The estimate `flow` and the `prior` (both at 1/base size) mixed per pixel;
+        valid (B, 1, 1, 1): 0 where there is no prior (then the estimate as it is)."""
+        with torch.autocast("cuda", enabled=False):
+            d = prior.float() - flow
+            o = s.mix(torch.cat([la, warp(lb, flow), warp(lb, prior.float()), d], 1))
+            return flow + (torch.sigmoid(o[:, :1]) * d + o[:, 1:]) * valid.float()
+
+    def forward(s, a, b):
+        return s.up(s.raw(a, b)[0])
 
 
 def mem_in(cin, cout):
@@ -126,6 +162,122 @@ class UNet(nn.Module):
         c = s.mid(s.d2(b))
         b = s.dec2(s.u2(c) + b)
         a = s.dec1(s.u1(b) + a)
+        y = F.pixel_shuffle(s.out(a), 2)
+        return (y, s.state(a).float().clamp(-1.0, 1.0)) if s.state is not None else y
+
+
+class LayerNorm2d(nn.Module):
+    """Normalisation over the channels of each pixel (nothing spatial: the same at any
+    picture size)."""
+
+    def __init__(s, c, eps=1e-6):
+        super().__init__()
+        s.weight, s.bias, s.eps = nn.Parameter(torch.ones(1, c, 1, 1)), nn.Parameter(torch.zeros(1, c, 1, 1)), eps
+
+    def forward(s, x):
+        x = x.float()
+        mu = x.mean(1, keepdim=True)
+        return (x - mu) / ((x - mu).pow(2).mean(1, keepdim=True) + s.eps).sqrt() * s.weight + s.bias
+
+
+class ResBlock(nn.Module):
+    """x + conv(relu(conv(x))): the plain design with a skip, so that many blocks train
+    (the second convolution starts at zero: the block starts as nothing)."""
+
+    def __init__(s, c):
+        super().__init__()
+        s.a, s.b = conv(c, c), conv(c, c)
+        nn.init.zeros_(s.b.weight)
+        nn.init.zeros_(s.b.bias)
+
+    def forward(s, x):
+        return x + s.b(F.relu(s.a(x)))
+
+
+class NAFBlock(nn.Module):
+    """NAFNet's block without its global channel attention (that one depends on the
+    picture size): normalise, widen 1x1, depthwise 3x3, gate (one half times the
+    other), 1x1; then normalise, widen, gate, 1x1. Both parts added with a learned
+    scale starting at zero."""
+
+    def __init__(s, c):
+        super().__init__()
+        s.n1, s.n2 = LayerNorm2d(c), LayerNorm2d(c)
+        s.c1, s.dw, s.c2 = nn.Conv2d(c, 2 * c, 1), nn.Conv2d(2 * c, 2 * c, 3, 1, 1, groups=2 * c), nn.Conv2d(c, c, 1)
+        s.c3, s.c4 = nn.Conv2d(c, 2 * c, 1), nn.Conv2d(c, c, 1)
+        s.beta, s.gamma = nn.Parameter(torch.zeros(1, c, 1, 1)), nn.Parameter(torch.zeros(1, c, 1, 1))
+
+    def forward(s, x):
+        a, b = s.dw(s.c1(s.n1(x))).chunk(2, 1)
+        y = x + s.c2(a * b) * s.beta
+        a, b = s.c3(s.n2(y)).chunk(2, 1)
+        return y + s.c4(a * b) * s.gamma
+
+
+class TrBlock(nn.Module):
+    """Restormer's transformer block: attention between CHANNELS, computed over the
+    whole picture (each channel's map against each other's: cost linear in the picture
+    size), then a gated depthwise feed-forward. Heads of about 48 channels."""
+
+    def __init__(s, c, ffn=2.66):
+        super().__init__()
+        s.heads = 1 << max(0, (c // 48).bit_length() - 1)  # 48: 1, 96: 2, 192: 4, 384: 8 (64: 1, 128: 2, ...)
+        s.n1, s.n2 = LayerNorm2d(c), LayerNorm2d(c)
+        s.temp = nn.Parameter(torch.ones(s.heads, 1, 1))
+        s.qkv, s.qkv_dw, s.proj = nn.Conv2d(c, 3 * c, 1, bias=False), nn.Conv2d(3 * c, 3 * c, 3, 1, 1, groups=3 * c, bias=False), nn.Conv2d(c, c, 1, bias=False)
+        h = int(c * ffn)
+        s.f1, s.f_dw, s.f2 = nn.Conv2d(c, 2 * h, 1, bias=False), nn.Conv2d(2 * h, 2 * h, 3, 1, 1, groups=2 * h, bias=False), nn.Conv2d(h, c, 1, bias=False)
+
+    def forward(s, x):
+        B, C, H, W = x.shape
+        q, k, v = s.qkv_dw(s.qkv(s.n1(x))).chunk(3, 1)
+        sh = lambda t: t.reshape(B, s.heads, C // s.heads, H * W)
+        q, k, v = F.normalize(sh(q).float(), dim=-1), F.normalize(sh(k).float(), dim=-1), sh(v).float()
+        a = ((q @ k.transpose(-2, -1)) * s.temp).softmax(-1)
+        x = x + s.proj((a @ v).reshape(B, C, H, W))
+        a, b = s.f_dw(s.f1(s.n2(x))).chunk(2, 1)
+        return x + s.f2(F.gelu(a) * b)
+
+
+BLOCKS = {"res": ResBlock, "naf": NAFBlock, "tr": TrBlock}
+
+
+class UNet2(nn.Module):
+    """The merge with residual / NAFNet / transformer blocks (`block`), for the quality
+    model. As UNet: full-size inputs unshuffled to 1/2, one level per width (1/2, 1/4,
+    1/8, ...), `n` blocks per level in the encoder and again in the decoder, the levels
+    joined by addition; the memory (`state`) read beside the first convolution and
+    written from the last features. The output starts at zero."""
+
+    def __init__(s, cin, w, n, block="res", state=0):
+        super().__init__()
+        # One kind of block for every level, or one per level ("res,res,tr,tr").
+        kinds = block.split(",") if "," in block else [block] * len(w)
+        assert len(kinds) == len(w), (block, w)
+        stack = lambda c, k, i=0: nn.Sequential(*[BLOCKS[kinds[i]](c) for _ in range(k)])
+        s.inp = conv(cin * 4, w[0])
+        s.inp_h = mem_in(state, w[0]) if state else None
+        s.state = conv(w[0], state) if state else None
+        s.enc = nn.ModuleList([stack(c, k, i) for i, (c, k) in enumerate(zip(w, n))])
+        s.down = nn.ModuleList([nn.Conv2d(w[i], w[i + 1], 2, 2) for i in range(len(w) - 1)])
+        s.up = nn.ModuleList([nn.Sequential(nn.Conv2d(w[i + 1], w[i] * 4, 1), nn.PixelShuffle(2)) for i in range(len(w) - 1)])
+        s.dec = nn.ModuleList([stack(w[i], n[i], i) for i in range(len(w) - 1)])
+        s.out = conv(w[0], 3 * 4)
+        nn.init.zeros_(s.out.weight)
+        nn.init.zeros_(s.out.bias)
+
+    def forward(s, x, h=None):
+        a = s.inp(F.pixel_unshuffle(x, 2))
+        if s.state is not None:
+            a = a + s.inp_h(h.to(a.dtype))
+        skips = []
+        for i, e in enumerate(s.enc):
+            a = e(a)
+            if i < len(s.down):
+                skips.append(a)
+                a = s.down[i](a)
+        for i in reversed(range(len(s.dec))):
+            a = s.dec[i](s.up[i](a) + skips[i])
         y = F.pixel_shuffle(s.out(a), 2)
         return (y, s.state(a).float().clamp(-1.0, 1.0)) if s.state is not None else y
 
@@ -188,6 +340,19 @@ def mismatch(cur, w):
     return torch.cat(out, 1) * 8.0
 
 
+def mismatch_many(cur, ws):
+    """`mismatch(cur, w)` for each w of `ws` (same shapes), in one pass: the frame's
+    block means once, the pictures as one batch. The same numbers."""
+    n, B = len(ws), cur.shape[0]
+    allw = torch.cat([w.float() for w in ws], 0)
+    out = []
+    for k in (4, 16):
+        d = (F.avg_pool2d(cur.float(), k).repeat(n, 1, 1, 1) - F.avg_pool2d(allw, k)).abs().mean(1, keepdim=True)
+        out.append(F.interpolate(d, size=cur.shape[2:], mode="bilinear", align_corners=False))
+    m = torch.cat(out, 1) * 8.0
+    return [m[i * B : (i + 1) * B] for i in range(n)]
+
+
 class NoiseEstimator(nn.Module):
     """The noise-strength map predicted from the frame and its two aligned neighbours
     (CBDNet-style): what differs between them over time is noise, what they share is
@@ -220,9 +385,13 @@ class NoiseEstimator(nn.Module):
 
 
 class StableDenoiser(nn.Module):
-    def __init__(s, w=(32, 64, 128), n=(2, 3, 6), motion=(16, 32, 16), motion_k=5, motion_min=32, motion_iters=1, fuse=0, fuse_mode="blend", keep_cur=False, motion_base=4, mismatch=False, state=0, acc=False):
+    def __init__(s, w=(32, 64, 128), n=(2, 3, 6), motion=(16, 32, 16), motion_k=5, motion_min=32, motion_iters=1, fuse=0, fuse_mode="blend", keep_cur=False, motion_base=4, mismatch=False, state=0, acc=False, flow_mix=False, arch="plain"):
         super().__init__()
-        s.motion = Motion(motion, motion_k, motion_min, motion_iters, motion_base)
+        s.motion = Motion(motion, motion_k, motion_min, motion_iters, motion_base, mix=flow_mix)
+        s.last_fstate = None
+        s.flow_override = None
+        s.flow_match = False  # the motion corrected against the previous result (flow_match.py)
+        s.dis_flow = None  # "clean" / "noisy": train.sequence hands in DIS motion (study)
         # The pre-merge (width `fuse`; 0: none, as in models before it existed).
         # mismatch: the merge also gets the mismatch maps of the three aligned pictures
         # (6 channels, after everything else, so older weights load with them at zero).
@@ -249,7 +418,7 @@ class StableDenoiser(nn.Module):
         # output and dropped with it (clip start, jump, cut), read by the pre-merge and
         # the merge. The previous output alone carries only what was drawn; this
         # carries what the merge chooses to keep (how far to trust the history, say).
-        s.unet = UNet((19 if s.keep_cur else 16) + mm, w, n, state=state)
+        s.unet = UNet((19 if s.keep_cur else 16) + mm, w, n, state=state) if arch == "plain" else UNet2((19 if s.keep_cur else 16) + mm, w, n, arch, state=state)
         s.last_state = s._last_out = None
         s.estimator = NoiseEstimator()
         # How the neighbours are moved onto the frame (not a weight: any checkpoint).
@@ -268,17 +437,83 @@ class StableDenoiser(nn.Module):
         # under it, for the cuts it would half-believe.
         s.cut_thr = 0.0
         s.last_cut = None
+        # flow_prev (config; the motion stage must be trained for it): the motion
+        # towards the frame before is estimated against the previous OUTPUT, not the
+        # noisy frame before. The history is what gets moved, so this lines the history
+        # itself up with the new frame: errors in where it sits are corrected at every
+        # frame instead of adding up along a chain of frame-to-frame estimates (the
+        # clean frame carried 4 frames along the chain matches at 34.5 dB on the
+        # classroom, below the output's own 37.7), and one of the two pictures is
+        # clean. Where there is no previous output: the frame before, as always.
+        s.flow_prev = False
 
-    def forward(s, cur, before, after, valid, prev_out, prev_valid, strength, state=None, acc=None):
+    def flows(s, cur, nb, after, valid, prev_valid, fstate=None, gap=1.0, raw=None):
+        """The motion towards the frame before (`nb`) and after, at full size, and the
+        flow state for the next frame (None without the mix).
+
+        With the mix (Motion.mix): fstate is the previous frame's motion towards THIS
+        frame (its `after` motion, at 1/base size, on its own grid). Read where each
+        pixel came from and negated, it is this frame's motion towards the frame
+        before: the prior for it. The prior for the motion towards the frame after is
+        minus the motion towards the frame before (motion going on as it was).
+
+        raw: the two estimates worked out beforehand, (towards before, luma, the
+        frame before's luma, towards after, the frame after's luma) as Motion.raw
+        gives them: training runs Motion.raw once for a whole clip (train.sequence),
+        many frames in one call, instead of twice per frame."""
+        mo = s.motion
+        if mo.mix is None:
+            return mo(cur, nb), mo(cur, after), None
+        if raw is None:
+            fb0, la, lb = mo.raw(cur, nb)
+        else:
+            fb0, la, lb, fa0_, lb2_ = raw
+        if fstate is None:
+            fb = fb0
+        else:
+            pv = prev_valid if prev_valid.shape[-1] == 1 else prev_valid.float().amax((1, 2, 3), keepdim=True)
+            # gap: `nb` is this many frames back (the player, when playback skipped
+            # frames: the last picture made). The flow state is the motion over ONE
+            # frame, so the prior is that many times it.
+            fb = mo.mixed(fb0, -gap * warp(fstate.float(), fb0), (pv > 0).float() * (valid[:, 0:1] > 0).float(), la, lb)
+        if raw is None:
+            fa0, la, lb = mo.raw(cur, after)
+        else:
+            fa0, lb = fa0_, lb2_
+        fa = mo.mixed(fa0, -fb / gap, (valid[:, 0:1] > 0).float() * (valid[:, 1:2] > 0).float(), la, lb)
+        return mo.up(fb), mo.up(fa), fa
+
+    def forward(s, cur, before, after, valid, prev_out, prev_valid, strength, state=None, acc=None, fstate=None, gap=1.0, raw=None):
         """state: the memory returned by the previous step (`last_state`), for models
         that have one. Left out when not training: the one kept from the last call is
         used if `prev_out` is that call's output (so code that only feeds the previous
         output back runs these models unchanged), else none."""
         H, W = cur.shape[2:]
-        fb = s.motion(cur, before)
-        fa = s.motion(cur, after)
+        nb = before
+        if s.flow_prev:
+            nb = torch.where(prev_valid > 0, prev_out.detach().to(before.dtype), before)
+        if fstate is None and not s.training and s._last_out is not None and s._last_out.shape == prev_out.shape and (prev_out is s._last_out or torch.equal(prev_out, s._last_out)):
+            fstate = s.last_fstate  # as for the memory below: code that only feeds the output back
+        if getattr(s, "flow_override", None) is not None:
+            # A study switch (train.py --dis-flow): the motion handed in from outside.
+            (fb, fa), s.last_fstate = s.flow_override, None
+        else:
+            fb, fa, s.last_fstate = s.flows(cur, nb, after, valid, prev_valid, fstate, gap, None if s.flow_prev else raw)
+        if s.flow_match:
+            # The estimate cannot see faint detail under heavy noise and takes the
+            # motion of the surroundings there; the previous result is clean and at
+            # the frame before's time, so the noisy frame is matched against it
+            # (flow_match.py; no learned part, no gradient).
+            pm = prev_valid if prev_valid.shape[-1] == 1 else prev_valid.float().amax((1, 2, 3), keepdim=True)
+            with torch.no_grad():
+                fix = flow_match.correction(fb.detach(), cur, prev_out.detach(), warp, base=s.motion.base) * ((pm > 0) & (valid[:, 0:1] > 0)).float()
+            fb = fb.float() + fix
         s.last_flows = (fb, fa)  # for the motion loss and checks
-        wb, wa = warp(before, fb, s.warp_mode), warp(after, fa, s.warp_mode)
+        if before.dtype == after.dtype and fb.dtype == fa.dtype:
+            # Both neighbours in one warp (the same numbers, half the operations).
+            wb, wa = warp(torch.cat([before, after], 0), torch.cat([fb, fa], 0), s.warp_mode).chunk(2, 0)
+        else:
+            wb, wa = warp(before, fb, s.warp_mode), warp(after, fa, s.warp_mode)
         # The previous output lines up with t-1: moved along the same motion.
         wp = warp(prev_out, fb, s.warp_mode)
         if s.cut_thr > 0:
@@ -310,16 +545,26 @@ class StableDenoiser(nn.Module):
             # there is no previous frame.
             pv = prev_valid if prev_valid.shape[-1] == 1 else F.avg_pool2d(prev_valid.float(), 2)
             h = warp(state.float(), F.avg_pool2d(fb, 2) * 0.5) * pv
-        mm = [torch.cat([mismatch(cur, wb), mismatch(cur, wa), mismatch(cur, wp)], 1).to(x.dtype)] if s.mismatch else []
+        wacc = av = macc = None
+        if s.fuse is not None and s.acc:
+            # The accumulated picture, moved like the previous output; none at a
+            # start or after a cut.
+            av = prev_valid * (0.0 if acc is None else 1.0)
+            wacc = warp(acc.float(), fb, s.warp_mode) * av if acc is not None else torch.zeros_like(cur)
+        if s.mismatch:
+            # The mismatch maps of all the aligned pictures in one go.
+            mall = mismatch_many(cur, [wb, wa, wp] + ([wacc] if wacc is not None else []))
+            mm = [torch.cat(mall[:3], 1).to(x.dtype)]
+            macc = mall[3] if wacc is not None else None
+        else:
+            mm = []
         if s.fuse is not None:
             # The frames merged over time first; the U-Net then works on that picture.
             mask = torch.cat([ones, valid[:, 0:1] * ones, valid[:, 1:2] * ones, prev_valid * ones], 1)
             if s.acc:
-                # The accumulated picture, moved like the previous output; none at a
-                # start or after a cut.
-                av = prev_valid * (0.0 if acc is None else 1.0)
-                wacc = warp(acc.float(), fb, s.warp_mode) * av if acc is not None else torch.zeros_like(cur)
-                fx = torch.cat([x] + mm + [wacc.to(x.dtype), mismatch(cur, wacc).to(x.dtype)], 1)
+                if macc is None:
+                    macc = mismatch(cur, wacc)
+                fx = torch.cat([x] + mm + [wacc.to(x.dtype), macc.to(x.dtype)], 1)
                 base, w = s.fuse(fx, (cur, wb, wa, wp, wacc), torch.cat([mask, av * ones], 1), h)
                 # Its next value: the same mix without the previous output.
                 den = (w[:, 0:1] + w[:, 1:2] + w[:, 2:3] + w[:, 4:5]).clamp_min(1e-4)
@@ -348,8 +593,10 @@ def build_model(cfg):
     """The model of a run's config.json (older runs lack the motion settings)."""
     t = lambda v: tuple(int(x) for x in v.split(","))
     m = StableDenoiser(w=t(cfg["width"]), n=t(cfg["blocks"]), motion=t(cfg.get("motion_w") or "16,32,16"), motion_k=cfg["motion_k"],
-                       motion_min=cfg.get("motion_min") or 32, motion_iters=cfg.get("motion_iters") or 1, fuse=cfg.get("fuse") or 0, fuse_mode=cfg.get("fuse_mode") or "residual", keep_cur=cfg.get("keep_cur") or False, motion_base=cfg.get("motion_base") or 4, mismatch=cfg.get("mismatch") or False, state=cfg.get("state") or 0, acc=cfg.get("acc") or False)
+                       motion_min=cfg.get("motion_min") or 32, motion_iters=cfg.get("motion_iters") or 1, fuse=cfg.get("fuse") or 0, fuse_mode=cfg.get("fuse_mode") or "residual", keep_cur=cfg.get("keep_cur") or False, motion_base=cfg.get("motion_base") or 4, mismatch=cfg.get("mismatch") or False, state=cfg.get("state") or 0, acc=cfg.get("acc") or False, flow_mix=cfg.get("flow_mix") or False, arch=cfg.get("arch") or "plain")
     m.warp_mode = cfg.get("warp", "bilinear")
+    m.flow_prev = bool(cfg.get("flow_prev"))
+    m.flow_match = bool(cfg.get("flow_match"))
     m.use_estimator = cfg.get("map") == "learned"
     return m
 

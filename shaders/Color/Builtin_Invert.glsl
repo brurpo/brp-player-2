@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Invert
 // @brp pt.title Inverter
 // @brp pt.param intensity Intensidade | Quanto inverter (0 = original, 1 = totalmente invertido).
 //!PARAM intensity

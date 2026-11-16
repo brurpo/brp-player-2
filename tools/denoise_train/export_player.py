@@ -8,7 +8,9 @@ player's own Vulkan runner, and `config.txt` (the settings that are not weights)
 - flow:  one refinement of the motion stage (the same weights at every pyramid level).
          Input `x` = [frame luma, moved neighbour luma, flow x, flow y]; output `out` =
          the correction to the flow.
-- fuse:  the pre-merge (with a memory it also reads `h`, as `unet` does). Input `x` =
+- fuse:  the pre-merge (with a memory it also reads `h`, as `unet` does; with the
+         accumulated picture, config `acc`, `x` has 27 channels: the 22, that picture
+         and its two mismatch maps, and `out` has 5 weight maps). Input `x` =
          22 channels at full size (frame, the two moved
          neighbours, the moved previous output, 4 flags, 6 mismatch maps); output
          `out` = 4 weight maps before the softmax.
@@ -27,7 +29,7 @@ import json, os, struct, sys
 import numpy as np
 import torch
 
-from model import build_model
+from model import ResBlock, UNet2, build_model
 
 
 class Graph:
@@ -40,12 +42,12 @@ class Graph:
             s.blobs.append(b)
         s.lines.append(f"{ty:<16} {name:<12} {len(ins)} {len(outs)} {' '.join(ins + outs)} {params}".rstrip())
 
-    def conv(s, name, src, dst, weight, bias, stride=1, relu=False):
+    def conv(s, name, src, dst, weight, bias, stride=1, relu=False, pad=None):
         w = weight.detach().float().cpu().numpy()
         b = bias.detach().float().cpu().numpy()
         oc, ic, kh, kw = w.shape
         assert kh == kw
-        p = f"0={oc} 1={kw} 3={stride} 4={kw // 2} 5=1 6={w.size}" + (" 9=1" if relu else "")
+        p = f"0={oc} 1={kw} 3={stride} 4={kw // 2 if pad is None else pad} 5=1 6={w.size}" + (" 9=1" if relu else "")
         s.add("Convolution", name, [src], [dst], p)
         s.bin += struct.pack("<I", 0) + w.astype("<f4").tobytes() + b.astype("<f4").tobytes()
 
@@ -62,6 +64,38 @@ class Graph:
             f.write("7767517\n%d %d\n%s\n" % (len(s.lines), len(s.blobs), "\n".join(s.lines)))
         with open(path + ".bin", "wb") as f:
             f.write(bytes(s.bin))
+
+
+def unet2(g, u, first, src):
+    """model.UNet2 with residual blocks, from its first convolution (`first`, over the
+    reordered input and the memory; no ReLU after it) to its last features."""
+    def stack(prefix, x, blocks):
+        for i, blk in enumerate(blocks):
+            assert isinstance(blk, ResBlock), type(blk)  # the other blocks are not written yet
+            n = f"{prefix}{i}"
+            g.add("Split", n + "s", [x], [n + "x", n + "k"])
+            g.conv(n + "a", n + "x", n + "a", blk.a.weight, blk.a.bias, relu=True)
+            g.conv(n + "b", n + "a", n + "b", blk.b.weight, blk.b.bias)
+            g.add("BinaryOp", n + "+", [n + "b", n + "k"], [n], "0=0")
+            x = n
+        return x
+
+    g.conv("inp", src, "inp", first.weight, first.bias)
+    a, skips = "inp", []
+    for i, e in enumerate(u.enc):
+        a = stack(f"e{i}_", a, e)
+        if i < len(u.down):
+            g.add("Split", f"sk{i}", [a], [f"sk{i}a", f"sk{i}b"])
+            skips.append(f"sk{i}b")
+            d = u.down[i]
+            g.conv(f"dn{i}", f"sk{i}a", f"dn{i}", d.weight, d.bias, stride=2, pad=0)
+            a = f"dn{i}"
+    for i in reversed(range(len(u.dec))):
+        g.conv(f"up{i}", a, f"up{i}", u.up[i][0].weight, u.up[i][0].bias)
+        g.add("PixelShuffle", f"up{i}s", [f"up{i}"], [f"up{i}s"], "0=2")
+        g.add("BinaryOp", f"up{i}+", [f"up{i}s", skips[i]], [f"j{i}"], "0=0")
+        a = stack(f"d{i}_", f"j{i}", u.dec[i])
+    return a
 
 
 def convs_of(seq):
@@ -86,6 +120,15 @@ def export(run, ckpt, out):
     g.lines[-1] = g.lines[-1].replace(g.blobs[-1], "out")
     g.blobs[-1] = "out"
     g.write(os.path.join(out, "flow"))
+    if m.motion.mix is not None:
+        # The motion mix: [luma, neighbour moved by the estimate, by the prior, prior -
+        # estimate (2)] -> [share logit, correction (2)].
+        g = Graph()
+        g.add("Input", "x", [], ["x"])
+        g.seq("m", "x", convs_of(m.motion.mix), last_relu=False)
+        g.lines[-1] = g.lines[-1].replace(g.blobs[-1], "out")
+        g.blobs[-1] = "out"
+        g.write(os.path.join(out, "mix"))
 
     u = m.unet
     mem = u.state.out_channels if u.state is not None else 0
@@ -110,12 +153,13 @@ def export(run, ckpt, out):
     # previous output, 4 flags, 6 mismatch maps) then base (3). The model's order is
     # base, x[3:16], frame, mismatch maps.
     order = list(range(16, 19)) + list(range(3, 16)) + list(range(19, 25)) + [0, 1, 2]
-    w0 = u.inp[0].weight.detach()
+    inp = u.inp if isinstance(u, UNet2) else u.inp[0]
+    w0 = inp.weight.detach()
     idx = torch.tensor([c * 4 + k for c in order for k in range(4)])
     assert w0.shape[1] == 100, w0.shape
     first = torch.nn.Conv2d(100 + mem, w0.shape[0], 3, 1, 1)
     # The memory's convolution beside the first one = one convolution over both.
-    first.weight.data, first.bias.data = torch.cat([w0[:, idx]] + ([u.inp_h.weight.detach()] if mem else []), 1).clone(), u.inp[0].bias.detach().clone()
+    first.weight.data, first.bias.data = torch.cat([w0[:, idx]] + ([u.inp_h.weight.detach()] if mem else []), 1).clone(), inp.bias.detach().clone()
     g = Graph()
     g.add("Input", "x", [], ["x"])
     g.add("Input", "base", [], ["base"])
@@ -128,19 +172,22 @@ def export(run, ckpt, out):
     if mem:
         g.add("Concat", "cat_h", ["xu", "h"], ["xh"], "0=0")
         src = "xh"
-    a = g.seq("e1_", src, [(first, 1)] + convs_of(u.e1))
-    g.add("Split", "a_s", [a], ["a_a", "a_b"])
-    b = g.seq("e2_", "a_a", convs_of(u.d1) + convs_of(u.e2))
-    g.add("Split", "b_s", [b], ["b_a", "b_b"])
-    c = g.seq("mid_", "b_a", convs_of(u.d2) + convs_of(u.mid))
-    g.conv("u2", c, "u2", u.u2[0].weight, u.u2[0].bias)
-    g.add("PixelShuffle", "u2s", ["u2"], ["u2s"], "0=2")
-    g.add("BinaryOp", "add2", ["u2s", "b_b"], ["s2"], "0=0")
-    b = g.seq("dec2_", "s2", convs_of(u.dec2))
-    g.conv("u1", b, "u1", u.u1[0].weight, u.u1[0].bias)
-    g.add("PixelShuffle", "u1s", ["u1"], ["u1s"], "0=2")
-    g.add("BinaryOp", "add1", ["u1s", "a_b"], ["s1"], "0=0")
-    a = g.seq("dec1_", "s1", convs_of(u.dec1))
+    if isinstance(u, UNet2):
+        a = unet2(g, u, first, src)
+    else:
+        a = g.seq("e1_", src, [(first, 1)] + convs_of(u.e1))
+        g.add("Split", "a_s", [a], ["a_a", "a_b"])
+        b = g.seq("e2_", "a_a", convs_of(u.d1) + convs_of(u.e2))
+        g.add("Split", "b_s", [b], ["b_a", "b_b"])
+        c = g.seq("mid_", "b_a", convs_of(u.d2) + convs_of(u.mid))
+        g.conv("u2", c, "u2", u.u2[0].weight, u.u2[0].bias)
+        g.add("PixelShuffle", "u2s", ["u2"], ["u2s"], "0=2")
+        g.add("BinaryOp", "add2", ["u2s", "b_b"], ["s2"], "0=0")
+        b = g.seq("dec2_", "s2", convs_of(u.dec2))
+        g.conv("u1", b, "u1", u.u1[0].weight, u.u1[0].bias)
+        g.add("PixelShuffle", "u1s", ["u1"], ["u1s"], "0=2")
+        g.add("BinaryOp", "add1", ["u1s", "a_b"], ["s1"], "0=0")
+        a = g.seq("dec1_", "s1", convs_of(u.dec1))
     if mem:
         g.add("Split", "last_s", [a], ["last_a", "last_b"])
         g.conv("state", "last_b", "state", u.state.weight, u.state.bias)
@@ -151,7 +198,7 @@ def export(run, ckpt, out):
     g.write(os.path.join(out, "unet"))
 
     with open(os.path.join(out, "config.txt"), "w", newline="\n") as f:
-        f.write(f"motion_min {m.motion.min_side}\nmotion_iters {m.motion.iters}\nmotion_base {m.motion.base}\ncut_thr 0.026\nstate {mem}\n")
+        f.write(f"motion_min {m.motion.min_side}\nmotion_iters {m.motion.iters}\nmotion_base {m.motion.base}\ncut_thr 0.026\nstate {mem}\nacc {int(m.acc)}\nflow_prev {int(bool(getattr(m, 'flow_prev', False)))}\nflow_mix {int(m.motion.mix is not None)}\nflow_match {int(bool(getattr(m, 'flow_match', False)))}\n")
         f.write(f"source {os.path.basename(os.path.normpath(run))}/{ckpt} step {ck['step']}\n")
     print(f"{run} {ckpt} (step {ck['step']}) -> {out}")
     for n in ("flow", "fuse", "unet"):

@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Glow
 // @brp pt.title Brilho
 // @brp pt.param Strength Intensidade | Tamanho do desfoque.
 // @brp pt.param Radius Raio | Raio do desfoque.

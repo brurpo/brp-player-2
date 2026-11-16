@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         // As ref_dump.py: the first frame has no picture before and no state.
         let before = if i > 0 { Some(&frames[i - 1]) } else { None };
         let after = frames.get(i + 1);
-        let (out, st) = dn.record(&mut rec, &frames[i], before, after, state.as_ref(), true, 1.0, true)?;
+        let (out, st) = dn.record(&mut rec, &frames[i], before, after, state.as_ref(), true, 1.0, true, 1.0)?;
         rec.submit_wait()?;
         state = Some(st);
         let got = out.to_image(&compute)?;
@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         let mut times = Vec::new();
         for _ in 0..runs {
             let mut rec = Recorder::new(&compute)?;
-            let (out, st) = dn.record(&mut rec, &big[1 % big.len()], Some(&big[0]), big.get(2), state.as_ref(), true, 1.0, true)?;
+            let (out, st) = dn.record(&mut rec, &big[1 % big.len()], Some(&big[0]), big.get(2), state.as_ref(), true, 1.0, true, 1.0)?;
             times.push(rec.submit_wait()?.as_secs_f64() * 1e3);
             if let Some(old) = state.replace(st) {
                 ops.pool.put(old.buf);

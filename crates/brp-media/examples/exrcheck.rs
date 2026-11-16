@@ -38,7 +38,7 @@ fn source_rate(path: &str) -> anyhow::Result<()> {
     let src = brp_media::Source::open(path)?;
     let n = src.frame_count();
     let t = Instant::now();
-    src.request(brp_media::Request { frame: 0, playing: true, dir: 1, ahead: n, fill: false });
+    src.request(brp_media::Request { frame: 0, playing: true, dir: 1, ahead: n, fill: false, range: (0, i64::MAX), looping: false });
     while (0..n).any(|i| src.get(i).is_none()) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }

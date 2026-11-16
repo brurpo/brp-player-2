@@ -40,33 +40,45 @@ fn copy_nnedi_weights() {
     }
 }
 
-/// Bundled effects (repo `shaders/`) go to `<exe dir>/shaders`.
+/// Bundled effects (repo `shaders/`, with its group folders) go to `<exe dir>/shaders`.
 fn copy_shaders() {
     let src = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../shaders");
     println!("cargo:rerun-if-changed={}", src.display());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let Some(profile_dir) = out.ancestors().nth(3) else { return };
-    let dst = profile_dir.join("shaders");
-    let _ = std::fs::create_dir_all(&dst);
-    let mut shipped = std::collections::HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(&src) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "glsl") {
-                let name = p.file_name().unwrap().to_owned();
-                let _ = std::fs::copy(&p, dst.join(&name));
-                shipped.insert(name);
-            }
+    mirror_glsl(&src, &profile_dir.join("shaders"));
+}
+
+/// Make the `.glsl` files of `dst` those of `src`, folder by folder: copy what is
+/// there, drop effects (and folders left empty) that were removed or moved there.
+fn mirror_glsl(src: &std::path::Path, dst: &std::path::Path) {
+    let is_glsl = |p: &std::path::Path| p.extension().is_some_and(|x| x == "glsl");
+    let _ = std::fs::create_dir_all(dst);
+    let mut keep = std::collections::HashSet::new();
+    for e in std::fs::read_dir(src).into_iter().flatten().flatten() {
+        let (p, name) = (e.path(), e.file_name());
+        if p.is_dir() {
+            mirror_glsl(&p, &dst.join(&name));
+            keep.insert(name);
+        } else if is_glsl(&p) {
+            let _ = std::fs::copy(&p, dst.join(&name));
+            keep.insert(name);
         }
     }
-    // The exe's folder mirrors the repo: drop effects that were removed there.
-    if let Ok(entries) = std::fs::read_dir(&dst) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "glsl") && !shipped.contains(p.file_name().unwrap()) {
-                let _ = std::fs::remove_file(&p);
-            }
+    for e in std::fs::read_dir(dst).into_iter().flatten().flatten() {
+        let p = e.path();
+        if keep.contains(&e.file_name()) {
+            continue;
         }
+        if p.is_dir() {
+            // A folder the repo no longer has: its effects go, and it if nothing else is in it.
+            mirror_glsl(&src.join(e.file_name()), &p);
+        } else if is_glsl(&p) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    if std::fs::read_dir(dst).is_ok_and(|mut d| d.next().is_none()) {
+        let _ = std::fs::remove_dir(dst);
     }
 }
 

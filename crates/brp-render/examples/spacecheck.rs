@@ -8,6 +8,7 @@
 //! `video.frag`): the largest and mean difference in 8- and 10-bit levels. Then a gain
 //! in linear light on the HDR frames: highlights above SDR white must scale, not clip.
 //! `--4k` also times the conversions on a 4K frame.
+//! `--ocio`: OpenColorIO split for effects (DESIGN.md §7d), see `ocio::checks`.
 
 use brp_media::{ColorInfo, Primaries, Request, Source, Transfer as Tf, VideoFrame};
 use brp_render::offline_fx::{OfflineEffects, Rgba};
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn get(src: &Source, n: i64) -> Arc<VideoFrame> {
-    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false });
+    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false });
     let t = Instant::now();
     loop {
         if let Some(f) = src.get(n) {
@@ -232,6 +233,13 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    if args.iter().any(|a| a == "--ocio") {
+        let ok = ocio::checks(&ctx, &root)?;
+        if !ok {
+            std::process::exit(1);
+        }
+    }
+
     if args.iter().any(|a| a == "--4k") {
         // Cost of one conversion: 16 pass-through effects alternating source and
         // linear (16 conversions) against 16 in source (none), same passes otherwise.
@@ -255,4 +263,231 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// OpenColorIO split at the effects' working space (DESIGN.md §7d), against OCIO's CPU
+/// processor. For each input (camera log, an ACEScg EXR, and the inputs Auto picks for
+/// SDR, PQ, HLG and linear EXR files):
+/// - pass-through effects in each space with the split (OCIO's input transform at the
+///   start of the chain, the second half after it) against the frame through the whole
+///   conversion, no effect: 8-bit levels of the display's code values;
+/// - a blur in linear light with the split against the same blur run on the frame
+///   linearised by OCIO's CPU processor;
+/// - the same blur without the split (the player's own decoding, as before): for Auto
+///   inputs how far OCIO's linear light is from the player's, for the others how wrong
+///   the result was;
+/// - the cost of the passes (1080p and 4K).
+mod ocio {
+    use super::*;
+    use brp_ocio::{Cpu, Library, Part, Source as Cfg, Target};
+    use brp_render::compute::{Compute, Picture, Recorder};
+    use brp_render::workspace::SourceColor;
+    use brp_render::{OcioCompute, OcioShader, OcioTexture, Space};
+
+    fn shader(s: brp_ocio::Shader, from: Option<SourceColor>) -> OcioShader {
+        OcioShader {
+            glsl: s.glsl,
+            textures: s.textures.into_iter().map(|t| OcioTexture { binding: t.binding, dims: t.dims, w: t.w, h: t.h, d: t.d, channels: t.channels, linear: t.linear, data: t.data }).collect(),
+            from_source: from,
+        }
+    }
+
+    fn f16(v: f32) -> u16 {
+        let b = v.to_bits();
+        let s = ((b >> 16) & 0x8000) as u16;
+        let a = b & 0x7fff_ffff;
+        if a >= 0x477f_f000 {
+            return s | 0x7bff;
+        }
+        if a < 0x3880_0000 {
+            return s | (f32::from_bits(a) * 16_777_216.0).round() as u16;
+        }
+        let r = a + 0x0fff + ((a >> 13) & 1);
+        s | ((r - 0x3800_0000) >> 13) as u16
+    }
+
+    /// A half-float RGB frame of `px` (packed RGB).
+    fn frame(w: u32, h: u32, px: &[f32]) -> anyhow::Result<VideoFrame> {
+        let data: Vec<u16> = px.chunks(3).flat_map(|c| [f16(c[0]), f16(c[1]), f16(c[2]), f16(1.0)]).collect();
+        VideoFrame::from_rgba_f16(w as usize, h as usize, &data, false, 0, 0)
+    }
+
+    fn packed(r: &Rgba) -> Vec<f32> {
+        r.data.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
+    }
+
+    fn apply(c: &Cpu, px: &[f32]) -> Vec<f32> {
+        let mut v = px.to_vec();
+        c.apply(&mut v);
+        v
+    }
+
+    /// Display code values compared in 8-bit levels: mean, 99.99th percentile, max.
+    fn levels(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        let mut d: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x.clamp(0.0, 1.0) - y.clamp(0.0, 1.0)).abs() * 255.0).collect();
+        let n = d.len() as f64;
+        let mean = d.iter().map(|&v| v as f64).sum::<f64>() / n;
+        d.sort_by(f32::total_cmp);
+        (mean, d[((n * 0.9999) as usize).min(d.len() - 1)] as f64, *d.last().unwrap() as f64)
+    }
+
+    /// Largest difference in light relative to the pixel's brightest channel (at least
+    /// 1e-2 of SDR white, below which nothing is visible).
+    fn light_err(a: &[f32], b: &[f32]) -> f64 {
+        a.chunks(3)
+            .zip(b.chunks(3))
+            .map(|(x, y)| {
+                let m = x.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-2);
+                (0..3).map(|k| ((x[k] - y[k]).abs() / m) as f64).fold(0.0, f64::max)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    struct Case {
+        label: &'static str,
+        frame: Arc<VideoFrame>,
+        /// How the file is tagged (what the player decodes it as).
+        color: ColorInfo,
+        cfg: Cfg,
+        input: &'static str,
+        view: &'static str,
+        auto: bool,
+    }
+
+    pub fn checks(ctx: &Arc<GpuContext>, root: &str) -> anyhow::Result<bool> {
+        let lib = Library::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ocio-configs"), None);
+        let b = lib.get(Cfg::Builtin).unwrap().clone();
+        let sdr = open(&format!("{root}/test.mp4"))?;
+        let pq = open(&format!("{root}/20250725_164717.mp4"))?;
+        let exr = open(&format!("{root}/exr/chap_0001.exr"))?;
+        let (pq_f, exr_f) = (get(&pq, 10), get(&exr, 0));
+
+        // The decoded frame in the file's encoding (the chain's Source, no OCIO).
+        let decoded = |f: &VideoFrame, c: ColorInfo| -> anyhow::Result<Rgba> {
+            let mut fx = OfflineEffects::new(ctx.clone())?;
+            let e = fx.set_effects(&[effect(1, "pass_source", &[])?], transfer(&c));
+            anyhow::ensure!(e.is_empty(), "{e:?}");
+            Ok(fx.run(f, c, 0, (f.width(), f.height()))?.0)
+        };
+        // A camera log picture: the PQ frame's light (up to ~2,400 nits) as ARRI LogC4,
+        // in a file tagged as ordinary SDR video (as log ProRes usually is).
+        let pq_rgb = decoded(&pq_f, pq.info.color)?;
+        let lin: Vec<f32> = pq_rgb.data.iter().flat_map(|p| SourceColor::of(&pq.info.color).source_to_linear([p[0], p[1], p[2]])).collect();
+        let to_log = Cpu::new(&b, "Linear Rec.2020", &b, Target::Space("ARRI LogC4"), false)?;
+        let log = frame(pq_rgb.w, pq_rgb.h, &apply(&to_log, &lin))?;
+        let sdr_tag = ColorInfo { transfer: Tf::Sdr, primaries: Primaries::Bt709, ..sdr.info.color };
+        let aces = "ACES 2.0 - SDR 100 nits (Rec.709)";
+        let colorimetric = "Video (colorimetric)";
+        let cases = vec![
+            Case { label: "ARRI LogC4 (the PQ frame's light, tagged SDR)", frame: Arc::new(log), color: sdr_tag, cfg: Cfg::Builtin, input: "ARRI LogC4", view: aces, auto: false },
+            Case { label: "ACEScg EXR (chap_0001.exr read as ACEScg)", frame: exr_f.clone(), color: exr.info.color, cfg: Cfg::Builtin, input: "ACEScg", view: aces, auto: false },
+            Case { label: "ACEScg EXR, input from Maya's config", frame: exr_f.clone(), color: exr.info.color, cfg: Cfg::Maya, input: "ACEScg", view: aces, auto: false },
+            Case { label: "Auto: SDR test.mp4 (Rec.1886)", frame: get(&sdr, 10), color: sdr.info.color, cfg: Cfg::Builtin, input: "Rec.1886 Rec.709 - Display", view: colorimetric, auto: true },
+            Case { label: "Auto: PQ clip (Rec.2100-PQ)", frame: pq_f.clone(), color: pq.info.color, cfg: Cfg::Builtin, input: "Rec.2100-PQ - Display", view: colorimetric, auto: true },
+            Case { label: "Auto: HLG (the PQ frame re-tagged)", frame: pq_f.clone(), color: ColorInfo { transfer: Tf::Hlg, ..pq.info.color }, cfg: Cfg::Builtin, input: "Rec.2100-HLG - Display", view: colorimetric, auto: true },
+            Case { label: "Auto: linear EXR (Linear Rec.709)", frame: exr_f.clone(), color: exr.info.color, cfg: Cfg::Builtin, input: "Linear Rec.709 (sRGB)", view: aces, auto: true },
+        ];
+        let stacks: Vec<(&str, Vec<&str>)> = vec![
+            ("source (mpv MAIN)", vec!["pass_source"]),
+            ("linear", vec!["pass_linear"]),
+            ("display", vec!["pass_display"]),
+            ("pq", vec!["pass_pq"]),
+            ("mpv LINEAR", vec!["pass_mpv_linear"]),
+            ("all stacked", vec!["pass_source", "pass_linear", "pass_display", "pass_pq", "pass_mpv_linear", "pass_linear"]),
+        ];
+        let mut ok = true;
+        println!("\n==== OpenColorIO split for effects (DESIGN.md §7d) ====");
+        for c in &cases {
+            let src = lib.get(c.cfg).unwrap().clone();
+            let t = Target::Display { display: "sRGB - Display", view: c.view };
+            let sc = SourceColor::of(&c.color);
+            let whole = Cpu::new(&src, c.input, &b, t, false)?;
+            let cpu_in = Cpu::part(&src, c.input, &b, t, false, Part::In)?;
+            let cpu_out = Cpu::part(&src, c.input, &b, t, false, Part::Out)?;
+            let pre = OcioCompute::new(ctx, &shader(brp_ocio::shader_part(&src, c.input, &b, t, false, Part::In, 1, 1)?, None))?;
+            let (w, h) = (c.frame.width(), c.frame.height());
+            let base = packed(&decoded(&c.frame, c.color)?);
+            // No effect: the whole conversion (the window and export without effects).
+            let reference = apply(&whole, &base);
+            // An effect's Source output through the second half.
+            let finish = |r: &Rgba| -> Vec<f32> {
+                let lin: Vec<f32> = r.data.iter().flat_map(|p| sc.source_to_linear([p[0], p[1], p[2]])).collect();
+                apply(&cpu_out, &lin)
+            };
+            println!("\n{} -> sRGB - Display / {} ({}x{}, tagged {:?} {:?})", c.label, c.view, w, h, c.color.transfer, c.color.primaries);
+            let mut fx = OfflineEffects::new(ctx.clone())?;
+            fx.set_ocio_input(Some(pre.clone()));
+            for (name, list) in &stacks {
+                let specs: Vec<EffectSpec> = list.iter().enumerate().map(|(i, n)| effect(10 + i as u64, n, &[])).collect::<anyhow::Result<_>>()?;
+                let e = fx.set_effects(&specs, transfer(&c.color));
+                anyhow::ensure!(e.is_empty(), "{e:?}");
+                let (out, _) = fx.run(&c.frame, c.color, 0, (w, h))?;
+                let (mean, p, max) = levels(&finish(&out), &reference);
+                ok &= mean < 0.5;
+                println!("  pass-through {name:<20} mean {mean:.3}, 99.99% {p:.2}, max {max:.2} (8-bit levels)");
+            }
+            // A blur in linear light: with the split, and on OCIO's CPU linear light.
+            let e = fx.set_effects(&[effect(30, "blur_linear", &[])?], transfer(&c.color));
+            anyhow::ensure!(e.is_empty(), "{e:?}");
+            let (split_lin, _) = fx.run_to(&c.frame, c.color, 0, (w, h), Space::Linear)?;
+            let split_disp = finish(&fx.run(&c.frame, c.color, 0, (w, h))?.0);
+            let cpu_lin = apply(&cpu_in, &base);
+            let lin_tag = ColorInfo { transfer: Tf::Linear, primaries: Primaries::Bt2020, ..c.color };
+            let mut fx2 = OfflineEffects::new(ctx.clone())?;
+            let e = fx2.set_effects(&[effect(31, "blur_linear", &[])?], Transfer::Linear);
+            anyhow::ensure!(e.is_empty(), "{e:?}");
+            let (ref_lin, _) = fx2.run_to(&frame(w, h, &cpu_lin)?, lin_tag, 0, (w, h), Space::Linear)?;
+            let (ref_lin, split_lin) = (packed(&ref_lin), packed(&split_lin));
+            let right = apply(&cpu_out, &ref_lin);
+            let (mean, p, max) = levels(&apply(&cpu_out, &split_lin), &right);
+            let rel = light_err(&ref_lin, &split_lin);
+            ok &= mean < 0.5;
+            println!("  linear blur vs the blur of OCIO's CPU linear light: mean {mean:.3}, 99.99% {p:.2}, max {max:.2} levels; light {rel:.1e} of the pixel");
+            // The same blur without the split: on the player's decoding, then the whole
+            // conversion (as before).
+            let mut fx3 = OfflineEffects::new(ctx.clone())?;
+            let e = fx3.set_effects(&[effect(32, "blur_linear", &[])?], transfer(&c.color));
+            anyhow::ensure!(e.is_empty(), "{e:?}");
+            let old = apply(&whole, &packed(&fx3.run(&c.frame, c.color, 0, (w, h))?.0));
+            if c.auto {
+                let (mean, p, max) = levels(&split_disp, &old);
+                println!("  linear blur, split vs the player's decoding (before): mean {mean:.3}, 99.99% {p:.2}, max {max:.2} levels");
+            } else {
+                let (mean, p, max) = levels(&old, &right);
+                println!("  (before the split, the blur ran on the player's decoding: mean {mean:.3}, 99.99% {p:.2}, max {max:.2} levels from the right result)");
+            }
+        }
+
+        // Cost: each OCIO pass on its own, 50 dispatches per submission, best of 5 (an
+        // empty submission's time taken off).
+        println!();
+        let compute = Compute::new(ctx.clone());
+        let t = Target::Display { display: "sRGB - Display", view: aces };
+        let sc = SourceColor::of(&sdr_tag);
+        let passes = [
+            ("whole: LogC4 -> sRGB / ACES 2.0 (no effects)", shader(brp_ocio::shader_part(&b, "ARRI LogC4", &b, t, false, Part::Whole, 1, 1)?, None)),
+            ("in: LogC4 -> working space", shader(brp_ocio::shader_part(&b, "ARRI LogC4", &b, t, false, Part::In, 1, 1)?, None)),
+            ("out: decode, working space -> sRGB / ACES 2.0", shader(brp_ocio::shader_part(&b, "ARRI LogC4", &b, t, false, Part::Out, 1, 1)?, Some(sc))),
+        ];
+        for (w, h) in [(1920u32, 1080u32), (3840, 2160)] {
+            for (name, s) in &passes {
+                let o = OcioCompute::new(ctx, s)?;
+                let mut best = Duration::MAX;
+                for _ in 0..5 {
+                    let empty = Recorder::new(&compute)?.submit_wait()?;
+                    let mut rec = Recorder::new(&compute)?;
+                    let a = Picture::new(&compute, &mut rec, w, h, false)?;
+                    let z = Picture::new(&compute, &mut rec, w, h, false)?;
+                    for _ in 0..50 {
+                        o.record(&mut rec, a.view, z.view, w, h)?;
+                        rec.barrier();
+                    }
+                    best = best.min(rec.submit_wait()?.saturating_sub(empty));
+                }
+                println!("{w}x{h} {name:<48} {:.3} ms per pass", best.as_secs_f64() * 1e3 / 50.0);
+            }
+        }
+        println!("\nOCIO split: {}", if ok { "OK" } else { "TOO LARGE" });
+        Ok(ok)
+    }
 }

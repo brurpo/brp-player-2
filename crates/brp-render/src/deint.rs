@@ -141,7 +141,8 @@ impl Deinterlacer {
         // The shared-memory variant wins on discrete GPUs; integrated GPUs are ALU-bound
         // here and run the generic one faster (measured on an AMD iGPU).
         let nnedi_fast = if max_shared >= NNEDI_FAST_SHARED && !integrated {
-            Some(make_pipe(device, NNEDI_FAST_SPV, &nb, std::mem::size_of::<NnediPush>() as u32)?)
+            // Only faster: if the driver refuses it, the generic one does the same work.
+            make_pipe(device, NNEDI_FAST_SPV, &nb, std::mem::size_of::<NnediPush>() as u32).map_err(|e| log::warn!("NNEDI3: generic shader (the fast one could not be built: {e:#})")).ok()
         } else {
             log::info!("NNEDI3: generic shader (integrated GPU or {max_shared} bytes of shared memory)");
             None

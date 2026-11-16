@@ -78,21 +78,58 @@ pub fn user_shader_dir() -> PathBuf {
     d
 }
 
-/// All .glsl files in the shader folders, sorted by name.
-pub fn library() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = shader_dirs()
-        .into_iter()
-        .filter_map(|d| std::fs::read_dir(d).ok())
-        .flat_map(|it| it.flatten().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("glsl")))
-        .collect();
-    v.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
-    v.dedup_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+/// A file of the effect library and where it is filed: the folders it sits in, from
+/// the shader folder down (`shaders/Damage/Grain.glsl`: ["Damage"]). They are its
+/// place in the "Add effect" tree; a file right in the shader folder has none.
+#[derive(Clone, Debug)]
+pub struct LibraryFile {
+    pub path: PathBuf,
+    pub folders: Vec<String>,
+}
+
+/// All .glsl files in the shader folders and their subfolders, sorted by file name.
+/// A file name found twice counts once (presets and `--fx` name effects by file name):
+/// the one next to the executable, else the first by path.
+pub fn library() -> Vec<LibraryFile> {
+    let mut v: Vec<LibraryFile> = Vec::new();
+    for dir in shader_dirs() {
+        for path in usershader::glsl_files(&dir) {
+            let folders = path.strip_prefix(&dir).ok().and_then(|r| r.parent()).map(|r| r.iter().map(|c| c.to_string_lossy().into_owned()).collect()).unwrap_or_default();
+            v.push(LibraryFile { path, folders });
+        }
+    }
+    v.sort_by_key(|f| f.path.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+    v.dedup_by_key(|f| f.path.file_name().map(|n| n.to_string_lossy().to_lowercase()));
     v
 }
 
+/// The file of the library with this file name (any folder), ignoring case.
+pub fn library_file(name: &str) -> Option<PathBuf> {
+    library().into_iter().find(|f| f.path.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))).map(|f| f.path)
+}
+
+/// The groups every install has, in the order the "Add effect" tree shows them
+/// (other folders follow by name): the folders of the bundled effects
+/// (`shaders/Restore`, `shaders/Damage`…) and the groups of the AI effects. A folder
+/// with one of these names, in any case, is that group; `i18n` names them
+/// (`fx_cat_<lower case>`).
+pub const GROUPS: [&str; 7] = ["Restore", "Damage", "Effects", "Color", "Matte", "Motion", "Utility"];
+
+/// The group of an AI effect (they are not files: this stands for their folder).
+pub fn ai_group(k: AiKind) -> &'static str {
+    match k {
+        AiKind::Denoise | AiKind::DenoiseAi | AiKind::CleanUp | AiKind::Deblur | AiKind::Steady | AiKind::Upscale => "Restore",
+        AiKind::Interpolate | AiKind::MotionBlur | AiKind::Stabilise => "Motion",
+        AiKind::Matting => "Matte",
+        AiKind::Depth => "Utility",
+    }
+}
+
+/// A file's name as shown when it has no title of its own (`// @brp en.title`): the
+/// file name without the extension or a "Builtin_" prefix, "_" as spaces.
 fn display_name(path: &Path) -> String {
-    path.file_stem().map(|s| s.to_string_lossy().replace('_', " ")).unwrap_or_default()
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    stem.strip_prefix("Builtin_").filter(|s| !s.is_empty()).unwrap_or(&stem).replace('_', " ")
 }
 
 impl Effects {
@@ -205,7 +242,7 @@ impl Effects {
     /// `--fx=A.glsl,ai:upscale:Quality=1,B.glsl:Strength=0.5`: shader files from the
     /// library, AI effects as ai:<name>, parameters after colons.
     pub fn add_from_arg(&mut self, list: &str) {
-        let lib = library();
+        let lib: Vec<PathBuf> = library().into_iter().map(|f| f.path).collect();
         for item in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             let (name, params) = match item.strip_prefix("ai:") {
                 Some(rest) => rest.split_once(':').map_or((rest, ""), |(a, b)| (a, b)),
@@ -389,7 +426,7 @@ impl Effects {
                 continue;
             }
             let by_path = e["path"].as_str().map(PathBuf::from).filter(|p| p.exists());
-            let by_name = e["file"].as_str().and_then(|n| library().into_iter().find(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == n)));
+            let by_name = e["file"].as_str().and_then(library_file);
             let Some(fpath) = by_path.or(by_name) else {
                 missing.push(e["file"].as_str().unwrap_or("?").to_string());
                 continue;
@@ -494,4 +531,57 @@ fn matching_paren(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The groups have names in both languages; every AI effect is in one; every
+    /// shader in the repo's `shaders/` sits in the folder of one, and the library
+    /// reads those folders.
+    #[test]
+    fn effects_have_groups() {
+        for g in GROUPS {
+            let key = format!("fx_cat_{}", g.to_lowercase());
+            for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Pt] {
+                assert_ne!(lang.t(&key), "?", "no name for group {g}");
+            }
+        }
+        for k in AiKind::ALL {
+            assert!(GROUPS.contains(&ai_group(k)));
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shaders");
+        let mut n = 0;
+        for p in usershader::glsl_files(&dir) {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let f = usershader::parse::parse(&name, &std::fs::read_to_string(&p).unwrap()).unwrap();
+            let folders: Vec<String> = p.strip_prefix(&dir).unwrap().parent().unwrap().iter().map(|c| c.to_string_lossy().into_owned()).collect();
+            assert!(folders.len() == 1 && GROUPS.contains(&folders[0].as_str()), "{name}: in {folders:?}, not in a group's folder");
+            // Shown under its own name in both languages, not the file's.
+            for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Pt] {
+                let title = Effects::default().title_of(&p, lang);
+                assert!(!title.contains("Builtin") && Some(title.as_str()) == f.title(lang.code()), "{name}: shown as {title:?}");
+            }
+            n += 1;
+        }
+        assert!(n > 10);
+        assert_eq!(display_name(Path::new("x/Builtin_Old_Thing.glsl")), "Old Thing");
+        assert_eq!(display_name(Path::new("x/my_look.glsl")), "my look");
+    }
+
+    /// Folders under a shader folder come out as each file's place in the tree.
+    #[test]
+    fn folders_of_files() {
+        let dir = std::env::temp_dir().join(format!("brp-fx-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for f in ["loose.glsl", "Damage/a.glsl", "My Looks/Film/b.GLSL", ".hidden/c.glsl", "presets/p.json", "1/2/3/4/deep.glsl", "1/2/3/4/5/too_deep.glsl"] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        let rel: Vec<String> = usershader::glsl_files(&dir).iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(rel, ["1/2/3/4/deep.glsl", "Damage/a.glsl", "My Looks/Film/b.GLSL", "loose.glsl"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

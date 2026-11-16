@@ -12,7 +12,13 @@
 //!   is checked.
 //! - A newer release: a banner offers it. Installing downloads its zip, renames the
 //!   files it replaces to `*.old` (Windows lets running files be renamed, not
-//!   overwritten), moves the new ones in and offers a restart.
+//!   overwritten), moves the new ones in and offers a restart. Files the new release
+//!   no longer has stay, except bundled effects: a `.glsl` in `shaders/` that the
+//!   installed release shipped and the new one does not is deleted (it would stay in
+//!   the effect list otherwise); files the user put there are never touched. The
+//!   same is done at the first start after an update, from the previous release's
+//!   manifest (still there as `manifest.json.old`): the update is carried out by
+//!   the old version, and versions up to 0.2.3 do not know this step.
 
 use anyhow::{bail, Context as _, Result};
 use parking_lot::Mutex;
@@ -85,6 +91,11 @@ impl Updater {
         if let Some(dir) = u.dir.clone() {
             let me = u.clone();
             let _ = std::thread::Builder::new().name("update".into()).spawn(move || {
+                // Before the last update's leftovers go: the old manifest is one of them.
+                let gone = remove_shaders_dropped_by_last_update(&dir);
+                if !gone.is_empty() {
+                    log::info!("update: effects no longer shipped removed: {}", gone.join(", "));
+                }
                 remove_old(&dir);
                 if let Err(e) = me.fetch_components(&dir) {
                     log::warn!("components: {e:#}");
@@ -181,7 +192,15 @@ impl Updater {
                 unzip(&zip, &new)?;
                 // The zip holds one top folder (brp-player-<version>/): its contents go in.
                 let root = single_subdir(&new).unwrap_or(new.clone());
+                // Before the new files move in: what this install shipped (its
+                // manifest is about to be replaced) and what the new release ships.
+                let shipped = shipped_shaders(read_manifest(&dir).ok().as_ref());
+                let ships = glsl_names(&root.join("shaders"));
                 replace_tree(&root, &dir)?;
+                let gone = remove_dropped_shaders(&dir.join("shaders"), &shipped, &ships);
+                if !gone.is_empty() {
+                    log::info!("update: effects no longer shipped removed: {}", gone.join(", "));
+                }
                 let _ = std::fs::remove_dir_all(&work);
                 Ok(())
             })();
@@ -359,6 +378,105 @@ fn replace_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Effect files shipped by every release up to 0.2.3 (read from their zips), whose
+/// manifests did not list them yet.
+const SHADERS_UNTIL_0_2_3: [&str; 24] = [
+    "AMatte_BackgroundColor.glsl",
+    "AMatte_Keyer.glsl",
+    "Builtin_ColorCorrection.glsl",
+    "Builtin_Deblur.glsl",
+    "Builtin_Edges.glsl",
+    "Builtin_Film_Grain.glsl",
+    "Builtin_GaussianBlur.glsl",
+    "Builtin_Glitch.glsl",
+    "Builtin_Glow.glsl",
+    "Builtin_Glow_Fast.glsl",
+    "Builtin_Glow_Slow.glsl",
+    "Builtin_Invert.glsl",
+    "Builtin_Keying.glsl",
+    "Builtin_LensDistortion.glsl",
+    "Builtin_LensFlare.glsl",
+    "Builtin_Noise.glsl",
+    "Builtin_Painterly.glsl",
+    "Builtin_SpatialDenoiser.glsl",
+    "Builtin_Temporal_Denoiser.glsl",
+    "FSRCNN_upscale4x.glsl",
+    "MB.glsl",
+    "example.glsl",
+    "temporalNL.glsl",
+    "upscale4x.glsl",
+];
+
+/// A `.glsl` file's place in `shaders/`: its name, or folders and name joined by "/"
+/// ("Damage/Builtin_Grain.glsl"). Nothing that could lead out of the folder: the only
+/// form taken from a manifest.
+fn is_glsl_path(n: &str) -> bool {
+    let parts: Vec<&str> = n.split('/').collect();
+    parts.len() <= 6 && parts.iter().all(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(['\\', ':'])) && n.len() > 5 && n.to_ascii_lowercase().ends_with(".glsl")
+}
+
+/// The effect files an install's release shipped in `shaders/` (see `is_glsl_path`):
+/// its manifest's "shaders" list (written by tools/release/package.py), or, for a
+/// manifest without one (releases up to 0.2.3), the files those releases shipped.
+fn shipped_shaders(manifest: Option<&Value>) -> Vec<String> {
+    match manifest.and_then(|m| m["shaders"].as_array()) {
+        Some(list) => list.iter().filter_map(|v| v.as_str()).filter(|n| is_glsl_path(n)).map(String::from).collect(),
+        None => SHADERS_UNTIL_0_2_3.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// The `.glsl` files in `dir` and its subfolders, as places in it (see `is_glsl_path`).
+fn glsl_names(dir: &Path) -> Vec<String> {
+    let files = brp_render::usershader::glsl_files(dir);
+    files.iter().filter_map(|p| p.strip_prefix(dir).ok()).map(|r| r.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")).filter(|n| is_glsl_path(n)).collect()
+}
+
+/// After an update: delete from `dir` (the install's `shaders/`) the effect files
+/// the old release shipped (`shipped`) and the new one does not (`ships`: the files
+/// in the new release's `shaders/`), each named by its place there, so an effect the
+/// new release keeps in another folder is deleted from where it was. Anything the old release did not ship is the
+/// user's and stays. Nothing is deleted when the new release has no effect files at
+/// all (not a release as we package them). Returns the names deleted.
+fn remove_dropped_shaders(dir: &Path, shipped: &[String], ships: &[String]) -> Vec<String> {
+    if ships.is_empty() {
+        return Vec::new();
+    }
+    let mut gone = Vec::new();
+    for name in shipped.iter().filter(|n| is_glsl_path(n) && !ships.iter().any(|s| s.eq_ignore_ascii_case(n))) {
+        let p = dir.join(name);
+        if !p.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&p) {
+            Ok(()) => gone.push(name.clone()),
+            Err(e) => log::warn!("update: cannot remove {}: {e}", p.display()),
+        }
+        // Its folders too, when nothing is left in them (remove_dir refuses otherwise).
+        let mut folder = p.parent();
+        while let Some(f) = folder.filter(|f| *f != dir && f.starts_with(dir)) {
+            if std::fs::remove_dir(f).is_err() {
+                break;
+            }
+            folder = f.parent();
+        }
+    }
+    gone
+}
+
+/// First start after an update (the previous release's manifest is still there as
+/// `manifest.json.old`): delete the bundled effects that release shipped and this one
+/// does not. `install` does it when the version doing the update knows how; versions
+/// up to 0.2.3 do not, and one of them does the update that brings this version in.
+/// Nothing happens unless this release's manifest lists its effects.
+fn remove_shaders_dropped_by_last_update(dir: &Path) -> Vec<String> {
+    let previous = std::fs::read(old_name(&dir.join("manifest.json"))).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let (Some(previous), Ok(current)) = (previous, read_manifest(dir)) else { return Vec::new() };
+    if current["shaders"].as_array().is_none() {
+        return Vec::new();
+    }
+    remove_dropped_shaders(&dir.join("shaders"), &shipped_shaders(Some(&previous)), &shipped_shaders(Some(&current)))
+}
+
 fn old_name(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".old");
@@ -395,7 +513,147 @@ fn newer(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::*;
+
+    /// A scratch install or release tree: (place under it, text) files.
+    fn tree(root: &Path, files: &[(&str, &str)]) {
+        for (name, text) in files {
+            let p = root.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+    }
+
+    fn names(root: &Path) -> Vec<String> {
+        let mut v = glsl_names(&root.join("shaders"));
+        v.sort();
+        v
+    }
+
+    /// What `install` does with an unpacked release.
+    fn update(dir: &Path, root: &Path) -> Vec<String> {
+        let shipped = shipped_shaders(read_manifest(dir).ok().as_ref());
+        let ships = glsl_names(&root.join("shaders"));
+        replace_tree(root, dir).unwrap();
+        let mut gone = remove_dropped_shaders(&dir.join("shaders"), &shipped, &ships);
+        gone.sort();
+        gone
+    }
+
+    /// An update deletes the effects the old release shipped and the new one does
+    /// not have in the same place, and nothing else: the user's files stay.
+    #[test]
+    fn dropped_shaders_removed() {
+        let base = std::env::temp_dir().join(format!("brp-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (old, new, newer) = (base.join("install"), base.join("new"), base.join("newer"));
+        // An install of a release without a "shaders" list (effects right in
+        // shaders/): two shipped effects, the user's own effects (one in a folder of
+        // theirs), and a file of the user's that is not an effect.
+        tree(&old, &[
+            ("manifest.json", r#"{"version": "0.2.3", "repo": "x/y", "components": []}"#),
+            ("shaders/Builtin_Glow.glsl", "old glow"),
+            ("shaders/Builtin_Noise.glsl", "old noise"),
+            ("shaders/my_look.glsl", "mine"),
+            ("shaders/Mine/look2.glsl", "mine"),
+            ("shaders/notes.txt", "mine too"),
+        ]);
+        // The new release keeps its effects in folders: Glow moves into one, Noise is
+        // gone, Grain is new; its manifest lists them.
+        tree(&new, &[
+            ("manifest.json", r#"{"version": "0.2.4", "repo": "x/y", "components": [], "shaders": ["Effects/Builtin_Glow.glsl", "Damage/Builtin_Grain.glsl"]}"#),
+            ("shaders/Effects/Builtin_Glow.glsl", "new glow"),
+            ("shaders/Damage/Builtin_Grain.glsl", "grain"),
+        ]);
+        assert_eq!(update(&old, &new), ["Builtin_Glow.glsl", "Builtin_Noise.glsl"]);
+        assert_eq!(names(&old), ["Damage/Builtin_Grain.glsl", "Effects/Builtin_Glow.glsl", "Mine/look2.glsl", "my_look.glsl"]);
+        assert_eq!(std::fs::read_to_string(old.join("shaders/Effects/Builtin_Glow.glsl")).unwrap(), "new glow");
+        assert_eq!(std::fs::read_to_string(old.join("shaders/my_look.glsl")).unwrap(), "mine");
+        assert!(old.join("shaders/notes.txt").is_file());
+
+        // The next release drops Grain: now the installed manifest's own list says
+        // what was shipped, and the emptied folder goes too. Files of the user's that
+        // release did not ship stay: one named like an old effect, one in a shipped folder.
+        tree(&old, &[("shaders/MB.glsl", "the user's"), ("shaders/Effects/mine.glsl", "the user's")]);
+        tree(&newer, &[
+            ("manifest.json", r#"{"version": "0.2.5", "repo": "x/y", "components": [], "shaders": ["Effects/Builtin_Glow.glsl"]}"#),
+            ("shaders/Effects/Builtin_Glow.glsl", "newer glow"),
+        ]);
+        assert_eq!(update(&old, &newer), ["Damage/Builtin_Grain.glsl"]);
+        assert_eq!(names(&old), ["Effects/Builtin_Glow.glsl", "Effects/mine.glsl", "MB.glsl", "Mine/look2.glsl", "my_look.glsl"]);
+        assert!(!old.join("shaders/Damage").exists());
+
+        // A new tree without effect files deletes nothing; places that could lead
+        // out of shaders/ (a bad manifest) are ignored.
+        assert!(remove_dropped_shaders(&old.join("shaders"), &shipped_shaders(None), &[]).is_empty());
+        let bad = serde_json::json!({ "shaders": ["../manifest.json", "../x.glsl", "a/../x.glsl", "..\\x.glsl", "a\\x.glsl", "C:x.glsl", "/x.glsl", "a//x.glsl", ".glsl", "x.txt", "Effects/Builtin_Glow.glsl", "Builtin_Glow.glsl"] });
+        assert_eq!(shipped_shaders(Some(&bad)), ["Effects/Builtin_Glow.glsl", "Builtin_Glow.glsl"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An install of 0.2.3 (24 effects right in shaders/, no list in its manifest)
+    /// updated to the effects in the repo's `shaders/` (in folders) loses all 24 old
+    /// files: the twelve removed, and the old copies of the ones now in folders.
+    #[test]
+    fn update_from_0_2_3_drops_the_old_effects() {
+        let dir = std::env::temp_dir().join(format!("brp-update-test-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in SHADERS_UNTIL_0_2_3.iter().chain(&["users_own.glsl"]) {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+        let ships = glsl_names(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shaders"));
+        assert!(ships.len() > 10 && ships.iter().all(|n| n.contains('/')), "{ships:?}");
+        // Every effect of the repo that 0.2.3 had is still shipped, under a folder.
+        let file = |n: &str| n.rsplit('/').next().unwrap().to_string();
+        let kept: Vec<String> = ships.iter().map(|n| file(n)).filter(|n| SHADERS_UNTIL_0_2_3.contains(&n.as_str())).collect();
+        assert_eq!(kept.len(), 12);
+        let gone = remove_dropped_shaders(&dir, &shipped_shaders(Some(&serde_json::json!({ "version": "0.2.3" }))), &ships);
+        assert_eq!(gone.len(), 24);
+        assert_eq!(glsl_names(&dir), ["users_own.glsl"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The update done by a version without the deletion step (up to 0.2.3): the
+    /// new version cleans up at its first start, once, from the old manifest.
+    #[test]
+    fn first_start_after_update_by_an_old_version() {
+        let base = std::env::temp_dir().join(format!("brp-update-test-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir, new) = (base.join("install"), base.join("new"));
+        tree(&dir, &[
+            ("manifest.json", r#"{"version": "0.2.3", "repo": "x/y", "components": []}"#),
+            ("shaders/Builtin_Glow.glsl", "old"),
+            ("shaders/Builtin_Noise.glsl", "old"),
+            ("shaders/MB.glsl", "old"),
+            ("shaders/my_look.glsl", "mine"),
+        ]);
+        tree(&new, &[
+            ("manifest.json", r#"{"version": "0.2.4", "repo": "x/y", "components": [], "shaders": ["Effects/Builtin_Glow.glsl", "Damage/Builtin_Grain.glsl"]}"#),
+            ("shaders/Effects/Builtin_Glow.glsl", "new"),
+            ("shaders/Damage/Builtin_Grain.glsl", "new"),
+        ]);
+        // 0.2.3's update: files added and replaced, nothing deleted.
+        replace_tree(&new, &dir).unwrap();
+        assert_eq!(names(&dir), ["Builtin_Glow.glsl", "Builtin_Noise.glsl", "Damage/Builtin_Grain.glsl", "Effects/Builtin_Glow.glsl", "MB.glsl", "my_look.glsl"]);
+        // The new version's first start.
+        let mut gone = remove_shaders_dropped_by_last_update(&dir);
+        gone.sort();
+        assert_eq!(gone, ["Builtin_Glow.glsl", "Builtin_Noise.glsl", "MB.glsl"]);
+        remove_old(&dir);
+        assert_eq!(names(&dir), ["Damage/Builtin_Grain.glsl", "Effects/Builtin_Glow.glsl", "my_look.glsl"]);
+        assert!(!dir.join("manifest.json.old").exists());
+        // Later starts: no old manifest, so a file the user adds under an old name stays.
+        tree(&dir, &[("shaders/MB.glsl", "the user's")]);
+        assert!(remove_shaders_dropped_by_last_update(&dir).is_empty());
+        assert!(dir.join("shaders/MB.glsl").is_file());
+        // An install whose own manifest has no list (a version before this) does nothing.
+        tree(&dir, &[("manifest.json.old", r#"{"version": "0.2.2"}"#), ("manifest.json", r#"{"version": "0.2.3"}"#)]);
+        assert!(remove_shaders_dropped_by_last_update(&dir).is_empty());
+        assert!(dir.join("shaders/MB.glsl").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn versions() {
         assert!(newer("0.2.0", "0.1.9"));

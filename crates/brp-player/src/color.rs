@@ -197,10 +197,14 @@ impl Ocio {
             self.error = Some("no colour space for this file in the configs".into());
             return None;
         };
+        // The file's colour: the split for effects decodes the effect chain's pictures
+        // with it (DESIGN.md §7d).
+        let color = info.map(|i| i.color);
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             r.hash(&mut h);
+            format!("{color:?}").hash(&mut h);
             h.finish()
         };
         if let Some((k, rx)) = &self.building {
@@ -228,7 +232,7 @@ impl Ocio {
             let r2 = r.clone();
             let _ = std::thread::Builder::new().name("brp-ocio-build".into()).spawn(move || {
                 let t = std::time::Instant::now();
-                let res = build_setup(&lib2, &r2, key);
+                let res = build_setup(&lib2, &r2, key, color);
                 log::info!("OCIO {} -> {} / {}: built in {:?}", r2.input.label(), r2.display.label(), r2.view, t.elapsed());
                 let _ = tx.send(res);
             });
@@ -247,10 +251,24 @@ pub fn to_render(s: brp_ocio::Shader) -> brp_render::OcioShader {
             .into_iter()
             .map(|t| brp_render::OcioTexture { binding: t.binding, dims: t.dims, w: t.w, h: t.h, d: t.d, channels: t.channels, linear: t.linear, data: t.data })
             .collect(),
+        from_source: None,
     }
 }
 
-fn build_setup(lib: &Library, r: &Resolved, key: u64) -> anyhow::Result<brp_render::OcioSetup> {
+/// OCIO's input transform (to the effects' working space, linear Rec.2020) and the
+/// rest of the conversion from there, decoding the effect chain's pictures (in the
+/// file's own encoding `color`) first (DESIGN.md §7d).
+fn split_shaders(src: &brp_ocio::Config, input: &str, dst: &brp_ocio::Config, target: Target<'_>, to_xyz: bool, color: &ColorInfo, set: u32) -> anyhow::Result<(brp_render::OcioShader, brp_render::OcioShader)> {
+    use brp_ocio::Part;
+    let pre = brp_ocio::shader_part(src, input, dst, target, false, Part::In, set, 1)?;
+    let post = brp_ocio::shader_part(src, input, dst, target, to_xyz, Part::Out, set, 1)?;
+    anyhow::ensure!(pre.uniforms == 0 && post.uniforms == 0, "this conversion has dynamic parameters (not supported)");
+    let mut post = to_render(post);
+    post.from_source = Some(brp_render::workspace::SourceColor::of(color));
+    Ok((to_render(pre), post))
+}
+
+fn build_setup(lib: &Library, r: &Resolved, key: u64, color: Option<ColorInfo>) -> anyhow::Result<brp_render::OcioSetup> {
     let src = lib.get(r.input.source).ok_or_else(|| anyhow::anyhow!("config not loaded"))?;
     let dst = lib.get(r.display.source).ok_or_else(|| anyhow::anyhow!("config not loaded"))?;
     let target = Target::Display { display: &r.display.name, view: &r.view };
@@ -258,29 +276,68 @@ fn build_setup(lib: &Library, r: &Resolved, key: u64) -> anyhow::Result<brp_rend
     let xyz = brp_ocio::shader(src, &r.input.name, dst, target, true, brp_render::ocio::OCIO_SET, 1)?;
     anyhow::ensure!(direct.uniforms == 0 && xyz.uniforms == 0, "this conversion has dynamic parameters (not supported)");
     let hdr_display = matches!(auto::encoding(lib, &r.display, true), auto::Encoding::Pq | auto::Encoding::Hlg);
-    Ok(brp_render::OcioSetup { direct: to_render(direct), xyz: to_render(xyz), hdr_display, key })
+    // With effects: split at the effects' working space. When it cannot be (a data
+    // input, a config without interchange roles) effects work on the player's own
+    // decoding of the file, as without OCIO.
+    let split = color.and_then(|c| {
+        let r2 = (|| -> anyhow::Result<brp_render::OcioSplit> {
+            let (pre, direct) = split_shaders(src, &r.input.name, dst, target, false, &c, brp_render::ocio::OCIO_SET)?;
+            let (_, xyz) = split_shaders(src, &r.input.name, dst, target, true, &c, brp_render::ocio::OCIO_SET)?;
+            Ok(brp_render::OcioSplit { pre, direct, xyz })
+        })();
+        r2.map_err(|e| log::warn!("OCIO: effects keep the player's decoding: {e:#}")).ok()
+    });
+    Ok(brp_render::OcioSetup { direct: to_render(direct), xyz: to_render(xyz), hdr_display, split, key })
 }
 
 /// The export's OCIO (DESIGN.md §7d): the file's colour space through the output
 /// target (and the view, for a display), and how the output file is tagged.
 #[derive(Clone)]
 pub struct ExportOcio {
+    /// The conversion of each exported picture: the whole one, or with `pre` its
+    /// second half (from the file's own encoding of OCIO's linear light).
     pub shader: brp_render::OcioShader,
-    /// The same on the CPU (`--verify`).
+    /// The same on the CPU (`--verify`), from what `shader` takes: with `pre`, the
+    /// player's linear light (`brp_render::workspace::SourceColor::source_to_linear`
+    /// of the picture first, `shader.from_source`).
     pub cpu: Arc<brp_ocio::Cpu>,
+    /// With effects: OCIO's input transform, run on the decoded frames before the
+    /// stack (DESIGN.md §7d).
+    pub pre: Option<brp_render::OcioShader>,
     pub encoding: auto::Encoding,
     pub label: String,
 }
 
 /// What an export of kind `kind` writes with OCIO on: the target and its conversion.
 #[allow(clippy::too_many_arguments)]
-pub fn export_ocio(lib: &Library, o: &OcioChoices, s: &crate::settings::Settings, info: &MediaInfo, kind: auto::Output) -> anyhow::Result<ExportOcio> {
+/// `effects`: the export has effects; the conversion is then split at their working
+/// space, as in the window (DESIGN.md §7d).
+pub fn export_ocio(lib: &Library, o: &OcioChoices, s: &crate::settings::Settings, info: &MediaInfo, kind: auto::Output, effects: bool) -> anyhow::Result<ExportOcio> {
     let media = media_of(info);
     let probe = Ocio { enabled: true, input: o.input.clone(), display: o.display.clone(), view: o.view.clone(), output: o.output.clone(), lib: None, custom: None, loading: None, shown: None, building: None, error: None };
     // The view is the window's (resolved on the output display when it is one).
     let r = probe.resolve(lib, s, media, Screen::Sdr).ok_or_else(|| anyhow::anyhow!("no OCIO colour space for this file"))?;
     let target = probe.resolve_output(lib, s, kind).ok_or_else(|| anyhow::anyhow!("no OCIO output for this format"))?;
     let src = lib.get(r.input.source).ok_or_else(|| anyhow::anyhow!("config not loaded"))?;
+    // With effects, split as the window does (a failure: the whole conversion, effects
+    // on the player's decoding).
+    let split = |dst: &brp_ocio::Config, t: Target<'_>| -> Option<(brp_render::OcioShader, brp_render::OcioShader, brp_ocio::Cpu)> {
+        if !effects {
+            return None;
+        }
+        let r2 = (|| -> anyhow::Result<_> {
+            let (pre, post) = split_shaders(src, &r.input.name, dst, t, false, &info.color, 1)?;
+            let cpu = brp_ocio::Cpu::part(src, &r.input.name, dst, t, false, brp_ocio::Part::Out)?;
+            Ok((pre, post, cpu))
+        })();
+        r2.map_err(|e| log::warn!("export: OCIO not split for effects: {e:#}")).ok()
+    };
+    let whole = |dst: &brp_ocio::Config, t: Target<'_>| -> anyhow::Result<(brp_render::OcioShader, brp_ocio::Cpu)> {
+        let sh = brp_ocio::shader(src, &r.input.name, dst, t, false, 1, 1)?;
+        anyhow::ensure!(sh.uniforms == 0, "this conversion has dynamic parameters (not supported)");
+        Ok((to_render(sh), brp_ocio::Cpu::new(src, &r.input.name, dst, t, false)?))
+    };
+    let mut pre = None;
     let (shader, cpu, encoding, label) = match &target {
         OutputTarget::Display(d) | OutputTarget::DisplayView(d, _) => {
             let view = match (&target, &o.view) {
@@ -291,19 +348,31 @@ pub fn export_ocio(lib: &Library, o: &OcioChoices, s: &crate::settings::Settings
             .ok_or_else(|| anyhow::anyhow!("display {} has no views", d.label()))?;
             let dst = lib.get(d.source).ok_or_else(|| anyhow::anyhow!("config not loaded"))?;
             let t = Target::Display { display: &d.name, view: &view };
-            let sh = brp_ocio::shader(src, &r.input.name, dst, t, false, 1, 1)?;
-            let cpu = brp_ocio::Cpu::new(src, &r.input.name, dst, t, false)?;
+            let (sh, cpu) = match split(dst, t) {
+                Some((p, post, cpu)) => {
+                    pre = Some(p);
+                    (post, cpu)
+                }
+                None => whole(dst, t)?,
+            };
             (sh, cpu, auto::encoding(lib, d, true), format!("{} → {} / {view}", r.input.label(), d.label()))
         }
         OutputTarget::Space(c) => {
             let dst = lib.get(c.source).ok_or_else(|| anyhow::anyhow!("config not loaded"))?;
-            let sh = brp_ocio::shader(src, &r.input.name, dst, Target::Space(&c.name), false, 1, 1)?;
-            let cpu = brp_ocio::Cpu::new(src, &r.input.name, dst, Target::Space(&c.name), false)?;
+            let t = Target::Space(&c.name);
+            let (sh, cpu) = match split(dst, t) {
+                Some((p, post, cpu)) => {
+                    pre = Some(p);
+                    (post, cpu)
+                }
+                None => whole(dst, t)?,
+            };
             (sh, cpu, auto::encoding(lib, c, false), format!("{} → {}", r.input.label(), c.label()))
         }
     };
-    anyhow::ensure!(shader.uniforms == 0, "this conversion has dynamic parameters (not supported)");
-    Ok(ExportOcio { shader: to_render(shader), cpu: Arc::new(cpu), encoding, label })
+    let label = if pre.is_some() { format!("{label} (split for effects)") } else { label };
+    Ok(ExportOcio { shader, cpu: Arc::new(cpu), pre, encoding, label })
+
 }
 
 /// The Color panel's choices, as an export takes them.

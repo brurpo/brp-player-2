@@ -5,11 +5,18 @@
 //! - `OcioPass`, the window's last pass: the video (drawn raw, in the file's own
 //!   encoding, into the scene layer) through OCIO, the background and the checkerboard,
 //!   the UI over it, into the swapchain (SDR, or HDR10 from display-referred XYZ).
-//! - `OcioCompute`, for export: a picture through OCIO, on the compute queue.
+//! - `OcioCompute`, for export: a picture through OCIO, on the compute queue; and,
+//!   with effects, OCIO's input transform at the start of the effect chain.
+//!
+//! With effects the conversion is split at the effects' working space (DESIGN.md §7d):
+//! the chain starts from OCIO's linear light (`Part::In`, run by the chain), ends in
+//! the file's own encoding of that light as always (§7a), and the last pass decodes
+//! it back to linear (`OcioShader::from_source`) and runs `Part::Out`.
 
 use crate::composite::Layers;
 use crate::context::GpuContext;
 use crate::gpu::SharedAllocator;
+use crate::workspace::SourceColor;
 use anyhow::{Context, Result};
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
@@ -22,6 +29,28 @@ pub struct OcioShader {
     /// Vulkan GLSL defining `vec4 OCIOMain(vec4)`; textures in descriptor set 1.
     pub glsl: String,
     pub textures: Vec<OcioTexture>,
+    /// The picture is the effect chain's `Source` (the file's own encoding of OCIO's
+    /// linear light, DESIGN.md §7d) and `glsl` starts from the working space (linear
+    /// Rec.2020): decode it with the player's conversion first. None: `glsl` takes the
+    /// picture as it is.
+    pub from_source: Option<SourceColor>,
+}
+
+impl OcioShader {
+    /// GLSL defining `vec3 brp_ocio_in(vec3)`: what the picture becomes before
+    /// `OCIOMain` (the player's decoding of `Source` to linear Rec.2020, or nothing).
+    fn input_glsl(&self) -> String {
+        match self.from_source {
+            Some(sc) => format!(
+                "{}\nvec3 brp_ocio_in(vec3 c) {{ return brp_to_linear(0, c, {}, {}, {:?}); }}\n",
+                crate::workspace::SPACE_GLSL,
+                sc.transfer,
+                sc.bt2020 as i32,
+                sc.peak
+            ),
+            None => "vec3 brp_ocio_in(vec3 c) { return c; }\n".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -287,11 +316,11 @@ const FINITE: &str = "vec3 brp_finite(vec3 c) {
 ";
 
 const PASS_MAIN: &str = r#"
-const mat3 BRP_XYZ_TO_709 = mat3(
+const mat3 BRP_W_XYZ_TO_709 = mat3(
     3.2409699419, -0.9692436363, 0.0556300797,
    -1.5373831776, 1.8759675015, -0.2039769589,
    -0.4986107603, 0.0415550574, 1.0569715142);
-const mat3 BRP_709_TO_2020 = mat3(
+const mat3 BRP_W_709_TO_2020 = mat3(
     0.6274038959, 0.0690972894, 0.0163914389,
     0.3292830384, 0.9195403951, 0.0880133079,
     0.0433130657, 0.0113623156, 0.8955952532);
@@ -319,12 +348,12 @@ void main() {
         code = pc.bg.rgb;
         lin = brp_srgb_decode(pc.bg.rgb);
     } else {
-        vec3 c = brp_finite(OCIOMain(vec4(s.rgb, 1.0)).rgb);
+        vec3 c = brp_finite(OCIOMain(vec4(brp_ocio_in(s.rgb), 1.0)).rgb);
         float a = clamp(s.a, 0.0, 1.0);
         ivec2 cell = ivec2(gl_FragCoord.xy / max(pc.f.z, 1.0));
         float ck = ((cell.x + cell.y) & 1) == 0 ? 0.20 : 0.30;
         if (xyz) {
-            lin = mix(brp_srgb_decode(vec3(ck)), BRP_XYZ_TO_709 * c * pc.f.y, a);
+            lin = mix(brp_srgb_decode(vec3(ck)), BRP_W_XYZ_TO_709 * c * pc.f.y, a);
         } else {
             code = mix(vec3(ck), c, a);
         }
@@ -342,7 +371,7 @@ void main() {
         return;
     }
     vec3 l = brp_srgb_decode(clamp(g, 0.0, 1.0)) + (1.0 - u.a) * (lin - sdr);
-    o_color = vec4(brp_pq_encode(max(BRP_709_TO_2020 * l, 0.0) * pc.f.x), 1.0);
+    o_color = vec4(brp_pq_encode(max(BRP_W_709_TO_2020 * l, 0.0) * pc.f.x), 1.0);
 }
 "#;
 
@@ -366,9 +395,10 @@ impl OcioPass {
         let luts = Luts::new(ctx, s, vk::ShaderStageFlags::FRAGMENT)?;
         let src = format!(
             "#version 460\nlayout(set = 0, binding = 0) uniform sampler2D brp_scene;\nlayout(set = 0, binding = 1) uniform sampler2D brp_ui;\n\
-             layout(push_constant) uniform BrpPC {{ ivec4 mode; vec4 f; vec4 bg; }} pc;\nlayout(location = 0) out vec4 o_color;\n\n{}\n{FINITE}
+             layout(push_constant) uniform BrpPC {{ ivec4 mode; vec4 f; vec4 bg; }} pc;\nlayout(location = 0) out vec4 o_color;\n\n{}\n{}\n{FINITE}
 {PASS_MAIN}",
-            s.glsl
+            s.glsl,
+            s.input_glsl()
         );
         let frag = crate::usershader::compile_fragment(&src, "ocio display")?;
         unsafe {
@@ -480,7 +510,8 @@ impl Drop for OcioPass {
     }
 }
 
-/// A picture (rgba16f) through OCIO, for export (alpha kept).
+/// A picture (rgba16f) through OCIO (alpha kept): for export, and OCIO's input
+/// transform at the start of the effect chain (DESIGN.md §7d).
 pub struct OcioCompute {
     device: ash::Device,
     luts: Luts,
@@ -498,10 +529,11 @@ impl OcioCompute {
         let luts = Luts::new(ctx, s, vk::ShaderStageFlags::COMPUTE)?;
         let src = format!(
             "#version 460\nlayout(local_size_x = 16, local_size_y = 16) in;\nlayout(set = 0, binding = 0, rgba16f) uniform readonly image2D brp_src;\n\
-             layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D brp_dst;\n\n{}\n{FINITE}\n\
+             layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D brp_dst;\n\n{}\n{}\n{FINITE}\n\
              void main() {{\n    ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n    if (any(greaterThanEqual(p, imageSize(brp_dst)))) return;\n\
-                 vec4 c = imageLoad(brp_src, p);\n    imageStore(brp_dst, p, vec4(brp_finite(OCIOMain(vec4(c.rgb, 1.0)).rgb), c.a));\n}}\n",
-            s.glsl
+                 vec4 c = imageLoad(brp_src, p);\n    imageStore(brp_dst, p, vec4(brp_finite(OCIOMain(vec4(brp_ocio_in(c.rgb), 1.0)).rgb), c.a));\n}}\n",
+            s.glsl,
+            s.input_glsl()
         );
         let spv = crate::usershader::compile_glsl(&src, "ocio export")?;
         unsafe {
@@ -517,6 +549,21 @@ impl OcioCompute {
             device.destroy_shader_module(module, None);
             let pipeline = r.map_err(|(_, e)| e)?[0];
             Ok(Arc::new(OcioCompute { device, luts, set_layout, layout, pipeline }))
+        }
+    }
+
+    /// Layout of the descriptor set `dispatch` takes (binding 0 source, 1 destination:
+    /// storage images, rgba16f, GENERAL).
+    pub(crate) fn set_layout(&self) -> vk::DescriptorSetLayout {
+        self.set_layout
+    }
+
+    /// Record into `cb` with the caller's descriptor set (see `set_layout`).
+    pub(crate) fn dispatch(&self, cb: vk::CommandBuffer, set: vk::DescriptorSet, w: u32, h: u32) {
+        unsafe {
+            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &[set, self.luts.set], &[]);
+            self.device.cmd_dispatch(cb, w.div_ceil(16), h.div_ceil(16), 1);
         }
     }
 

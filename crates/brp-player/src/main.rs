@@ -9,6 +9,7 @@ mod export_ui;
 mod i18n;
 mod icons;
 mod instance;
+mod logfile;
 mod player;
 mod popup;
 mod settings;
@@ -119,6 +120,15 @@ impl App {
             }
         }
         let window = Arc::new(el.create_window(attrs)?);
+        log::info!("startup: window made");
+        // BRP_TEST_PANIC, BRP_TEST_CRASH: end here with a panic, or with an access
+        // violation as a faulty driver would (checking the log and the message box).
+        if std::env::var_os("BRP_TEST_PANIC").is_some() {
+            panic!("BRP_TEST_PANIC");
+        }
+        if std::env::var_os("BRP_TEST_CRASH").is_some() {
+            unsafe { (std::hint::black_box(8usize) as *mut u32).write_volatile(1) };
+        }
         // BRP_TEST_MAXIMIZED: open maximized (as most people play).
         if restore_max || std::env::var_os("BRP_TEST_MAXIMIZED").is_some() {
             window.set_maximized(true);
@@ -175,6 +185,12 @@ impl App {
             Some(8192),
         );
         let mut ui = UiState::new(renderer.gpu_name().to_string(), &egui_ctx, self.settings.clone());
+        // Parts this GPU's driver could not build: the player runs without them.
+        let missing = renderer.unavailable();
+        if !missing.is_empty() {
+            let parts: Vec<&str> = missing.iter().map(|k| ui.lang.t(k)).collect();
+            ui.toast(format!("{}: {}", ui.lang.t("gpu_missing"), parts.join(", ")));
+        }
         // Decoders on the GPU (DXV, ProRes): registered before any file opens.
         brp_media::gpudec::set_factory(Some(brp_render::gpudec::factory(&renderer.gpu())));
         player.ai.ctx = Some(renderer.gpu());
@@ -687,6 +703,8 @@ impl Win {
                 self.window.request_redraw();
             }
         }
+        // The background effects start from OCIO's linear light as the window's do.
+        self.player.ai.set_ocio(renderer.ocio_pre());
 
         // Effect chain changes and background shader compiles.
         if self.player.fx.dirty {
@@ -864,6 +882,15 @@ impl ApplicationHandler<UserEvent> for App {
             let file = self.initial_file.take();
             if let Err(e) = self.create_window(el, file) {
                 log::error!("could not start: {e:#}");
+                // No usable graphics card or driver: say which were found and what to do.
+                let (hint, detail) = match e.downcast_ref::<brp_render::GpuError>() {
+                    Some(brp_render::GpuError::NoneUsable(list)) if !list.is_empty() => {
+                        (Some("start_gpu"), list.iter().map(|g| format!("{} (driver {}): {}", g.name, g.driver, g.reason)).collect::<Vec<_>>().join("\n"))
+                    }
+                    Some(_) => (Some("start_gpu"), format!("{e:#}")),
+                    None => (None, format!("{e:#}")),
+                };
+                logfile::fatal("start_failed", hint, &detail);
                 el.exit();
             }
         }
@@ -1112,12 +1139,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // The log file first (see `logfile`): what follows is in it.
+    logfile::init("info,wgpu=warn");
     // Driver start-up is the slowest part of launch: begin it before anything else.
     let gpu_init = std::thread::Builder::new().name("brp-gpu-init".into()).spawn(brp_render::GpuInstance::new).ok();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu=warn")).init();
     brp_media::init();
 
-    let el = EventLoop::<UserEvent>::with_user_event().build()?;
+    let el = EventLoop::<UserEvent>::with_user_event().build().inspect_err(|e| logfile::fatal("start_failed", None, &e.to_string()))?;
     let proxy: EventLoopProxy<UserEvent> = el.create_proxy();
     if !new_window {
         instance::listen(move |msg| {
@@ -1126,6 +1154,7 @@ fn main() -> anyhow::Result<()> {
     }
     let start_frame = std::env::args().find_map(|a| a.strip_prefix("--frame=").and_then(|v| v.parse().ok()));
     let settings = settings::Settings::load();
+    logfile::set_lang(settings.lang);
     if let Some(b) = settings.cache_bytes {
         brp_media::mem::set_cache_budget(b as usize);
     }
@@ -1135,12 +1164,14 @@ fn main() -> anyhow::Result<()> {
         brp_media::mem::set_fx_cache_budget(mb << 20);
     }
     let mut app = App { start, gpu_init, initial_file, start_frame, wins: HashMap::new(), focus_order: Vec::new(), popup_owner: HashMap::new(), settings, settings_pending: None };
-    el.run_app(&mut app)?;
+    el.run_app(&mut app).inspect_err(|e| logfile::fatal("crashed", None, &e.to_string()))?;
     // Drop the windows (GPU resources, AI threads) before the process exits, while
     // the GPU driver is still loaded.
     app.wins.clear();
     if app.settings_pending.is_some() {
         app.settings.save();
     }
+    // A log without this line: the run did not end by itself.
+    log::info!("exit");
     Ok(())
 }

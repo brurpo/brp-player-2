@@ -24,6 +24,7 @@ unsafe extern "C" {
         view: *const c_char,
         dst_cs: *const c_char,
         to_xyz: i32,
+        part: i32,
         set: u32,
         binding_start: u32,
         err: *mut *mut c_char,
@@ -54,6 +55,7 @@ unsafe extern "C" {
         view: *const c_char,
         dst_cs: *const c_char,
         to_xyz: i32,
+        part: i32,
         err: *mut *mut c_char,
     ) -> *mut c_void;
     fn brp_ocio_cpu_release(c: *mut c_void);
@@ -209,6 +211,30 @@ pub enum Target<'a> {
     Display { display: &'a str, view: &'a str },
 }
 
+/// Which part of a conversion (DESIGN.md §7d): all of it, or one side of the effects'
+/// working space (linear light, Rec.2020 primaries, 1.0 = SDR white). `Out` after
+/// `In` is `Whole`: both meet at an interchange colour space of the input's config
+/// (display-referred CIE-XYZ D65 for display inputs, no view or tone curve; ACES2065-1
+/// for scene-referred ones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    Whole,
+    /// The input to the working space (the target is not used).
+    In,
+    /// The working space to the target.
+    Out,
+}
+
+impl Part {
+    fn id(self) -> i32 {
+        match self {
+            Part::Whole => 0,
+            Part::In => 1,
+            Part::Out => 2,
+        }
+    }
+}
+
 /// One LUT texture of a GPU shader.
 #[derive(Clone, Debug)]
 pub struct Texture {
@@ -247,9 +273,15 @@ fn ptrs(t: Target<'_>) -> (CString, CString, CString) {
 /// display-referred CIE-XYZ D65 of `dst` (1.0 = the display's white, or 100 nits for HDR
 /// displays). Textures go in descriptor set `set` from `binding_start`.
 pub fn shader(src: &Config, src_cs: &str, dst: &Config, target: Target<'_>, to_xyz: bool, set: u32, binding_start: u32) -> Result<Shader> {
+    shader_part(src, src_cs, dst, target, to_xyz, Part::Whole, set, binding_start)
+}
+
+/// `part` of the conversion `shader` makes.
+#[allow(clippy::too_many_arguments)]
+pub fn shader_part(src: &Config, src_cs: &str, dst: &Config, target: Target<'_>, to_xyz: bool, part: Part, set: u32, binding_start: u32) -> Result<Shader> {
     let (d, v, c) = ptrs(target);
     let mut err = std::ptr::null_mut();
-    let s = unsafe { brp_ocio_shader(src.ptr, cs(src_cs).as_ptr(), dst.ptr, d.as_ptr(), v.as_ptr(), c.as_ptr(), to_xyz as i32, set, binding_start, &mut err) };
+    let s = unsafe { brp_ocio_shader(src.ptr, cs(src_cs).as_ptr(), dst.ptr, d.as_ptr(), v.as_ptr(), c.as_ptr(), to_xyz as i32, part.id(), set, binding_start, &mut err) };
     if s.is_null() {
         return Err(take_err(err));
     }
@@ -308,9 +340,14 @@ impl Drop for Cpu {
 
 impl Cpu {
     pub fn new(src: &Config, src_cs: &str, dst: &Config, target: Target<'_>, to_xyz: bool) -> Result<Cpu> {
+        Cpu::part(src, src_cs, dst, target, to_xyz, Part::Whole)
+    }
+
+    /// `part` of the conversion.
+    pub fn part(src: &Config, src_cs: &str, dst: &Config, target: Target<'_>, to_xyz: bool, part: Part) -> Result<Cpu> {
         let (d, v, c) = ptrs(target);
         let mut err = std::ptr::null_mut();
-        let p = unsafe { brp_ocio_cpu(src.ptr, cs(src_cs).as_ptr(), dst.ptr, d.as_ptr(), v.as_ptr(), c.as_ptr(), to_xyz as i32, &mut err) };
+        let p = unsafe { brp_ocio_cpu(src.ptr, cs(src_cs).as_ptr(), dst.ptr, d.as_ptr(), v.as_ptr(), c.as_ptr(), to_xyz as i32, part.id(), &mut err) };
         if p.is_null() {
             return Err(take_err(err));
         }
@@ -481,5 +518,116 @@ impl Library {
             Source::Blender => "Blender".into(),
             Source::Custom => self.custom_name.clone().unwrap_or_else(|| "Custom".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    //! The effects' working space (DESIGN.md §7d): `Part::Out` after `Part::In` is the
+    //! whole conversion, and `Part::In` gives the player's own linear light where the
+    //! player can decode the file itself.
+    use super::*;
+
+    fn lib() -> Library {
+        Library::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ocio-configs"), None)
+    }
+
+    /// Pixels over `lo..hi` on each channel (a 9³ grid).
+    fn grid(lo: f32, hi: f32) -> Vec<f32> {
+        let mut v = Vec::new();
+        for r in 0..9 {
+            for g in 0..9 {
+                for b in 0..9 {
+                    v.extend([r, g, b].map(|i| lo + (hi - lo) * i as f32 / 8.0));
+                }
+            }
+        }
+        v
+    }
+
+    fn apply(c: &Cpu, px: &[f32]) -> Vec<f32> {
+        let mut v = px.to_vec();
+        c.apply(&mut v);
+        v
+    }
+
+    /// Largest difference relative to max(1, |value|).
+    fn worst(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(1.0)).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn out_after_in_is_whole() {
+        let lib = lib();
+        let b = lib.get(Source::Builtin).unwrap();
+        let cases: Vec<(Source, &str, (f32, f32))> = vec![
+            (Source::Builtin, "Rec.1886 Rec.709 - Display", (0.0, 1.0)),
+            (Source::Builtin, "sRGB - Display", (0.0, 1.0)),
+            (Source::Builtin, "Rec.2100-PQ - Display", (0.0, 0.9)),
+            (Source::Builtin, "Rec.2100-HLG - Display", (0.0, 1.0)),
+            (Source::Builtin, "ARRI LogC4", (0.05, 0.9)),
+            (Source::Builtin, "ARRI LogC3 (EI800)", (0.05, 0.9)),
+            (Source::Builtin, "ACEScg", (0.0, 8.0)),
+            (Source::Builtin, "Linear Rec.709 (sRGB)", (0.0, 8.0)),
+            (Source::Maya, "ACEScg", (0.0, 8.0)),
+            (Source::Blender, "AgX Log", (0.0, 1.0)),
+            (Source::Blender, "Linear Rec.709", (0.0, 8.0)),
+        ];
+        let targets: Vec<(Source, Target)> = vec![
+            (Source::Builtin, Target::Display { display: "sRGB - Display", view: "Video (colorimetric)" }),
+            (Source::Builtin, Target::Display { display: "sRGB - Display", view: "ACES 2.0 - SDR 100 nits (Rec.709)" }),
+            (Source::Builtin, Target::Space("Rec.1886 Rec.709 - Display")),
+            (Source::Builtin, Target::Space("ACEScg")),
+            (Source::Blender, Target::Display { display: "sRGB", view: "AgX" }),
+        ];
+        for (s, name, (lo, hi)) in &cases {
+            let src = lib.get(*s).unwrap();
+            let px = grid(*lo, *hi);
+            let pre = Cpu::part(src, name, b, Target::Space("ACEScg"), false, Part::In).unwrap();
+            let lin = apply(&pre, &px);
+            for (d, t) in &targets {
+                let dst = lib.get(*d).unwrap();
+                let Ok(whole) = Cpu::new(src, name, dst, *t, false) else { continue };
+                let post = Cpu::part(src, name, dst, *t, false, Part::Out).unwrap();
+                let (a, z) = (apply(&whole, &px), apply(&post, &lin));
+                let e = worst(&a, &z);
+                if e > 5e-4 {
+                    let k = (0..a.len()).max_by(|&i, &j| ((a[i] - z[i]).abs() / a[i].abs().max(1.0)).total_cmp(&((a[j] - z[j]).abs() / a[j].abs().max(1.0)))).unwrap() / 3;
+                    println!("  worst at input {:?}: whole {:?}, split {:?}", &px[k * 3..k * 3 + 3], &a[k * 3..k * 3 + 3], &z[k * 3..k * 3 + 3]);
+                }
+                println!("{name} ({s:?}) -> {t:?}: worst {e:.2e} ({:.3} 8-bit levels)", e * 255.0);
+                // Largest where a channel is exactly 0 and the target has a steep gamma: the matrix
+                // round trip leaves ~1e-8 of light, gamma 1/2.4 makes it ~0.001.
+                assert!(e < 4e-3, "{name} -> {t:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn in_is_the_players_linear_light() {
+        let lib = lib();
+        let b = lib.get(Source::Builtin).unwrap();
+        let to2020 = |c: [f32; 3]| -> [f32; 3] {
+            let m = [[0.6274039, 0.3292830, 0.0433131], [0.0690973, 0.9195404, 0.0113623], [0.0163914, 0.0880133, 0.8955953]];
+            m.map(|r| r[0] * c[0] + r[1] * c[1] + r[2] * c[2])
+        };
+        let pq = |e: f32| {
+            let (m1, m2, c1, c2, c3) = (0.1593017578125f32, 78.84375f32, 0.8359375f32, 18.8515625f32, 18.6875f32);
+            let p = e.powf(1.0 / m2);
+            ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1) * 10000.0 / 203.0
+        };
+        let px = grid(0.0, 1.0);
+        let check = |name: &str, f: &dyn Fn([f32; 3]) -> [f32; 3], tol: f32| {
+            let pre = Cpu::part(b, name, b, Target::Space("ACEScg"), false, Part::In).unwrap();
+            let got = apply(&pre, &px);
+            let want: Vec<f32> = px.chunks(3).flat_map(|c| f([c[0], c[1], c[2]])).collect();
+            let e = worst(&want, &got);
+            println!("{name}: in vs the player's linear: worst {e:.2e}");
+            assert!(e < tol, "{name}: {e}");
+        };
+        check("Rec.1886 Rec.709 - Display", &|c| to2020(c.map(|x| x.powf(2.4))), 1e-4);
+        check("Rec.2100-PQ - Display", &|c| c.map(pq), 1e-3);
+        check("Linear Rec.709 (sRGB)", &|c| to2020(c), 1e-4);
+        check("Linear Rec.2020", &|c| c, 1e-4);
     }
 }

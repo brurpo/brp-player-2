@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Edges
 // @brp pt.title Bordas
 // @brp pt.param LowThreshold Limiar baixo | Limiar inferior da detecção de bordas. Ajuda a ligar as linhas.
 // @brp pt.param HighThreshold Limiar alto | Limiar superior da detecção de bordas. Define os pixels de borda forte.

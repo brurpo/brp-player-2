@@ -1,6 +1,6 @@
 //! Vulkan instance, device, queue and allocator.
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -10,6 +10,131 @@ use std::sync::{Arc, Mutex};
 pub struct GpuDevice {
     pub name: String,
     pub discrete: bool,
+}
+
+/// A GPU the system lists that the player cannot use, and why.
+#[derive(Clone, Debug)]
+pub struct GpuReject {
+    pub name: String,
+    /// Its driver's version, as the vendor writes it.
+    pub driver: String,
+    pub reason: String,
+}
+
+/// No GPU here can run the player (the app shows this at start-up).
+#[derive(Debug)]
+pub enum GpuError {
+    /// No Vulkan on this system at all (no graphics driver that brings it).
+    NoVulkan(String),
+    /// The GPUs found, none of them usable.
+    NoneUsable(Vec<GpuReject>),
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::NoVulkan(e) => write!(f, "Vulkan not found on this system ({e})"),
+            GpuError::NoneUsable(list) if list.is_empty() => f.write_str("no Vulkan GPU found"),
+            GpuError::NoneUsable(list) => {
+                f.write_str("no usable Vulkan 1.3 GPU (a newer graphics driver may bring it): ")?;
+                for (i, g) in list.iter().enumerate() {
+                    write!(f, "{}{} (driver {}): {}", if i > 0 { "; " } else { "" }, g.name, g.driver, g.reason)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+/// A driver's version as its vendor writes it (NVIDIA 572.83, Intel on Windows
+/// 101.5333; others pack it like a Vulkan version).
+fn driver_version(vendor: u32, v: u32) -> String {
+    match vendor {
+        0x10de => format!("{}.{:02}", v >> 22, (v >> 14) & 0xff),
+        0x8086 if cfg!(windows) => format!("{}.{}", v >> 14, v & 0x3fff),
+        _ => format!("{}.{}.{}", vk::api_version_major(v), vk::api_version_minor(v), vk::api_version_patch(v)),
+    }
+}
+
+/// The best GPU the player can use: (device, queue family, name). With `surface`,
+/// one that can present to it. `preferred` picks a GPU by (part of) its name;
+/// otherwise a discrete GPU wins. Every GPU found goes to the log, with why it
+/// cannot be used if so.
+unsafe fn pick_device(instance: &ash::Instance, surface: Option<(&ash::khr::surface::Instance, vk::SurfaceKHR)>, preferred: Option<&str>) -> Result<(vk::PhysicalDevice, u32, String)> {
+    unsafe {
+        // BRP_TEST_OLD_DRIVER: every GPU counts as offering Vulkan 1.2 only (a driver
+        // from before 2022), to check the start-up message.
+        let old_driver = std::env::var_os("BRP_TEST_OLD_DRIVER").is_some();
+        let mut best: Option<(i32, vk::PhysicalDevice, u32, String)> = None;
+        let mut rejected = Vec::new();
+        for pd in instance.enumerate_physical_devices()? {
+            let props = instance.get_physical_device_properties(pd);
+            let name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let driver = driver_version(props.vendor_id, props.driver_version);
+            let api = if old_driver { props.api_version.min(vk::make_api_version(0, 1, 2, 198)) } else { props.api_version };
+            let found = format!(
+                "{name} ({:?}, {:04x}:{:04x}, driver {driver}, Vulkan {}.{}.{})",
+                props.device_type,
+                props.vendor_id,
+                props.device_id,
+                vk::api_version_major(api),
+                vk::api_version_minor(api),
+                vk::api_version_patch(api)
+            );
+            let families = instance.get_physical_device_queue_family_properties(pd);
+            let reason = if api < vk::API_VERSION_1_3 {
+                Some(format!("its driver offers Vulkan {}.{} only (1.3 needed)", vk::api_version_major(api), vk::api_version_minor(api)))
+            } else {
+                // The features every part of the player is built on (all of them
+                // required of a Vulkan 1.3 driver).
+                let (mut s12, mut s13) = (vk::PhysicalDeviceVulkan12Features::default(), vk::PhysicalDeviceVulkan13Features::default());
+                let mut s2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut s12).push_next(&mut s13);
+                instance.get_physical_device_features2(pd, &mut s2);
+                let missing: Vec<&str> = [(s12.buffer_device_address, "bufferDeviceAddress"), (s13.dynamic_rendering, "dynamicRendering"), (s13.synchronization2, "synchronization2")]
+                    .into_iter()
+                    .filter(|(on, _)| *on == 0)
+                    .map(|(_, n)| n)
+                    .collect();
+                (!missing.is_empty()).then(|| format!("its driver lacks Vulkan features: {}", missing.join(", ")))
+            };
+            let qf = match surface {
+                Some((surface_fn, surface)) => families.iter().enumerate().position(|(i, f)| {
+                    f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && surface_fn.get_physical_device_surface_support(pd, i as u32, surface).unwrap_or(false)
+                }),
+                None => families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)),
+            };
+            let reason = reason.or_else(|| qf.is_none().then(|| if surface.is_some() { "cannot present to this window".to_string() } else { "no graphics and compute queue".to_string() }));
+            if let Some(reason) = reason {
+                log::warn!("GPU found: {found}: not usable: {reason}");
+                rejected.push(GpuReject { name, driver, reason });
+                continue;
+            }
+            log::info!("GPU found: {found}");
+            let mut score = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 100,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 50,
+                _ if surface.is_some() => 10,
+                _ => 50,
+            };
+            if preferred.is_some_and(|p| name.to_lowercase().contains(&p.to_lowercase())) {
+                score += 1000;
+            }
+            if best.as_ref().is_none_or(|b| score > b.0) {
+                best = Some((score, pd, qf.unwrap() as u32, name));
+            }
+        }
+        match best {
+            Some((_, pd, qf, name)) => Ok((pd, qf, name)),
+            None => {
+                if rejected.is_empty() {
+                    log::warn!("GPU found: none (no graphics driver with Vulkan)");
+                }
+                Err(GpuError::NoneUsable(rejected).into())
+            }
+        }
+    }
 }
 
 pub struct GpuContext {
@@ -185,8 +310,10 @@ impl GpuInstance {
         let t0 = std::time::Instant::now();
         let lap = |what: &str| log::debug!("vk init: {what} at {:?}", t0.elapsed());
         unsafe {
-            let entry = ash::Entry::load().context("Vulkan loader not found")?;
+            let entry = ash::Entry::load().map_err(|e| GpuError::NoVulkan(e.to_string()))?;
             lap("loader");
+            let loader = entry.try_enumerate_instance_version().ok().flatten().unwrap_or(vk::API_VERSION_1_0);
+            log::info!("Vulkan loader {}.{}.{}", vk::api_version_major(loader), vk::api_version_minor(loader), vk::api_version_patch(loader));
             let available = entry.enumerate_instance_extension_properties(None)?;
             let has_ext = |name: &CStr| available.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
             // Every surface extension this system offers (the window type is not known yet).
@@ -302,36 +429,18 @@ impl GpuContext {
 
             lap("surface");
             // Pick a device that can present to this surface and supports Vulkan 1.3.
-            let mut best: Option<(i32, vk::PhysicalDevice, u32, String)> = None;
-            for pd in instance.enumerate_physical_devices()? {
-                let props = instance.get_physical_device_properties(pd);
-                if props.api_version < vk::API_VERSION_1_3 {
-                    continue;
-                }
-                let name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let families = instance.get_physical_device_queue_family_properties(pd);
-                let Some(qf) = families.iter().enumerate().find_map(|(i, f)| {
-                    let ok = f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                        && surface_fn.get_physical_device_surface_support(pd, i as u32, surface).unwrap_or(false);
-                    ok.then_some(i as u32)
-                }) else {
-                    continue;
-                };
-                let mut score = match props.device_type {
-                    vk::PhysicalDeviceType::DISCRETE_GPU => 100,
-                    vk::PhysicalDeviceType::INTEGRATED_GPU => 50,
-                    _ => 10,
-                };
-                if let Some(p) = preferred {
-                    if name.to_lowercase().contains(&p.to_lowercase()) {
-                        score += 1000;
+            let (physical, queue_family, device_name) = match pick_device(&instance, Some((&surface_fn, surface)), preferred) {
+                Ok(d) => d,
+                Err(e) => {
+                    // Nothing else is made yet: the surface and the instance go here.
+                    surface_fn.destroy_surface(surface, None);
+                    if let Some((du, m)) = debug {
+                        du.destroy_debug_utils_messenger(m, None);
                     }
+                    instance.destroy_instance(None);
+                    return Err(e);
                 }
-                if best.as_ref().is_none_or(|b| score > b.0) {
-                    best = Some((score, pd, qf, name));
-                }
-            }
-            let (_, physical, queue_family, device_name) = best.context("no Vulkan 1.3 GPU can present to this window")?;
+            };
             log::info!("GPU: {device_name}");
 
             lap("pick device");
@@ -375,27 +484,7 @@ impl GpuContext {
     pub fn headless(inst: GpuInstance, preferred: Option<&str>) -> Result<Self> {
         let GpuInstance { entry, instance, debug } = inst;
         unsafe {
-            let mut best: Option<(i32, vk::PhysicalDevice, u32, String)> = None;
-            for pd in instance.enumerate_physical_devices()? {
-                let props = instance.get_physical_device_properties(pd);
-                if props.api_version < vk::API_VERSION_1_3 {
-                    continue;
-                }
-                let name = props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let Some(qf) = instance.get_physical_device_queue_family_properties(pd).iter().position(|f| {
-                    f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                }) else {
-                    continue;
-                };
-                let mut score = if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU { 100 } else { 50 };
-                if preferred.is_some_and(|p| name.to_lowercase().contains(&p.to_lowercase())) {
-                    score += 1000;
-                }
-                if best.as_ref().is_none_or(|b| score > b.0) {
-                    best = Some((score, pd, qf as u32, name));
-                }
-            }
-            let (_, physical, queue_family, device_name) = best.context("no Vulkan 1.3 GPU")?;
+            let (physical, queue_family, device_name) = pick_device(&instance, None, preferred)?;
             let Device { device, queue, compute_queue, allocator, fp16, coopmat, subgroup_size, coopmat_acc16, memory_budget } = create_device(&entry, &instance, physical, queue_family, &[])?;
             let pipeline_cache = crate::shader_cache::load_pipeline_cache(&device, &instance.get_physical_device_properties(physical));
             let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);

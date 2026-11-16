@@ -60,6 +60,12 @@ pub struct ChainFrame<'a> {
     pub space: Space,
     /// Space the output must be in (None: whatever the last effect left).
     pub want: Option<Space>,
+    /// OpenColorIO's input transform (to the working space, linear Rec.2020), when
+    /// OCIO is on (DESIGN.md §7d): run on the decoded `planes` (`space` `Source`), so
+    /// the chain starts from OCIO's linear light instead of the player's decoding of
+    /// the file. `Source` is then the file's own encoding of that light. The caller
+    /// keeps it alive until the work has run.
+    pub ocio: Option<&'a crate::ocio::OcioCompute>,
 }
 
 pub struct ChainOutput {
@@ -644,6 +650,19 @@ impl EffectChain {
         };
         reg.insert("MAIN".into(), main);
         let mut space = f.space;
+        if let (Some(o), Space::Source) = (f.ocio, f.space) {
+            // OCIO's input transform: the picture becomes its linear light.
+            let (src, w, h) = main;
+            let (dst, _) = self.alloc_image(cb, w, h)?;
+            let set = self.alloc_set(si, o.set_layout())?;
+            self.write_image(set, 0, src, vk::ImageLayout::GENERAL, true);
+            self.write_image(set, 1, dst, vk::ImageLayout::GENERAL, true);
+            o.dispatch(cb, set, w, h);
+            barrier(&d, cb);
+            reg.insert("MAIN".into(), (dst, w, h));
+            self.release_dead(src, &reg);
+            space = Space::Linear;
+        }
         self.run_main(cb, si, f, &mut reg, &mut space)?;
         let sc = SourceColor::of(&f.color);
         if let Some(want) = f.want.filter(|w| !sc.same(space, *w)) {

@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Color Correction
 // @brp pt.title Correção de cor
 // @brp pt.param SharpenStrength Nitidez | Quanto de nitidez aplicar. 0 = sem efeito.
 // @brp pt.param SharpenRadius Raio da nitidez | Raio do desfoque da máscara de nitidez. Valores maiores afetam bordas mais largas.

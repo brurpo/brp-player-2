@@ -22,6 +22,8 @@ ffmpeg-sys-next.workspace = true
 env_logger.workspace = true
 winit.workspace = true
 png = "0.18"
+# spacecheck --ocio: OCIO's split for effects against its CPU processor (DESIGN.md §7d).
+brp-ocio = { path = "../brp-ocio" }
 
 # HDR screens: is HDR on for the window's monitor, its peak and SDR white (hdr.rs).
 [target.'cfg(windows)'.dependencies]

@@ -65,6 +65,11 @@ pub struct Player {
     pub sub: u8,
     /// Paced playback (AI effects) is keeping real time: audio plays.
     realtime: bool,
+    /// Playback without AI effects is waiting for frames to be read (a file that
+    /// reads slower than it plays): audio is off until reading is ahead again.
+    behind: bool,
+    /// The frame playback is waiting for, and since when.
+    waiting_for: Option<(i64, Instant)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +125,8 @@ impl Player {
             ai: crate::ai::Ai::new(),
             sub: 0,
             realtime: false,
+            behind: false,
+            waiting_for: None,
         }
     }
 
@@ -324,9 +331,10 @@ impl Player {
     }
 
     /// Audio plays only for normal forward playback at native speed; with AI effects,
-    /// only while their processing keeps real time (playback waits for each picture).
+    /// only while their processing keeps real time (playback waits for each picture);
+    /// without, not while playback waits for frames to be read (`behind`).
     fn audio_wanted(&self) -> bool {
-        self.playing && self.dir > 0 && (self.speed - 1.0).abs() < 0.01 && self.slow() == 1 && (!self.ai.paces() || self.realtime)
+        self.playing && self.dir > 0 && (self.speed - 1.0).abs() < 0.01 && self.slow() == 1 && if self.ai.paces() { self.realtime } else { !self.behind }
     }
 
     /// Start, restart or stop audio to match playback. `restart` = time jumped.
@@ -389,6 +397,8 @@ impl Player {
             self.current = self.out_frame();
         }
         self.realtime = false;
+        self.behind = false;
+        self.waiting_for = None;
         self.playing = true;
         self.play_pressed = Some(Instant::now());
         self.reset_clock();
@@ -416,6 +426,7 @@ impl Player {
 
     pub fn seek(&mut self, frame: i64) {
         self.realtime = false;
+        self.waiting_for = None;
         self.current = frame.clamp(0, self.last_frame());
         self.field = 0;
         self.sub = 0;
@@ -660,9 +671,60 @@ impl Player {
         if self.playing && self.ai.paces() {
             self.tick_paced();
         } else if self.playing {
-            let t = self.clock_base + self.clock_start.elapsed().as_secs_f64() * self.speed * self.dir as f64;
+            let mut t = self.clock_base + self.clock_start.elapsed().as_secs_f64() * self.speed * self.dir as f64;
             let mut target = src.frame_at_time(t.max(0.0));
             let (lo, hi) = (self.in_point, self.out_frame());
+            // At normal speed or slower, never pass a frame that is not decoded yet (a
+            // file that reads slower than it plays: a network drive, a heavy codec):
+            // stay on the last one that is, and hold the clock there. Every frame is
+            // then shown and kept in memory (the decoder also reads ahead, `fill`), and
+            // playback runs at speed once they are: the next pass of a loop, or as soon
+            // as reading gets ahead. Faster than normal, frames are skipped anyway.
+            let mut hold = None;
+            let was_behind = self.behind;
+            if self.speed <= 1.0 + 1e-6 {
+                let step = self.dir as i64;
+                let goal = target.clamp(lo.min(self.current), hi.max(self.current));
+                let mut reach = self.current;
+                while reach != goal && (goal - reach) * step > 0 {
+                    let next = reach + step;
+                    // A frame that never comes (a gap in the file, a decode error) is
+                    // passed after HOLD_LIMIT.
+                    let given_up = matches!(self.waiting_for, Some((f, since)) if f == next && since.elapsed().as_secs_f64() > HOLD_LIMIT);
+                    if src.get(next).is_none() && !given_up {
+                        break;
+                    }
+                    reach = next;
+                }
+                if (goal - reach) * step > 0 {
+                    hold = Some(reach);
+                    if !matches!(self.waiting_for, Some((f, _)) if f == reach + step) {
+                        self.waiting_for = Some((reach + step, Instant::now()));
+                    }
+                } else {
+                    self.waiting_for = None;
+                }
+            }
+            if let Some(reach) = hold {
+                // The clock waits at the end of `reach` (its start, backward).
+                t = if self.dir > 0 { (src.frame_end_time(reach) - 1e-4).max(src.frame_time(reach)) } else { src.frame_time(reach) };
+                target = reach;
+                self.clock_base = t;
+                self.clock_start = Instant::now();
+                // A short wait is a hiccup; a longer one means reading is slower than
+                // playing: audio off until it is ahead again.
+                if !self.behind && matches!(self.waiting_for, Some((_, since)) if since.elapsed().as_secs_f64() > BEHIND_AFTER) {
+                    self.behind = true;
+                    log::debug!("playback waiting for frames at {reach}: audio off");
+                }
+            } else if self.behind && self.dir > 0 {
+                // Ahead again: the next frames are all in memory.
+                let buffered = (1..=REALTIME_BUFFER as i64).all(|k| self.current + k > hi || src.get(self.current + k).is_some());
+                if buffered {
+                    self.behind = false;
+                    log::debug!("playback keeping real time at frame {}: audio on", self.current);
+                }
+            }
             // Compare times, not frame numbers: frame lookup clamps to the last frame,
             // so without an Out point the frame number never passes the end.
             let past_end = target > hi || t >= src.frame_end_time(hi);
@@ -686,6 +748,14 @@ impl Player {
                 }
             }
             self.current = target;
+            if self.behind != was_behind {
+                // Stop audio, or start it again on this frame.
+                if !self.behind {
+                    self.reset_clock();
+                } else {
+                    self.sync_audio(false);
+                }
+            }
             let subs = self.subs();
             let src = self.source.as_ref().unwrap();
             let (t0, t1) = (src.frame_time(target), src.frame_end_time(target));
@@ -704,7 +774,7 @@ impl Player {
         }
         let deint = self.deint_method().is_some();
         let src = self.source.as_ref().unwrap();
-        src.request(Request { frame: self.current, playing: self.playing, dir: self.dir, ahead: if self.ai.active() && !self.scrubbing { 60 } else { 0 }, fill: !self.scrubbing });
+        src.request(Request { frame: self.current, playing: self.playing, dir: self.dir, ahead: if self.ai.active() && !self.scrubbing { 60 } else { 0 }, fill: !self.scrubbing, range: (self.in_point, self.out_frame()), looping: self.loop_on });
 
         let exact = src.get(self.current);
         let mut waiting = exact.is_none();
@@ -864,3 +934,84 @@ impl Player {
 
 /// Pictures that must be ready ahead before audio plays with AI effects (~0.4 s).
 const REALTIME_BUFFER: usize = 12;
+/// Playback waiting for a frame this long (seconds) is behind: audio goes off.
+const BEHIND_AFTER: f64 = 0.2;
+/// A frame that has not come after this long (seconds) is passed.
+const HOLD_LIMIT: f64 = 5.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file that reads slower than it plays (`BRP_SLOW_READ_MS`, as a network drive
+    /// would): the first pass of a loop shows every frame in order, slower than real
+    /// time; the next pass finds them in memory and runs at speed. Run on its own (the
+    /// slow reads are for the whole process):
+    ///   cargo test -p brp-player --release -- --ignored slow_reads
+    #[test]
+    #[ignore]
+    fn slow_reads_show_every_frame_then_play_at_speed() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../footage/interlaced.mp4");
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipped: {path} not there");
+            return;
+        }
+        // 60 ms a packet: 16 frames a second for a 29.97 fps file.
+        unsafe { std::env::set_var("BRP_SLOW_READ_MS", "60") };
+        brp_media::init();
+        let mut p = Player::new();
+        p.muted = true;
+        p.open(path);
+        let t0 = Instant::now();
+        while !p.source.as_ref().is_some_and(|s| s.index_ready()) {
+            assert!(t0.elapsed().as_secs() < 20, "index");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (lo, hi) = (0i64, 44i64);
+        p.in_point = lo;
+        p.out_point = hi;
+        p.loop_on = true;
+        p.scrubbing = true; // no read-ahead before play: the first pass starts cold
+        p.tick();
+        p.scrubbing = false;
+        let fps = p.native_fps();
+        p.play();
+        // (frame, when) at every change of the frame on screen.
+        let mut shown: Vec<(i64, f64)> = vec![(p.current, 0.0)];
+        let t0 = Instant::now();
+        let mut passes = 0;
+        while passes < 3 && t0.elapsed().as_secs() < 40 {
+            p.tick();
+            if p.current != shown.last().unwrap().0 {
+                if p.current < shown.last().unwrap().0 {
+                    passes += 1;
+                }
+                shown.push((p.current, t0.elapsed().as_secs_f64()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(passes, 3, "three passes of the loop");
+        // Split into passes at each wrap.
+        let mut runs: Vec<Vec<(i64, f64)>> = vec![vec![]];
+        for (i, &(f, t)) in shown.iter().enumerate() {
+            if i > 0 && f < shown[i - 1].0 {
+                runs.push(vec![]);
+            }
+            runs.last_mut().unwrap().push((f, t));
+        }
+        let real = (hi - lo + 1) as f64 / fps;
+        for (k, r) in runs.iter().take(3).enumerate() {
+            let skipped: Vec<i64> = (lo..=hi).filter(|f| !r.iter().any(|x| x.0 == *f)).collect();
+            let took = r.last().unwrap().1 - r[0].1;
+            eprintln!("pass {}: {} frames shown, skipped {:?}, {:.2} s (real time {:.2} s)", k + 1, r.len(), skipped, took, real);
+        }
+        let first: Vec<i64> = runs[0].iter().map(|x| x.0).collect();
+        assert_eq!(first, (lo..=hi).collect::<Vec<_>>(), "first pass: every frame, in order");
+        let took1 = runs[0].last().unwrap().1 - runs[0][0].1;
+        assert!(took1 > real * 1.2, "first pass is slower than real time ({took1:.2} s)");
+        // Later passes: from memory, at speed (the 1 ms polling sees every frame).
+        let took3 = runs[2].last().unwrap().1 - runs[2][0].1;
+        assert!(took3 < real * 1.1, "third pass at speed ({took3:.2} s against {real:.2} s)");
+        assert_eq!(runs[2].iter().map(|x| x.0).collect::<Vec<_>>(), (lo..=hi).collect::<Vec<_>>(), "third pass: every frame");
+    }
+}

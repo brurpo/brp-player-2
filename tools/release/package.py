@@ -16,7 +16,8 @@ re-uses the Drive file of the last one that had it, so each Drive version folder
 holds what is new or changed (dist/drive/published.json remembers what was uploaded).
 
 The app zip holds what the app needs to start: brp-player.exe, FFmpeg's LGPL DLLs,
-OpenColorIO's DLL, the VC++ runtime, shaders, manifest.json, the licenses. Not in it (components,
+OpenColorIO's DLL, the VC++ runtime, shaders, manifest.json (which lists the shader files,
+so an update can delete the ones a later release drops), the licenses. Not in it (components,
 downloaded on first start): the GPL ffmpeg.exe (x264/x265), the AI models, the NNEDI3
 weights (GPL), the RVM model (GPL) and the Maya/Blender OCIO configs.
 """
@@ -144,7 +145,11 @@ def app():
         if not fid:
             sys.exit(f"no Drive id for {e['file']} in dist/drive_ids.json")
         comps.append({k: e[k] for k in ("name", "dir", "version", "sha256", "size")} | {"url": f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t"})
-    manifest = {"version": ver, "repo": REPO, "components": comps}
+    # The effect files this release ships (their places in shaders/, "Folder/Name.glsl"):
+    # the next update deletes those of them it no longer ships (update.rs,
+    # remove_dropped_shaders).
+    shaders = sorted(rel.replace("\\", "/") for rel, _ in walk(os.path.join(REL, "shaders")) if rel.lower().endswith(".glsl"))
+    manifest = {"version": ver, "repo": REPO, "components": comps, "shaders": shaders}
     stage = os.path.join(DIST, "stage")
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)

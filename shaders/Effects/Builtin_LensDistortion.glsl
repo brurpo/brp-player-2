@@ -1,4 +1,5 @@
 // Portuguese names for the BRP Player effects panel (plain comments: mpv ignores them).
+// @brp en.title Lens Distortion
 // @brp pt.title Distorção de lente
 // @brp pt.param Distortion Distorção | Força principal da distorção da lente. Negativo: almofada; positivo: barril.
 // @brp pt.param Aberration Aberração | Aberração espectral. Valores positivos levam o azul para fora, negativos o vermelho.

@@ -127,6 +127,38 @@ impl SourceColor {
         a == b || self.describe(a) == self.describe(b)
     }
 
+    /// A `Source` pixel as linear Rec.2020 light, 1.0 = SDR white: `space.glsl`'s
+    /// `brp_to_linear(0, ..)` on the CPU (checks; OCIO's split, DESIGN.md §7d).
+    pub fn source_to_linear(&self, c: [f32; 3]) -> [f32; 3] {
+        let spow = |x: f32, g: f32| x.signum() * x.abs().powf(g);
+        let pq = |e: f32| {
+            let (m1, m2, c1, c2, c3) = (0.1593017578125f32, 78.84375f32, 0.8359375f32, 18.8515625f32, 18.6875f32);
+            let p = e.abs().min(1.0).powf(1.0 / m2);
+            e.signum() * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1) * (10000.0 / 203.0)
+        };
+        let l = match self.transfer {
+            1 => c.map(pq),
+            2 => {
+                let (a, b, cc) = (0.17883277f32, 0.28466892f32, 0.55991073f32);
+                let s = c.map(|e| {
+                    let x = e.abs();
+                    e.signum() * if x < 0.5 { x * x / 3.0 } else { (((x - cc) / a).exp() + b) / 12.0 }
+                });
+                let ys = 0.2627 * s[0] + 0.6780 * s[1] + 0.0593 * s[2];
+                let k = ys.max(1e-6).powf(0.2) * (1000.0 / 203.0);
+                s.map(|v| v * k)
+            }
+            3 => c,
+            _ => c.map(|x| spow(x, 2.4)),
+        };
+        if self.bt2020 {
+            l
+        } else {
+            const M: [[f32; 3]; 3] = [[0.6274038959, 0.3292830384, 0.0433130657], [0.0690972894, 0.9195403951, 0.0113623156], [0.0163914389, 0.0880133079, 0.8955952532]];
+            M.map(|r| r[0] * l[0] + r[1] * l[1] + r[2] * l[2])
+        }
+    }
+
     /// Push constants of `space.comp` / the tensor kernel: from, to, transfer, src2020.
     pub fn words(&self, from: Space, to: Space) -> [i32; 4] {
         [from.id(), to.id(), self.transfer, self.bt2020 as i32]

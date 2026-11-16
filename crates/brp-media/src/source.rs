@@ -32,9 +32,73 @@ pub struct Request {
     /// Frames to decode ahead while playing forward (0 = default). Background effects
     /// work ahead of the playhead and need more.
     pub ahead: i64,
-    /// While paused, keep decoding ahead of the playhead in the background, filling
-    /// the cache (not while scrubbing: the playhead moves too fast for it to help).
+    /// Keep reading ahead of the playhead in the background, filling the cache up to
+    /// its budget: paused, and playing forward (not while scrubbing: the playhead
+    /// moves too fast for it to help). A file that reads slower than it plays (a
+    /// network drive) is then in memory after its first pass, and one that reads
+    /// faster is in memory ahead of the playhead.
     pub fill: bool,
+    /// The frames being played, first and last (In and Out; the whole file: 0 and
+    /// `i64::MAX`). Reading ahead while playing stops at the last one.
+    pub range: (i64, i64),
+    /// Playback loops in `range`: after its last frame, reading ahead goes on from
+    /// its first, and the frames just played are the last to be needed again.
+    pub looping: bool,
+}
+
+/// How far a frame is from being needed (larger: dropped first, read last).
+/// Playing forward: the frames ahead inside the range in order; looping, then the
+/// range's start up to the playhead; anything else four times its distance.
+fn far(r: &Request, f: i64) -> i64 {
+    let d = f - r.frame;
+    if r.playing && r.dir >= 0 {
+        let (lo, hi) = r.range;
+        if d >= 0 && f <= hi {
+            d
+        } else if d < 0 && r.looping && f >= lo {
+            hi.min(r.frame.saturating_add(1 << 40)) - r.frame + 1 + (f - lo)
+        } else {
+            d.abs().saturating_mul(4)
+        }
+    } else {
+        let behind = if r.dir >= 0 { d < 0 } else { d > 0 };
+        d.abs() * if behind && r.playing { 4 } else { 1 }
+    }
+}
+
+/// The frames the background fill reads, nearest first: paused, those ahead of the
+/// few around the playhead; playing forward, those ahead to the end of the range
+/// and, looping, from its start up to the playhead. None playing backward.
+fn fill_order(r: &Request, n: i64) -> impl Iterator<Item = i64> {
+    let t = r.frame.clamp(0, (n - 1).max(0));
+    let (lo, hi) = (r.range.0.clamp(0, (n - 1).max(0)), r.range.1.min(n - 1));
+    let (ahead, wrap) = if !r.playing {
+        (t + 4..n, 0..0)
+    } else if r.dir >= 0 {
+        (t + 1..hi + 1, if r.looping { lo..t } else { 0..0 })
+    } else {
+        (0..0, 0..0)
+    };
+    ahead.chain(wrap)
+}
+
+/// Test hook: `BRP_SLOW_READ_MS=<ms>` waits that long at every packet read (and every
+/// sequence file decoded), as a slow drive would: playback must then show every frame
+/// as it arrives, and run at speed once the frames are in memory.
+fn slow_read() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("BRP_SLOW_READ_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// What the decode thread does next.
+enum Work {
+    /// Decode until this frame is in the cache.
+    Frame(i64),
+    /// Read this frame's packet into memory without decoding it (GPU decoders).
+    Packet(i64),
 }
 
 enum Msg {
@@ -154,7 +218,7 @@ impl Source {
                 rx,
                 info: info.clone(),
                 conv: Converter::new(),
-                req: Request { frame: 0, playing: false, dir: 1, ahead: 0, fill: false },
+                req: Request { frame: 0, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false },
                 index: None,
                 last: None,
                 last_pts: None,
@@ -163,6 +227,7 @@ impl Source {
                 eof: false,
                 seek: None,
                 unreachable: HashSet::new(),
+                no_packet: HashSet::new(),
                 end_frame: None,
                 analyzed: HashSet::new(),
                 desc,
@@ -352,6 +417,8 @@ struct Worker {
     eof: bool,
     seek: Option<SeekState>,
     unreachable: HashSet<i64>,
+    /// Frames whose packet could not be read ahead (end of file, a gap): not tried again.
+    no_packet: HashSet<i64>,
     /// Number of frames, learned at end of stream when there is no index yet.
     end_frame: Option<i64>,
     /// Frame numbers already used for interlace detection.
@@ -398,7 +465,7 @@ impl Worker {
     fn run(&mut self) {
         loop {
             // Take the latest request; block only when there is nothing to decode.
-            let need = self.next_needed();
+            let need = self.next_work();
             let msg = if need.is_some() {
                 match self.rx.try_recv() {
                     Ok(m) => Some(m),
@@ -422,10 +489,20 @@ impl Worker {
                 }
                 continue;
             }
-            let Some(need) = need else { continue };
-            if let Err(e) = self.produce(need) {
-                log::warn!("decode error at frame {need}: {e}");
-                self.unreachable.insert(need);
+            match need {
+                Some(Work::Frame(need)) => {
+                    if let Err(e) = self.produce(need) {
+                        log::warn!("decode error at frame {need}: {e}");
+                        self.unreachable.insert(need);
+                    }
+                }
+                Some(Work::Packet(need)) => {
+                    if let Err(e) = self.read_ahead(need) {
+                        log::debug!("reading ahead at frame {need}: {e:#}");
+                        self.no_packet.insert(need);
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -454,6 +531,7 @@ impl Worker {
                     }
                 }
                 self.unreachable.clear();
+                self.no_packet.clear();
                 self.end_frame = None;
             }
         }
@@ -538,12 +616,15 @@ impl Worker {
         // are several times smaller): drop those farthest from the playhead.
         let budget = self.ram_budget();
         if self.packet_bytes > budget {
-            let t = self.req.frame;
+            let r = self.req;
             let mut keys: Vec<i64> = self.packets.keys().copied().collect();
-            keys.sort_unstable_by_key(|&f| std::cmp::Reverse((f - t).abs()));
+            keys.sort_unstable_by_key(|&f| std::cmp::Reverse(far(&r, f)));
             for f in keys {
                 if self.packet_bytes <= budget * 9 / 10 {
                     break;
+                }
+                if f == idx {
+                    continue;
                 }
                 if let Some((_, p)) = self.packets.remove(&f) {
                     self.packet_bytes -= p.len();
@@ -611,20 +692,83 @@ impl Worker {
         if let Some(f) = order.into_iter().find(wanted) {
             return Some(f);
         }
-        if self.req.playing || !self.req.fill {
+        if !self.req.fill {
             return None;
         }
-        // Paused: the next frame ahead, decoded in the background, while the cache has
-        // room, or while it is nearer the playhead than the farthest frame kept (the
-        // eviction then drops that one: the cache settles on the frames around the
-        // playhead, and decoding stops).
-        let next = (t + 4..n).find(wanted)?;
+        // The fill: the next frame ahead, decoded in the background, while the cache
+        // has room, or while it is nearer to being needed than the farthest frame kept
+        // (the eviction then drops that one: paused, the cache settles on the frames
+        // around the playhead and decoding stops; playing, it moves along ahead of it).
+        let r = self.req;
+        let next = fill_order(&r, n).find(wanted)?;
         let budget = self.budget(c.bytes);
         if c.bytes < budget * 8 / 10 {
             return Some(next);
         }
-        let farthest = c.frames.keys().map(|f| (f - t).abs()).max().unwrap_or(0);
-        (next - t < farthest - 1).then_some(next)
+        let farthest = c.frames.keys().map(|f| far(&r, *f)).max().unwrap_or(0);
+        (far(&r, next) < farthest - 1).then_some(next)
+    }
+
+    /// The next thing to do: a frame to decode, or, for a GPU-decoded file whose
+    /// window of pictures is full, a packet to read ahead into system memory. Its
+    /// pictures stay a small window in GPU memory; what a slow drive needs kept is
+    /// the file's bytes, and a picture is made from its packet in a few ms.
+    fn next_work(&self) -> Option<Work> {
+        if let Some(f) = self.next_needed() {
+            return Some(Work::Frame(f));
+        }
+        if !self.req.fill || !matches!(self.gpu, GpuState::On(_)) {
+            return None;
+        }
+        let n = self.frame_count();
+        let r = self.req;
+        let next = fill_order(&r, n).find(|f| *f >= 0 && *f < n && !self.packets.contains_key(f) && !self.unreachable.contains(f) && !self.no_packet.contains(f))?;
+        let budget = self.ram_budget();
+        if self.packet_bytes < budget * 8 / 10 {
+            return Some(Work::Packet(next));
+        }
+        let farthest = self.packets.keys().map(|f| far(&r, *f)).max().unwrap_or(0);
+        (far(&r, next) < farthest - 1).then_some(Work::Packet(next))
+    }
+
+    /// Read packets into memory, without decoding, until `need`'s is there (a
+    /// bounded batch, so new requests are seen quickly). Only with a GPU decoder:
+    /// its streams are intra-only, one packet a picture, decodable in any order.
+    fn read_ahead(&mut self, need: i64) -> anyhow::Result<()> {
+        if self.should_seek(need) {
+            self.seek_to(need, 0)?;
+            self.seek = None;
+        }
+        for _ in 0..8 {
+            if self.packets.contains_key(&need) || !matches!(self.gpu, GpuState::On(_)) {
+                return Ok(());
+            }
+            let (pts, data) = unsafe {
+                if ff::av_read_frame(self.input.ctx, self.pkt.0) < 0 {
+                    self.eof = true;
+                    self.no_packet.insert(need);
+                    return Ok(());
+                }
+                let p = &*self.pkt.0;
+                if p.stream_index != self.stream || p.data.is_null() {
+                    ff::av_packet_unref(self.pkt.0);
+                    continue;
+                }
+                let pts = if p.pts != ffutil::AV_NOPTS_VALUE { p.pts } else { p.dts };
+                let data = std::slice::from_raw_parts(p.data, p.size as usize).to_vec();
+                ff::av_packet_unref(self.pkt.0);
+                (pts, data)
+            };
+            slow_read();
+            let idx = self.number(pts);
+            self.keep_packet(idx, pts, data);
+            if idx > need && !self.packets.contains_key(&need) {
+                // Passed it: no packet of its own (a gap in the file).
+                self.no_packet.insert(need);
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Decode until `need` is in the cache (or found to be unreachable).
@@ -764,6 +908,7 @@ impl Worker {
                     ff::av_packet_unref(self.pkt.0);
                     continue;
                 }
+                slow_read();
                 let pts = if p.pts != ffutil::AV_NOPTS_VALUE { p.pts } else { p.dts };
                 let data = std::slice::from_raw_parts(p.data, p.size as usize);
                 let out = match dec.decode(data) {
@@ -813,6 +958,7 @@ impl Worker {
                     continue;
                 }
                 if (*self.pkt.0).stream_index == self.stream {
+                    slow_read();
                     let s = ff::avcodec_send_packet(self.dec, self.pkt.0);
                     if s < 0 && s != ffutil::AVERROR_EAGAIN {
                         log::debug!("send packet: {}", ffutil::err_str(s));
@@ -914,15 +1060,11 @@ impl Worker {
         if c.bytes <= budget {
             return;
         }
-        let t = self.req.frame;
+        let r = self.req;
         let mut keys: Vec<i64> = c.frames.keys().copied().collect();
-        // Frames behind the playhead matter less when playing forward, and vice versa.
-        let cost = |f: i64| {
-            let d = f - t;
-            let behind = if self.req.dir >= 0 { d < 0 } else { d > 0 };
-            d.abs() * if behind && self.req.playing { 4 } else { 1 }
-        };
-        keys.sort_unstable_by_key(|&f| std::cmp::Reverse(cost(f)));
+        // Frames behind the playhead matter less when playing forward, and vice versa
+        // (looping, they come round again: `far`).
+        keys.sort_unstable_by_key(|&f| std::cmp::Reverse(far(&r, f)));
         for f in keys {
             if c.bytes <= budget * 9 / 10 {
                 break;
@@ -1076,7 +1218,7 @@ impl Source {
             packet_frames: Mutex::new(HashSet::new()),
         });
         let state = Arc::new(SeqState {
-            req: parking_lot::Mutex::new(Request { frame: 0, playing: false, dir: 1, ahead: 0, fill: false }),
+            req: parking_lot::Mutex::new(Request { frame: 0, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false }),
             busy: Default::default(),
             failed: Default::default(),
             wake: parking_lot::Condvar::new(),
@@ -1181,6 +1323,7 @@ fn seq_decode_loop(n: i64, decode: &(dyn Fn(i64) -> anyhow::Result<VideoFrame> +
         };
         let Some(f) = pick else { continue };
         let t = std::time::Instant::now();
+        slow_read();
         match decode(f) {
             Ok(vf) => {
                 log::trace!("sequence frame {f} in {:?}", t.elapsed());
@@ -1226,16 +1369,16 @@ fn seq_next_needed(req: &Request, n: i64, shared: &Shared, busy: &HashSet<i64>, 
     if let Some(f) = order.into_iter().find(wanted) {
         return Some(f);
     }
-    if req.playing || !req.fill {
+    if !req.fill {
         return None;
     }
-    let next = (t + 4..n).find(wanted)?;
+    let next = fill_order(req, n).find(wanted)?;
     let budget = seq_budget(shared);
     if c.bytes < budget * 8 / 10 {
         return Some(next);
     }
-    let farthest = c.frames.keys().map(|f| (f - t).abs()).max().unwrap_or(0);
-    (next - t < farthest - 1).then_some(next)
+    let farthest = c.frames.keys().map(|f| far(req, *f)).max().unwrap_or(0);
+    (far(req, next) < farthest - 1).then_some(next)
 }
 
 /// Drop the frames farthest from the playhead until under budget (`keep` stays).
@@ -1244,14 +1387,8 @@ fn seq_evict(c: &mut Cache, req: &Request, shared: &Shared, keep: i64) {
     if c.bytes <= budget {
         return;
     }
-    let t = req.frame;
     let mut keys: Vec<i64> = c.frames.keys().copied().collect();
-    let cost = |f: i64| {
-        let d = f - t;
-        let behind = if req.dir >= 0 { d < 0 } else { d > 0 };
-        d.abs() * if behind && req.playing { 4 } else { 1 }
-    };
-    keys.sort_unstable_by_key(|&f| std::cmp::Reverse(cost(f)));
+    keys.sort_unstable_by_key(|&f| std::cmp::Reverse(far(req, f)));
     for f in keys {
         if c.bytes <= budget * 9 / 10 {
             break;

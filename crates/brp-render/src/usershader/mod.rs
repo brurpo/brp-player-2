@@ -7,6 +7,7 @@ pub use codegen::{BindKind, Generated, ParamMode, Transfer};
 pub use parse::{Localized, Param, ParamKind, Pass, Rpn, ShaderFile, TexDecl};
 
 use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
 
 thread_local! {
     /// One compiler per thread: compiles on several threads run at once (the start-up
@@ -93,6 +94,29 @@ pub fn bind_kinds(file: &ShaderFile, pass: &Pass) -> Vec<(String, BindKind)> {
             (b.clone(), kind)
         })
         .collect()
+}
+
+/// Every `.glsl` file in `dir` and its subfolders (four levels down at most; folders
+/// whose name starts with "." are skipped), sorted by path. The folders are how effects
+/// are grouped: the player's "Add effect" tree mirrors them.
+pub fn glsl_files(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 4 && !e.file_name().to_string_lossy().starts_with('.') {
+                    walk(&p, depth + 1, out);
+                }
+            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("glsl")) {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out.sort();
+    out
 }
 
 /// Whole-word occurrence of `word` in `text`.

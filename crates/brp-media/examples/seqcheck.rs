@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     println!("{}: {} frames, {}x{} {} {} {:?}, {} fps, {} ({})", ours.info.file_name, n, ours.info.width, ours.info.height, ours.info.codec, ours.info.pix_fmt, ours.info.color.transfer, ours.info.frame_rate, ours.info.container, ours.decoder_name());
     // Decoding rate: all frames, playing from 0.
     let t = Instant::now();
-    ours.request(Request { frame: 0, playing: true, dir: 1, ahead: n, fill: false });
+    ours.request(Request { frame: 0, playing: true, dir: 1, ahead: n, fill: false, range: (0, i64::MAX), looping: false });
     for i in 0..n {
         wait(&ours, i);
     }
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(theirs.frame_count() == n, "FFmpeg reads {} frames, we read {n}", theirs.frame_count());
     let mut same = 0;
     for i in 0..n {
-        theirs.request(Request { frame: i, playing: false, dir: 1, ahead: 0, fill: false });
+        theirs.request(Request { frame: i, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false });
         let (a, b) = (wait(&ours, i), wait(&theirs, i));
         let equal = a.layout == b.layout
             && (0..a.plane_count()).all(|p| {

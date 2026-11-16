@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 const PASSTHROUGH: &str = "//!HOOK MAIN\n//!BIND HOOKED\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n";
 
 fn get(src: &Source, n: i64) -> Arc<VideoFrame> {
-    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false });
+    src.request(Request { frame: n, playing: false, dir: 1, ahead: 0, fill: false, range: (0, i64::MAX), looping: false });
     let t = Instant::now();
     loop {
         if let Some(f) = src.get(n) {
