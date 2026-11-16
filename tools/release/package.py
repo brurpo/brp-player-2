@@ -20,6 +20,11 @@ OpenColorIO's DLL, the VC++ runtime, shaders, manifest.json (which lists the sha
 so an update can delete the ones a later release drops), the licenses. Not in it (components,
 downloaded on first start): the GPL ffmpeg.exe (x264/x265), the AI models, the NNEDI3
 weights (GPL), the RVM model (GPL) and the Maya/Blender OCIO configs.
+
+IN_ZIP: our own denoiser's small model (models/brpdn, 12 MB) ships inside the app zip, so
+the effect works before any download and an update always brings the current one. Every
+large file is a Drive component (the denoiser's Quality model, models/brpdn_quality, too):
+nothing big goes to GitHub.
 """
 import hashlib, json, os, re, shutil, sys, zipfile
 
@@ -38,6 +43,8 @@ FF_GPL = os.environ.get("BRP_FFMPEG_GPL_DIR") or os.path.join(
 FF_VERSION = "7.1.5-12"
 OCIO_SRC = os.path.join(ROOT, "third_party", "ocio", "src-2.5.2")
 DATE = (2026, 1, 1, 0, 0, 0)  # fixed zip timestamps: same content, same checksum
+# Model folders shipped inside the app zip (small ones only).
+IN_ZIP = {"brpdn"}
 
 
 def version():
@@ -95,6 +102,8 @@ def components():
     out.append(("ffmpeg-gpl", "ffmpeg-gpl", ff))
     models = os.path.join(REL, "models")
     for m in sorted(os.listdir(models)):
+        if m in IN_ZIP:
+            continue
         files = walk(os.path.join(models, m), skip=lambda rel: rel.endswith(".safetensors"))
         out.append((f"models-{m}", f"models/{m}", files))
     out.append(("nnedi3", "nnedi3", [("nnedi3_weights.bin", os.path.join(ROOT, "crates", "brp-render", "assets", "nnedi3_weights.bin"))]))
@@ -166,6 +175,9 @@ def app():
         files.append((f"{top}/{n}", os.path.join(os.environ["SystemRoot"], "System32", n)))
     for rel, p in walk(os.path.join(REL, "shaders")):
         files.append((f"{top}/shaders/{rel}", p))
+    for m in sorted(IN_ZIP):
+        for rel, p in walk(os.path.join(REL, "models", m)):
+            files.append((f"{top}/models/{m}/{rel}", p))
     for n in ("LICENSE.md", "THIRD_PARTY_NOTICES.md", "README.md"):
         files.append((f"{top}/{n}", os.path.join(ROOT, n)))
     files.append((f"{top}/licenses/ffmpeg-lgpl/LICENSE.txt", os.path.join(FF_LGPL, "LICENSE.txt")))
