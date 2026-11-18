@@ -315,16 +315,46 @@ class Fuse(nn.Module):
             with torch.no_grad():
                 last.bias[:4] = start  # the frame's own weight (channels 0-3 -> weight 0 after the shuffle)
         s.net = nn.Sequential(*layers, last)
+        s.k, s.kp, s.width = 0, None, w
+
+    def set_kp(s, k):
+        """Kernel prediction: per pixel a k x k kernel for each picture (k odd) instead
+        of one weight. The taps around the centre start with next to no weight, so
+        the result starts as the plain mix."""
+        s.k = k
+        s.kp = conv(s.width, s.pics * (k * k - 1) * 4)
+        nn.init.zeros_(s.kp.weight)
+        nn.init.constant_(s.kp.bias, -8.0)
 
     def forward(s, x, frames=None, mask=None, h=None):
+        """Returns the merged picture, each picture's share of it (B, pics, H, W) and
+        each picture's part of the sum (their shares times the pictures; with
+        kernels, each picture filtered by its own)."""
         y = s.net[0](F.pixel_unshuffle(x, 2))
         if s.in_h is not None:
             y = y + s.in_h(h.to(y.dtype))
-        y = F.pixel_shuffle(s.net[1:](y), 2).float()
+        feat = s.net[1:-1](y)
+        y = F.pixel_shuffle(s.net[-1](feat), 2).float()
         if not s.blend:
-            return frames[0] + y, None
-        w = torch.softmax(y.masked_fill(mask < 0.5, -1e4), 1)
-        return sum(w[:, k : k + 1] * frames[k].float() for k in range(s.pics)), w
+            return frames[0] + y, None, None
+        y = y.masked_fill(mask < 0.5, -1e4)
+        if not s.k:
+            w = torch.softmax(y, 1)
+            parts = [w[:, k : k + 1] * frames[k].float() for k in range(s.pics)]
+            return sum(parts), w, parts
+        B, P, H, W = y.shape
+        kk, r = s.k * s.k, s.k // 2
+        off = F.pixel_shuffle(s.kp(feat), 2).float().view(B, P, kk - 1, H, W).masked_fill((mask < 0.5)[:, :, None], -1e4)
+        # All taps of all pictures share one softmax; the centre tap goes in the
+        # middle of each picture's kernel (unfold's order).
+        logits = torch.cat([off[:, :, : kk // 2], y[:, :, None], off[:, :, kk // 2 :]], 2)
+        wk = torch.softmax(logits.flatten(1, 2), 1).view(B, P, kk, H, W)
+        parts = []
+        for p in range(P):
+            f = frames[p].float()
+            taps = F.unfold(F.pad(f, (r, r, r, r), mode="replicate"), s.k).view(B, f.shape[1], kk, H, W)
+            parts.append((taps * wk[:, p : p + 1]).sum(2))
+        return sum(parts), wk.sum(2), parts
 
 
 def mismatch(cur, w):
@@ -483,7 +513,7 @@ class StableDenoiser(nn.Module):
         fa = mo.mixed(fa0, -fb / gap, (valid[:, 0:1] > 0).float() * (valid[:, 1:2] > 0).float(), la, lb)
         return mo.up(fb), mo.up(fa), fa
 
-    def forward(s, cur, before, after, valid, prev_out, prev_valid, strength, state=None, acc=None, fstate=None, gap=1.0, raw=None):
+    def forward(s, cur, before, after, valid, prev_out, prev_valid, strength, state=None, acc=None, fstate=None, gap=1.0, raw=None, future=None):
         """state: the memory returned by the previous step (`last_state`), for models
         that have one. Left out when not training: the one kept from the last call is
         used if `prev_out` is that call's output (so code that only feeds the previous
@@ -514,8 +544,24 @@ class StableDenoiser(nn.Module):
             wb, wa = warp(torch.cat([before, after], 0), torch.cat([fb, fa], 0), s.warp_mode).chunk(2, 0)
         else:
             wb, wa = warp(before, fb, s.warp_mode), warp(after, fa, s.warp_mode)
+        if future is not None:
+            # Forward and backward (train.py --future): in the frame-after's place, the
+            # result a backward pass made for THIS frame: clean, already aligned, and
+            # holding what the frames after it have to give. The motion towards the
+            # frame after is still estimated (the next frame's prior needs it).
+            wa = future.to(wa.dtype)
         # The previous output lines up with t-1: moved along the same motion.
         wp = warp(prev_out, fb, s.warp_mode)
+        fbr = fb
+        if getattr(s, "refine", None) is not None:
+            # That motion corrected, from the frame and the previous result moved onto
+            # it (the previous result is clean: what two noisy frames cannot show can
+            # be matched against it). The correction starts at zero and is learned from
+            # the denoising loss; it moves what the model carries along (previous
+            # result, accumulated picture, memory), not the noisy frame before.
+            d = s.refine(F.pixel_unshuffle(torch.cat([cur, wp.to(cur.dtype)], 1), 2)).float()
+            fbr = fb + F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False) * (prev_valid > 0).float()
+            wp = warp(prev_out, fbr, s.warp_mode)
         if s.cut_thr > 0:
             off = lambda w_: (F.avg_pool2d(cur.float(), 16) - F.avg_pool2d(w_.float(), 16)).abs().mean((1, 2, 3), keepdim=True) > s.cut_thr
             cb, ca = off(wb) & (valid[:, 0:1] > 0), off(wa) & (valid[:, 1:2] > 0)
@@ -544,13 +590,13 @@ class StableDenoiser(nn.Module):
             # Moved like the previous output (the flow at 1/2 size), nothing where
             # there is no previous frame.
             pv = prev_valid if prev_valid.shape[-1] == 1 else F.avg_pool2d(prev_valid.float(), 2)
-            h = warp(state.float(), F.avg_pool2d(fb, 2) * 0.5) * pv
+            h = warp(state.float(), F.avg_pool2d(fbr, 2) * 0.5) * pv
         wacc = av = macc = None
         if s.fuse is not None and s.acc:
             # The accumulated picture, moved like the previous output; none at a
             # start or after a cut.
             av = prev_valid * (0.0 if acc is None else 1.0)
-            wacc = warp(acc.float(), fb, s.warp_mode) * av if acc is not None else torch.zeros_like(cur)
+            wacc = warp(acc.float(), fbr, s.warp_mode) * av if acc is not None else torch.zeros_like(cur)
         if s.mismatch:
             # The mismatch maps of all the aligned pictures in one go.
             mall = mismatch_many(cur, [wb, wa, wp] + ([wacc] if wacc is not None else []))
@@ -565,13 +611,13 @@ class StableDenoiser(nn.Module):
                 if macc is None:
                     macc = mismatch(cur, wacc)
                 fx = torch.cat([x] + mm + [wacc.to(x.dtype), macc.to(x.dtype)], 1)
-                base, w = s.fuse(fx, (cur, wb, wa, wp, wacc), torch.cat([mask, av * ones], 1), h)
+                base, w, parts = s.fuse(fx, (cur, wb, wa, wp, wacc), torch.cat([mask, av * ones], 1), h)
                 # Its next value: the same mix without the previous output.
                 den = (w[:, 0:1] + w[:, 1:2] + w[:, 2:3] + w[:, 4:5]).clamp_min(1e-4)
-                s.last_acc = (w[:, 0:1] * cur.float() + w[:, 1:2] * wb.float() + w[:, 2:3] * wa.float() + w[:, 4:5] * wacc.float()) / den
+                s.last_acc = (parts[0] + parts[1] + parts[2] + parts[4]) / den
                 s.last_weights = w
             else:
-                base, s.last_weights = s.fuse(torch.cat([x] + mm, 1), (cur, wb, wa, wp), mask, h)
+                base, s.last_weights, _ = s.fuse(torch.cat([x] + mm, 1), (cur, wb, wa, wp), mask, h)
             x = torch.cat([base.to(x.dtype), x[:, 3:]] + ([cur] if s.keep_cur else []) + mm, 1)
         elif mm:
             x = torch.cat([x] + mm, 1)
@@ -598,6 +644,13 @@ def build_model(cfg):
     m.flow_prev = bool(cfg.get("flow_prev"))
     m.flow_match = bool(cfg.get("flow_match"))
     m.use_estimator = cfg.get("map") == "learned"
+    if cfg.get("kp"):
+        m.fuse.set_kp(int(cfg["kp"]))
+    if cfg.get("refine"):
+        w_ = int(cfg["refine"])
+        m.refine = nn.Sequential(conv(24, w_), nn.ReLU(), conv(w_, w_), nn.ReLU(), conv(w_, w_), nn.ReLU(), conv(w_, 2))
+        nn.init.zeros_(m.refine[-1].weight)
+        nn.init.zeros_(m.refine[-1].bias)
     return m
 
 

@@ -4,6 +4,9 @@ distributions as degrade.degrade, without touching pixels. NumPy only (the worke
 must not import PyTorch)."""
 import degrade as D
 
+# Share of television clips with the very wide halo; BRP_TV_WIDE overrides it (tests).
+TV_WIDE = float(__import__("os").environ.get("BRP_TV_WIDE", "0.3"))
+
 lu = D.lu
 
 
@@ -50,6 +53,58 @@ def recipe(r, kind="any", hdr=False, strength=1.0, real_noisy=False):
     if not any(s[0] not in ("encode",) for s in steps):
         steps.append(("grain", _display(r, "grain")))
     return {"kind": kind, "hdr": hdr, "steps": steps}
+
+
+def tv_recipe(r):
+    """An old television recording as it reaches us: tape and broadcast (little
+    horizontal detail, colour smeared and late, noise in streaks), the edge
+    'enhancement' of the time and often a second, digital one (wide halos), levels
+    pushed and clipped, deinterlaced, rescaled, compressed. gpu_degrade.tv."""
+    # Three kinds. 'soft' (35%): softened first, then everything. 'crisp' (35%): a small
+    # copy of a sharpened recording, edges sharp at the pixel, halos of 2-3 px, blacks
+    # crushed. 'clean' (30%): the user's clip: no noise at all, soft or crisp, always a
+    # narrow strong peaking pass, crushed blacks.
+    u = r.random()
+    kind = "soft" if u < 0.35 else "crisp" if u < 0.7 else "clean"
+    crisp = kind == "crisp" or (kind == "clean" and r.random() < 0.5)
+    if kind == "clean" and not crisp:
+        sx, sy = r.uniform(1.2, 3.0), r.uniform(0.3, 1.0)
+    else:
+        sx, sy = (r.uniform(0.15, 0.7), r.uniform(0.1, 0.5)) if crisp else (r.uniform(0.5, 2.2), r.uniform(0.3, 1.0))
+    sharp = []
+    if r.random() < (0.5 if kind == "clean" else 0.85):  # analogue: mostly along the lines
+        s = lu(r, 0.7, 7.0)
+        sharp.append({"a": lu(r, 0.4, 3.0), "sx": s, "sy": 0.0 if r.random() < 0.5 else s * r.uniform(0.3, 1.0), "late": False})
+    if kind == "clean":  # the peaking: narrow, strong
+        s = lu(r, 0.6, 1.6)
+        sharp.append({"a": lu(r, 0.8, 3.0), "sx": s, "sy": s * r.uniform(0.0, 1.0), "late": bool(r.random() < 0.5)})
+    elif r.random() < (0.85 if crisp else 0.6):  # digital, later
+        s = lu(r, 0.7, 6.0)
+        sharp.append({"a": lu(r, 0.3, 2.5), "sx": s, "sy": s, "late": True})
+    # The very wide halo (4-12 px): a glow around every edge, along the lines or all round.
+    if r.random() < TV_WIDE:
+        s = lu(r, 4.0, 12.0)
+        u = r.random()
+        sharp.append({"a": lu(r, 0.5, 2.5), "sx": s, "sy": 0.0 if u < 0.35 else s if u < 0.7 else s * r.uniform(0.3, 1.0), "late": bool(r.random() < 0.5)})
+    # Ringing along the lines (the user's clip: period 6 px, x1.0-1.5 after the peaking).
+    if r.random() < (0.7 if kind == "clean" else 0.4):
+        sharp.append({"a": lu(r, 0.3, 2.5), "ring": lu(r, 3.5, 11.0), "damp": r.uniform(0.35, 0.9), "late": bool(r.random() < 0.3)})
+    quiet = kind == "clean"
+    p = {"sx": sx, "sy": sy, "keep": r.uniform(0.3, 0.65), "sgam": r.uniform(1.3, 2.4) if r.random() < 0.5 else 1.0,
+         "csx": lu(r, 1.5, 9.0), "csy": lu(r, 0.4, 6.0), "cdx": int(r.integers(-1, 5)), "cdy": int(r.integers(-1, 2)), "sat": r.uniform(0.8, 1.8),
+         "cnoise": 0.0 if quiet else (lu(r, 0.003, 0.03) if r.random() < 0.7 else 0.0),
+         "noise": 0.0 if quiet else (lu(r, 0.003, 0.025) if r.random() < 0.85 else 0.0), "nsx": r.uniform(0.6, 3.0),
+         "ghost": r.uniform(0.03, 0.12) if r.random() < 0.2 and not quiet else 0.0, "gdx": int(r.integers(4, 24)),
+         "dropouts": lu(r, 1e-5, 3e-4) if r.random() < 0.15 and not quiet else 0.0, "sharp": sharp,
+         "contrast": r.uniform(1.1, 1.5) if quiet else r.uniform(0.95, 1.5), "lift": r.uniform(-0.12, 0.0) if quiet else r.uniform(-0.12, 0.04),
+         "scale": r.uniform(0.5, 0.9) if r.random() < (0.5 if kind == "soft" else 0.15) and not quiet else 0.0, "cubic": bool(r.random() < 0.6)}
+    steps = [("encode", {}), ("tv", p)]
+    if r.random() < (0.3 if quiet else 0.5):
+        mode = "bob" if r.random() < 0.6 else "linedouble"
+        steps.append(("aliasing", {"mode": mode, "first": int(r.integers(2)), "smooth": bool(r.random() < 0.7)}))
+    if r.random() < 0.85:
+        steps.append(("compress", _compress(r)))
+    return {"kind": "camera", "hdr": False, "steps": steps, "tv": True}
 
 
 def sensor_settings(r):

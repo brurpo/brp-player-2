@@ -377,6 +377,86 @@ void main() { ID3 if (x >= p.W || y >= p.H || c >= p.C) return;
 }
 "#;
 
+/// How far picture `b` is from picture `a` (both linear light, as `record` takes them),
+/// per `DIFF_BLOCK` px block (whole blocks only), in the code values a screen shows,
+/// x 255: the SDR code value (`sdr`), else PQ. Plane 0: the mean |difference| over the
+/// block's pixels and 3 channels; planes 1 to 3: the difference of the block's means of
+/// R, G and B.
+const DIFF: &str = r#"
+G3
+layout(push_constant) uniform P { F32 a; F32 b; F32 o; int W, H, k, sdr; } p;
+float code(float v) { return 255.0 * (p.sdr != 0 ? pow(max(v, 0.0), 1.0 / 2.4) : to_pq(v)); }
+void main() { ID3 int OW = p.W / p.k, OH = p.H / p.k; if (x >= OW || y >= OH || c > 0) return;
+    int n = p.W * p.H, m = OW * OH, o = y * OW + x;
+    vec3 s = vec3(0.0);
+    float t = 0.0;
+    for (int j = 0; j < p.k; j++) for (int i = 0; i < p.k; i++) {
+        int q = (y * p.k + j) * p.W + x * p.k + i;
+        vec3 d = vec3(code(p.a.v[q]) - code(p.b.v[q]), code(p.a.v[n + q]) - code(p.b.v[n + q]), code(p.a.v[2 * n + q]) - code(p.b.v[2 * n + q]));
+        s += d;
+        t += abs(d.x) + abs(d.y) + abs(d.z);
+    }
+    float area = float(p.k * p.k);
+    p.o.v[o] = t / (3.0 * area);
+    p.o.v[m + o] = s.x / area;
+    p.o.v[2 * m + o] = s.y / area;
+    p.o.v[3 * m + o] = s.z / area;
+}
+"#;
+
+/// Side of the blocks `Learned::difference` works on.
+pub const DIFF_BLOCK: usize = 8;
+
+/// How far two pictures are apart, in levels of 255 of the code values a screen shows
+/// (from `Learned::difference`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Difference {
+    /// Mean |difference| over the pixels and the 3 channels.
+    pub mean: f32,
+    /// The same within the block of `DIFF_BLOCK` px that changed most: the smallest
+    /// thing that moved shows here (also one moving inside a block, which leaves the
+    /// block's mean as it was).
+    pub fine: f32,
+    /// The largest |difference of the means| of a 32 px block (averaged over the 3
+    /// channels): a copy's compression noise averages out there, something that moved
+    /// does not.
+    pub block: f32,
+    /// |Change of the whole picture's mean|, averaged over the 3 channels: a fade moves
+    /// it, a copy's compression noise does not.
+    pub shift: f32,
+}
+
+impl Difference {
+    /// From the planes `Learned::difference` wrote: `data` is 4 planes of `w` x `h` blocks.
+    pub fn from_blocks(data: &[f32], w: usize, h: usize) -> Difference {
+        let n = w * h;
+        if n == 0 || data.len() < 4 * n {
+            return Difference { mean: f32::MAX, fine: f32::MAX, block: f32::MAX, shift: f32::MAX };
+        }
+        let mean = data[..n].iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        let shift = (1..4).map(|c| (data[c * n..(c + 1) * n].iter().map(|&v| v as f64).sum::<f64>() / n as f64).abs()).sum::<f64>() / 3.0;
+        let fine = data[..n].iter().copied().fold(0f32, f32::max);
+        // 32 px blocks: 4 x 4 of the planes' blocks (whole ones; the whole picture if it is smaller).
+        let k = (32 / DIFF_BLOCK).min(w).min(h);
+        let mut block = 0f32;
+        for by in 0..h / k {
+            for bx in 0..w / k {
+                let mut e = 0.0;
+                for c in 1..4 {
+                    let mut s = 0.0;
+                    for j in 0..k {
+                        let row = c * n + (by * k + j) * w + bx * k;
+                        s += data[row..row + k].iter().sum::<f32>();
+                    }
+                    e += (s / (k * k) as f32).abs();
+                }
+                block = block.max(e / 3.0);
+            }
+        }
+        Difference { mean: mean as f32, fine, block, shift: shift as f32 }
+    }
+}
+
 pub struct Learned {
     ops: Arc<Ops>,
     flow: Net,
@@ -424,6 +504,7 @@ pub struct Learned {
     finish: Arc<Kernel>,
     mem_warp: Arc<Kernel>,
     pack: Arc<Kernel>,
+    diff: Arc<Kernel>,
 }
 
 fn g(k: &Kernel, w: usize, h: usize, c: usize) -> [u32; 3] {
@@ -495,7 +576,20 @@ impl Learned {
             finish: k("finish", FINISH)?,
             mem_warp: k("mem", MEM)?,
             pack: k("pack", PACK)?,
+            diff: k("diff", DIFF)?,
         })
+    }
+
+    /// The planes `Difference::from_blocks` reads: how far `b` is from `a` per block
+    /// (see DIFF). Both pictures as `record` takes them, of one size.
+    pub fn difference(&self, rec: &mut Recorder, a: &Tensor, b: &Tensor, sdr: bool) -> Result<Tensor> {
+        ensure!(a.c >= 3 && b.c >= 3 && (a.w, a.h) == (b.w, b.h) && !a.half && !b.half, "difference: pictures of {}x{}x{} and {}x{}x{}", a.w, a.h, a.c, b.w, b.h, b.c);
+        let (w, h) = (a.w / DIFF_BLOCK, a.h / DIFF_BLOCK);
+        ensure!(w > 0 && h > 0, "difference: picture of {}x{}", a.w, a.h);
+        let out = self.ops.tensor(4, h, w)?;
+        let push = Push::new().t(a).t(b).t(&out).i(a.w as i32).i(a.h as i32).i(DIFF_BLOCK as i32).i(sdr as i32);
+        rec.dispatch(&self.diff, g(&self.diff, w, h, 1), &push)?;
+        Ok(out)
     }
 
     /// `img` in the model's space: PQ, sides padded to a multiple of 16.
@@ -778,5 +872,33 @@ impl Learned {
             }
             None => (out, den),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn difference_from_blocks() {
+        // 8 x 4 blocks of 8 px. The pixels differ by 0.5 on average, in one block by 16; the means of one
+        // block move by (3, 0.25, -0.25), those of the others by (0.25, 0.25, 0.25).
+        let (w, h) = (8, 4);
+        let n = w * h;
+        let mut data = vec![0.5f32; n];
+        data[3] = 16.0;
+        data.extend(std::iter::repeat_n(0.25, 3 * n));
+        let at = 2 * w + 5;
+        (data[n + at], data[2 * n + at], data[3 * n + at]) = (3.0, 0.25, -0.25);
+        let d = Difference::from_blocks(&data, w, h);
+        assert!((d.mean - (31.0 * 0.5 + 16.0) / 32.0).abs() < 1e-6);
+        assert_eq!(d.fine, 16.0);
+        // The 32 px block around it: 15 blocks of 0.25 and that one, per channel.
+        let c = |v: f32| ((15.0 * 0.25 + v) / 16.0f32).abs();
+        assert!((d.block - (c(3.0) + c(0.25) + c(-0.25)) / 3.0).abs() < 1e-6);
+        let s = |v: f32| ((31.0 * 0.25 + v) / 32.0f32).abs();
+        assert!((d.shift - (s(3.0) + s(0.25) + s(-0.25)) / 3.0).abs() < 1e-6);
+        // Too little data: never a copy.
+        assert!(Difference::from_blocks(&data[..n], w, h).mean > 1e30);
     }
 }

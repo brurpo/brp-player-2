@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 
 import degrade as D
-from recipes import needs_flow, recipe
+from recipes import needs_flow, recipe, tv_recipe
 from data import patchnoise as pn
 
 cv2.setNumThreads(1)
@@ -61,6 +61,9 @@ class DataConfig:
     # the real ones (noisy or denoised) taken from the 16 and 64 sample renders only.
     render_mix: tuple = (0.25, 0.45)
     render_low: float = 0.0
+    # Share of the camera clips damaged as an old television recording
+    # (recipes.tv_recipe) instead of the usual chain.
+    tv_share: float = 0.0
 
 
 class Camera:
@@ -79,6 +82,7 @@ class Camera:
         self.p = w / w.sum()
         self.gate = json.load(open(os.path.join(cfg.data, "noise_maps", "gate.json")))
         self.data, self.bin = cfg.data, os.path.join(bank, "crops.bin")
+        self.tv = cfg.tv_share if split == "train" else 0.0
         self.f = None
 
     def __bool__(self):
@@ -99,7 +103,8 @@ class Camera:
             e = self.crops[r.choice(len(self.crops), p=self.p)]
             if len(e["frames"]) < T:
                 continue
-            s = float(r.choice([1.0, 1.0, 1.25, 1.5, 2.0]))  # read s*C pixels, scale to C
+            tv = r.random() < self.tv
+            s = 2.0 if tv else float(r.choice([1.0, 1.0, 1.25, 1.5, 2.0]))  # read s*C pixels, scale to C
             size = int(C * s)
             if size > e["size"]:
                 s, size = 1.0, C
@@ -112,8 +117,8 @@ class Camera:
             clip = np.stack([self._frame(e, i)[y : y + size, x : x + size] for i in range(t0, t0 + T)])
             if size != C:
                 clip = np.stack([cv2.resize(f, (C, C), interpolation=cv2.INTER_AREA) for f in clip])
-            rec = recipe(r, "camera", hdr=False)
-            rec["decode"], rec["gain"] = "srgb", float(2 ** r.uniform(-1.0, 0.5))
+            rec = tv_recipe(r) if tv else recipe(r, "camera", hdr=False)
+            rec["decode"], rec["gain"] = "srgb", float(2 ** (r.uniform(-0.3, 0.3) if tv else r.uniform(-1.0, 0.5)))
             return clip, None, rec, f"camera:{e['clip']}"
         raise RuntimeError("camera: no crop passed the noise gate in 20 tries")
 
@@ -180,12 +185,23 @@ class Noisebase:
 
     def __init__(self, cfg, split):
         seqs = sorted(d for d in glob.glob(os.path.join(cfg.data, "noisebase", "scene*")) if os.path.exists(os.path.join(d, ".done")))
-        n_val = max(1, len(seqs) // 16)
-        self.seqs = seqs[-n_val:] if split == "val" else seqs[:-n_val]
-        self.spp = {}
-        # Cached means at a few sample counts (data/noisebase_bank.py): far fewer files.
         bank = os.path.join(cfg.data, "bank", "noisebase")
         meta = os.path.join(bank, "meta.json")
+        if os.path.exists(meta):
+            # With a bank, only the sequences already in it (a fetch in progress adds
+            # folders before their arrays exist; reading those raw is ~20 times slower).
+            banked = [d for d in seqs if os.path.exists(os.path.join(bank, os.path.basename(d) + ".noisy.f16.npy"))]
+            seqs = banked or seqs
+        # Held out: the last sixteenth. Validation uses those of them the first fetch
+        # had (every 8th sequence), so its clips stay the same when more are fetched;
+        # the others held out are a spare test set.
+        n_val = max(1, len(seqs) // 16)
+        held = seqs[-n_val:]
+        first = [d for d in held if int(os.path.basename(d)[5:]) % 8 == 0]
+        self.seqs = (first or held) if split == "val" else seqs[:-n_val]
+        self.spare = [d for d in held if d not in (first or held)]
+        self.spp = {}
+        # Cached means at a few sample counts (data/noisebase_bank.py): far fewer files.
         self.bank = None
         if os.path.exists(meta):
             spp = json.load(open(meta))["spp"]

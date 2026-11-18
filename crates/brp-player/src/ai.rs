@@ -173,7 +173,7 @@ impl AiKind {
                 p("Strength", "Beta: the model is still being trained, results will change in later versions. How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
                 p("Temporal", "On: each frame is merged with the frame before, the frame after and its own previous result, moved onto it along the motion: cleaner and steadier. Off: each frame alone (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
                 p("Scene cuts", "On: a neighbouring frame that does not match this one at all (another shot) is left out, and the result starts afresh there. Off: the network alone decides what to take from each frame (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
-                p("Model", "Fast: the small network, about 0.04 s per 1080p frame on a fast card. Quality: a much larger network, cleaner, steadier and keeps more faint detail, about 0.2 s per 1080p frame (options: Fast|Quality)", ParamKind::Int, 0.0, 0.0, 1.0),
+                p("Model", "Fast: the small network, about 0.04 s per 1080p frame on a fast card. Quality: a much larger network, cleaner, steadier and keeps more faint detail, about 0.2 s per 1080p frame. Quality 2 (test): a new network of that class with attention, being tested against Quality, about 0.23 s per 1080p frame. Old TV: for old digitised television recordings: also takes off the sharpening halos, the smeared and shifted colour and the tape noise, and leaves the picture a little softer than Quality would (options: Fast|Quality|Quality 2 (test)|Old TV)", ParamKind::Int, 0.0, 0.0, 3.0),
             ],
             AiKind::Deblur => vec![p(
                 "Strength",
@@ -295,17 +295,77 @@ const LEARNED_REPLAY: i64 = 2;
 /// "frame before".
 const LEARNED_GAP: i64 = 3;
 
+/// Learned denoiser, repeated frames. Many clips show each picture more than once
+/// (30 fps content at 60: twice; 24 at 60: twice and three times in turn). The copies
+/// differ only by what the compression made of them, but the denoiser gave each another
+/// result (the first copy's other neighbour is the picture before, the second copy's the
+/// picture after): a shimmer on moving edges, 0.6 to 0.9 levels of 255 on average. So
+/// the model runs on the first copy only, with the new pictures before and after as its
+/// neighbours, and the copies get that result.
+///
+/// Most pictures in a row taken for one (then the next counts as new again).
+const LEARNED_HOLD: i64 = 4;
+/// A picture repeats the one before when their difference (`brp_ai::learned::Difference`,
+/// levels of 255) is at most `REPEAT_SAME` on average, and `REPEAT_SAME_BLOCK` within
+/// the 8 px block that changed most: the same picture, whatever is around it (a held
+/// still, a frame stored twice). The block limit keeps a small thing moving over a
+/// still picture from being held (4 px of 20 levels moving by a pixel: 2.5).
+const REPEAT_SAME: f32 = 0.1;
+const REPEAT_SAME_BLOCK: f32 = 0.5;
+/// Or when it changed far less than the pictures around it: at most `REPEAT_RATIO` of
+/// the largest change among the `REPEAT_WINDOW` steps before it, and of the largest
+/// among those after it, each of them at least `REPEAT_AROUND`. And at most
+/// `REPEAT_MEAN` on average and `REPEAT_BLOCK` in the 32 px block whose mean changed
+/// most, the whole picture's mean moving by at most `REPEAT_SHIFT` of the average
+/// difference (in a fade it moves by about all of it).
+///
+/// No fixed limit tells a copy from a new picture: after compression a copy differs
+/// from its picture by up to 1.4 levels on average (2.4 where the copy is a key
+/// frame), more than two frames of a clean, nearly still shot differ (0.8 to 2.9 in a
+/// hand-held phone clip; 0.7 for a still with a noise of 0.5 levels). What tells them
+/// apart is that a copy sits between changes several times its size, while a still
+/// shot's frames, a slow fade's and a slow move's all change about as much as their
+/// neighbours. Where the pictures around change by less than `REPEAT_AROUND` nothing is
+/// taken for a copy (the same-picture rule aside): there the copies' results hardly
+/// differ anyway, and it keeps still shots, slow fades and slow moves untouched.
+const REPEAT_MEAN: f32 = 2.5;
+const REPEAT_BLOCK: f32 = 6.0;
+const REPEAT_SHIFT: f32 = 0.75;
+const REPEAT_RATIO: f32 = 0.4;
+const REPEAT_AROUND: f32 = 1.25;
+const REPEAT_WINDOW: i64 = LEARNED_HOLD - 1;
+/// Pictures after a picture that telling its copies apart can read: the copies
+/// themselves, then the window of the last one.
+const LEARNED_AHEAD: i64 = LEARNED_HOLD - 1 + REPEAT_WINDOW;
+/// Pictures after a frame the viewer waits for before it makes the frame's picture
+/// (what one repeat test reads; a longer run of copies asks again, as for any frame
+/// not decoded yet).
+const LEARNED_NEED: i64 = REPEAT_WINDOW + 1;
+/// Pictures before a picture read after a jump: back to the first copy of its picture,
+/// then `LEARNED_REPLAY` new pictures (each up to `LEARNED_HOLD` copies), and the
+/// window of the earliest.
+const LEARNED_BACK: i64 = (LEARNED_REPLAY + 1) * LEARNED_HOLD + REPEAT_WINDOW;
+
+/// BRP_DN_REPEATS=0: every picture goes through the model, copies too (as before;
+/// for comparing).
+fn learned_repeats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRP_DN_REPEATS").is_none_or(|v| v != "0"))
+}
+
 fn learned_temporal(params: &[f64]) -> bool {
     params.get(1).is_none_or(|&v| v >= 0.5)
 }
 
 /// Denoise (AI)'s models, by its Model parameter: folders of `models/`, each written
 /// by `tools/denoise_train/export_player.py`.
-const LEARNED_MODELS: [&str; 2] = ["brpdn", "brpdn_quality"];
+const LEARNED_MODELS: [&str; 4] = ["brpdn", "brpdn_quality", "brpdn_hybrid", "brpdn_tv"];
 
 fn learned_model(params: &[f64]) -> usize {
-    // 1: Quality. Anything else is Fast (also the third choice an earlier build had).
-    params.get(3).map_or(0, |v| (v.round() as i64 == 1) as usize)
+    // 0: Fast, 1: Quality, 2: Quality 2 (the network with attention), 3: Old TV.
+    // Anything else is Fast.
+    let m = params.get(3).map_or(0, |v| v.round() as i64);
+    usize::try_from(m).ok().filter(|m| *m < LEARNED_MODELS.len()).unwrap_or(0)
 }
 
 /// Steady Detail: frames each way.
@@ -343,7 +403,8 @@ pub(crate) struct Reach {
     pub depth: i64,
     /// Stabilisation: its smoothing radius each way (stages add up).
     pub stab: i64,
-    /// Learned denoiser (temporal): earlier pictures replayed after a jump.
+    /// Learned denoiser (temporal): earlier pictures replayed after a jump, and the
+    /// pictures around read to tell repeated frames (`LEARNED_BACK`, `LEARNED_AHEAD`).
     pub learned: i64,
 }
 
@@ -376,7 +437,15 @@ impl Reach {
 
     /// Source frames read before and after a frame.
     pub fn frames(&self) -> (i64, i64) {
-        (self.blur + self.window + 4 * self.matte + DEPTH_REPLAY * self.depth + LEARNED_REPLAY * self.learned + self.stab + self.deint, self.interp + self.blur + self.window + self.stab + self.deint)
+        // The learned denoiser's own step each way is in `window`.
+        let (back, ahead) = if learned_repeats() { (LEARNED_BACK - 1, LEARNED_AHEAD - 1) } else { (LEARNED_REPLAY, 0) };
+        (self.blur + self.window + 4 * self.matte + DEPTH_REPLAY * self.depth + back * self.learned + self.stab + self.deint, self.interp + self.blur + self.window + ahead * self.learned + self.stab + self.deint)
+    }
+
+    /// Source frames after a frame the viewer waits for before making its picture,
+    /// beyond the stack's own reach (`LEARNED_NEED`).
+    pub fn wait_ahead(&self) -> i64 {
+        if learned_repeats() { (LEARNED_NEED - 1) * self.learned } else { 0 }
     }
 }
 
@@ -992,7 +1061,7 @@ impl Ai {
         let frames: Vec<Arc<VideoFrame>> = (lo..=hi).filter_map(|i| src.get(i)).collect();
         let has = |i: i64| i < 0 || i > last || frames.iter().any(|f| f.index() == i);
         let reach = window + d;
-        if !has(n) || (need_next && !has(n + 1 + d)) || (blur > 0 && !has(n - 1 - d)) || !(n - reach..=n + reach).all(has) {
+        if !has(n) || (need_next && !has(n + 1 + d)) || (blur > 0 && !has(n - 1 - d)) || !(n - reach..=n + reach + r.wait_ahead()).all(has) {
             log::trace!("AI: job {pos:?} waits for frames {:?}", (n - reach.max(back)..=n + reach.max(fwd)).filter(|&i| !has(i)).collect::<Vec<_>>());
             return None;
         }
@@ -1214,6 +1283,9 @@ struct LearnedState {
     model: usize,
     /// Its denoised picture, as the network keeps it (PQ, padded).
     prev: Tensor,
+    /// The picture the stage made of it, handed out again for its copies (None: a
+    /// picture replayed after a jump, not shown).
+    out: Option<Tensor>,
 }
 
 struct MattingState {
@@ -1311,6 +1383,15 @@ pub(crate) struct Worker {
     /// The learned denoisers loaded so far, by index into `LEARNED_MODELS`.
     learned: HashMap<usize, brp_ai::learned::Learned>,
     learned_state: HashMap<usize, LearnedState>,
+    /// This job took the learned denoiser's state to write a new one (a job that
+    /// fails before that leaves the state as it was).
+    learned_dirty: bool,
+    /// How far two pictures of a stage's input are apart, by (stage, earlier tick,
+    /// later tick): read back from the GPU once (`differ`).
+    diffs: HashMap<(usize, i64, i64), brp_ai::learned::Difference>,
+    diffs_order: VecDeque<(usize, i64, i64)>,
+    /// Host-visible buffer the differences are read back through.
+    diff_read: Option<Buffer>,
     /// Depth: per stage input, the model (its frame history) and the last picture fed.
     depth: HashMap<usize, DepthState>,
     depth_fx: Option<brp_ai::depth::DepthFx>,
@@ -1349,6 +1430,8 @@ const MATTE_MARGIN: f32 = 0.0;
 const MATTE_RANGE: usize = 2;
 /// Motions kept.
 const MOTIONS: usize = 32;
+/// Differences between pictures kept (two numbers each).
+const DIFFS: usize = 1024;
 
 fn worker(shared: Arc<Shared>) {
     let mut w = Worker::default();
@@ -1701,6 +1784,8 @@ impl Worker {
             self.alphas_order.retain(|k| keep(k.0));
             self.depth.retain(|i, _| keep(*i));
             self.learned_state.retain(|i, _| keep(*i));
+            self.diffs.retain(|k, _| keep(k.0));
+            self.diffs_order.retain(|k| keep(k.0));
             self.sims.retain(|k, _| keep(k.0));
             self.sims_order.retain(|k| keep(k.0));
             self.motion.retain(|k, _| keep(k.0));
@@ -1720,6 +1805,7 @@ impl Worker {
         self.added.clear();
         self.added_motion.clear();
         self.added_alphas.clear();
+        self.learned_dirty = false;
         let t0 = std::time::Instant::now();
         let made = match body(self, &mut rec) {
             Ok(v) => {
@@ -1768,7 +1854,9 @@ impl Worker {
             self.motion_order.retain(|k| self.motion.contains_key(k));
             self.matting.clear();
             // The denoiser's state was to be written by work that did not run.
-            self.learned_state.clear();
+            if self.learned_dirty {
+                self.learned_state.clear();
+            }
             for k in std::mem::take(&mut self.added_alphas) {
                 self.alphas.remove(&k);
             }
@@ -2090,8 +2178,46 @@ impl Worker {
             self.put(rec, state);
             return Ok(out);
         }
-        // Where to carry on from: the last picture made, if this one follows it closely.
-        let mut state = self.learned_state.remove(&s).filter(|st| st.model == model && st.last < tick && tick - st.last <= LEARNED_GAP * g);
+        let hold = if learned_repeats() { LEARNED_HOLD } else { 1 };
+        // A copy of the picture the last result was made of: that result again. (A
+        // frame its test needs that is not decoded yet stops here, the state untouched.)
+        if hold > 1 {
+            let last = self.learned_state.get(&s).filter(|st| st.model == model && st.out.is_some() && st.last <= tick && tick - st.last < hold * g).map(|st| st.last);
+            if let Some(last) = last {
+                if tick == last || self.same_run(rec, job, s, model, last, tick, g)? {
+                    log::debug!("AI: denoise: picture {tick} repeats {last}");
+                    return Ok(self.learned_state[&s].out.clone().expect("checked above"));
+                }
+            }
+        }
+        // Where to carry on from: the last picture made, if this one follows it closely
+        // (at most `LEARNED_GAP` new pictures later; copies do not count). `cur`: the
+        // picture the model runs on, the first copy of this one.
+        let (mut cur, mut gap, mut carry) = (tick, 1.0f32, false);
+        if let Some(last) = self.learned_state.get(&s).filter(|st| st.model == model && st.last < tick && tick - st.last <= LEARNED_GAP * hold * g).map(|st| st.last) {
+            let (steps, start) = self.new_pictures(rec, job, s, model, last, tick, g, hold);
+            if (1..=LEARNED_GAP).contains(&steps) {
+                (cur, gap, carry) = (start, steps as f32, true);
+            }
+        }
+        if !carry {
+            cur = self.run_start(rec, job, s, model, tick, g, hold);
+        }
+        // The picture after: the next new one (None: the clip ends first).
+        let mut next = None;
+        let mut t = cur + g;
+        while t <= end {
+            if t - cur >= hold * g || !self.same_run(rec, job, s, model, cur, t, g)? {
+                next = Some(t);
+                break;
+            }
+            t += g;
+        }
+        let img = self.eval(rec, job, s, cur)?;
+        let after = next.map(|t| self.eval(rec, job, s, t)).transpose()?;
+        // From here the state is rewritten.
+        self.learned_dirty = true;
+        let mut state = self.learned_state.remove(&s).filter(|_| carry);
         let mut before = None;
         if let Some(st) = &state {
             match self.eval(rec, job, s, st.last) {
@@ -2100,26 +2226,33 @@ impl Worker {
             }
         }
         if state.is_none() {
-            for back in (1..=LEARNED_REPLAY).rev() {
-                let t = tick - back * g;
-                if t < 0 {
-                    continue;
-                }
-                let Ok(cur) = self.eval(rec, job, s, t) else {
+            gap = 1.0;
+            // The new pictures before this one, nearest first.
+            let mut starts = Vec::new();
+            let mut x = cur;
+            while (starts.len() as i64) < LEARNED_REPLAY && x - g >= 0 {
+                x = self.run_start(rec, job, s, model, x - g, g, hold);
+                starts.push(x);
+            }
+            for (i, &t) in starts.iter().enumerate().rev() {
+                let Ok(c) = self.eval(rec, job, s, t) else {
                     state = None;
                     continue;
                 };
                 // With a state, the picture before it; the first one stands alone.
-                let b = if state.is_some() { self.eval(rec, job, s, t - g).ok() } else { None };
-                let a = self.eval(rec, job, s, t + g).ok();
+                let b = match &state {
+                    Some(st) => self.eval(rec, job, s, st.last).ok(),
+                    None => None,
+                };
+                let a = self.eval(rec, job, s, if i == 0 { cur } else { starts[i - 1] }).ok();
                 let prev = state.as_ref().filter(|_| b.is_some()).map(|st| &st.prev);
-                let made = self.learned[&model].record(rec, &cur, b.as_ref().filter(|_| prev.is_some()), a.as_ref(), prev, sdr, 1.0, cuts, 1.0);
-                for x in [Some(cur), b, a].into_iter().flatten() {
+                let made = self.learned[&model].record(rec, &c, b.as_ref().filter(|_| prev.is_some()), a.as_ref(), prev, sdr, 1.0, cuts, 1.0);
+                for x in [Some(c), b, a].into_iter().flatten() {
                     self.put(rec, x);
                 }
                 let (out, st) = made?;
                 self.put(rec, out);
-                if let Some(old) = state.replace(LearnedState { last: t, model, prev: st }) {
+                if let Some(old) = state.replace(LearnedState { last: t, model, prev: st, out: None }) {
                     self.put(rec, old.prev);
                 }
             }
@@ -2130,20 +2263,157 @@ impl Worker {
                 }
             }
         }
-        let img = self.eval(rec, job, s, tick)?;
-        let after = if tick + g <= end { Some(self.eval(rec, job, s, tick + g)?) } else { None };
-        // How many frames back the picture before is (more than 1: playback skipped some).
-        let gap = state.as_ref().map_or(1.0, |st| (tick - st.last) as f32 / g.max(1) as f32);
+        // `gap`: how many new pictures back the picture before is (more than 1: playback
+        // skipped some).
+        log::debug!("AI: denoise: picture {cur} (for {tick}), before {:?}, after {next:?}, gap {gap}", state.as_ref().map(|st| st.last));
         let made = self.learned[&model].record(rec, &img, before.as_ref(), after.as_ref(), state.as_ref().map(|st| &st.prev), sdr, strength, cuts, gap);
         for x in [Some(img), before, after].into_iter().flatten() {
             self.put(rec, x);
         }
         if let Some(old) = state {
             self.put(rec, old.prev);
+            if let Some(o) = old.out {
+                self.put(rec, o);
+            }
         }
         let (out, st) = made?;
-        self.learned_state.insert(s, LearnedState { last: tick, model, prev: st });
+        self.learned_state.insert(s, LearnedState { last: cur, model, prev: st, out: Some(out.clone()) });
         Ok(out)
+    }
+
+    /// How far pictures `a` and `b` of stage `s`'s output are apart: computed on the
+    /// GPU, read back (the recording so far runs first) and kept.
+    #[allow(clippy::too_many_arguments)]
+    fn differ(&mut self, rec: &mut Recorder, job: &Job, s: usize, model: usize, a: i64, b: i64) -> anyhow::Result<brp_ai::learned::Difference> {
+        use brp_ai::learned::Difference;
+        let k = (s, a.min(b), a.max(b));
+        if let Some(d) = self.diffs.get(&k) {
+            return Ok(*d);
+        }
+        let (pa, pb) = (self.eval(rec, job, s, k.1)?, self.eval(rec, job, s, k.2)?);
+        let sdr = job.color.transfer == brp_media::Transfer::Sdr;
+        let planes = self.learned[&model].difference(rec, &pa, &pb, sdr);
+        self.put(rec, pa);
+        self.put(rec, pb);
+        let planes = planes?;
+        let bytes = planes.len() * 4;
+        if self.diff_read.as_ref().is_none_or(|b| b.size < bytes as u64) {
+            self.diff_read = None;
+            self.diff_read = Some(self.gpu().compute.readback(bytes as u64, "ai difference")?);
+        }
+        rec.copy(&planes.buf, planes.off, self.diff_read.as_ref().unwrap(), 0, bytes as u64);
+        rec.sync()?;
+        let raw = self.diff_read.as_mut().and_then(|b| b.mapped()).ok_or_else(|| anyhow::anyhow!("difference read-back not mapped"))?;
+        let data: Vec<f32> = raw[..bytes].chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect();
+        let d = Difference::from_blocks(&data, planes.w, planes.h);
+        self.put(rec, planes);
+        log::trace!("AI: pictures {} and {} of stage {s} differ by {:.3} (8 px block {:.2}, 32 px block {:.2}, shift {:.3})", k.1, k.2, d.mean, d.fine, d.block, d.shift);
+        self.diffs.insert(k, d);
+        self.diffs_order.push_back(k);
+        while self.diffs_order.len() > DIFFS {
+            if let Some(old) = self.diffs_order.pop_front() {
+                self.diffs.remove(&old);
+            }
+        }
+        Ok(d)
+    }
+
+    /// Whether picture `tick` of stage `s`'s output repeats the one before it (see
+    /// `REPEAT_SAME` and `REPEAT_RATIO`). Steps outside the clip do not count for the
+    /// window; a picture not decoded is an error.
+    #[allow(clippy::too_many_arguments)]
+    fn repeats(&mut self, rec: &mut Recorder, job: &Job, s: usize, model: usize, tick: i64, g: i64) -> anyhow::Result<bool> {
+        let end = job.last_frame * job.subs;
+        if tick - g < 0 || tick > end {
+            return Ok(false);
+        }
+        let d = self.differ(rec, job, s, model, tick - g, tick)?;
+        if d.mean <= REPEAT_SAME && d.fine <= REPEAT_SAME_BLOCK {
+            return Ok(true);
+        }
+        if d.mean > REPEAT_MEAN || d.block > REPEAT_BLOCK || d.shift > REPEAT_SHIFT * d.mean {
+            return Ok(false);
+        }
+        // Each side: a change this large within the window.
+        let around = (d.mean / REPEAT_RATIO).max(REPEAT_AROUND);
+        // A side the clip ends on has no steps: the other side decides alone.
+        let mut sides = 0;
+        for dir in [-1, 1] {
+            let (mut any, mut larger) = (false, false);
+            for k in 1..=REPEAT_WINDOW {
+                let u = tick + dir * k * g;
+                if u - g < 0 || u > end {
+                    break;
+                }
+                any = true;
+                if self.differ(rec, job, s, model, u - g, u)?.mean >= around {
+                    larger = true;
+                    break;
+                }
+            }
+            if any && !larger {
+                return Ok(false);
+            }
+            sides += any as i32;
+        }
+        Ok(sides > 0)
+    }
+
+    /// Whether picture `b` is a copy of picture `a` before it: every picture from
+    /// `a` to it repeats the one before, and it is still close to `a` itself (so a
+    /// slow change does not add up unseen).
+    #[allow(clippy::too_many_arguments)]
+    fn same_run(&mut self, rec: &mut Recorder, job: &Job, s: usize, model: usize, a: i64, b: i64, g: i64) -> anyhow::Result<bool> {
+        let mut t = a + g;
+        while t <= b {
+            if !self.repeats(rec, job, s, model, t, g)? {
+                return Ok(false);
+            }
+            t += g;
+        }
+        if b > a + g {
+            let d = self.differ(rec, job, s, model, a, b)?;
+            return Ok(d.mean <= REPEAT_MEAN && d.block <= REPEAT_BLOCK);
+        }
+        Ok(true)
+    }
+
+    /// The first copy of picture `tick` (at most `hold` pictures in a run): `tick`
+    /// itself when it is new, or when the pictures before it are not decoded.
+    #[allow(clippy::too_many_arguments)]
+    fn run_start(&mut self, rec: &mut Recorder, job: &Job, s: usize, model: usize, tick: i64, g: i64, hold: i64) -> i64 {
+        let mut r = tick;
+        while r - g >= 0 && tick - (r - g) < hold * g {
+            if !matches!(self.repeats(rec, job, s, model, r, g), Ok(true)) {
+                break;
+            }
+            if r < tick && !matches!(self.differ(rec, job, s, model, r - g, tick), Ok(d) if d.mean <= REPEAT_MEAN && d.block <= REPEAT_BLOCK) {
+                break;
+            }
+            r -= g;
+        }
+        r
+    }
+
+    /// How many new pictures (not copies) there are after picture `from` up to `to`,
+    /// and the first copy of `to`'s picture. Counting stops past `LEARNED_GAP`. A
+    /// picture not decoded counts as new.
+    #[allow(clippy::too_many_arguments)]
+    fn new_pictures(&mut self, rec: &mut Recorder, job: &Job, s: usize, model: usize, from: i64, to: i64, g: i64, hold: i64) -> (i64, i64) {
+        let (mut n, mut start) = (0, from);
+        let mut t = from + g;
+        while t <= to {
+            let copy = t - start < hold * g && matches!(self.same_run(rec, job, s, model, start, t, g), Ok(true));
+            if !copy {
+                n += 1;
+                start = t;
+                if n > LEARNED_GAP {
+                    break;
+                }
+            }
+            t += g;
+        }
+        (n, start)
     }
 
     /// Depth of picture `tick` of stage `s` and an effect from it. The video model

@@ -29,7 +29,7 @@ import json, os, struct, sys
 import numpy as np
 import torch
 
-from model import ResBlock, UNet2, build_model
+from model import ResBlock, TrBlock, UNet2, build_model
 
 
 class Graph:
@@ -42,14 +42,19 @@ class Graph:
             s.blobs.append(b)
         s.lines.append(f"{ty:<16} {name:<12} {len(ins)} {len(outs)} {' '.join(ins + outs)} {params}".rstrip())
 
-    def conv(s, name, src, dst, weight, bias, stride=1, relu=False, pad=None):
+    def conv(s, name, src, dst, weight, bias, stride=1, relu=False, pad=None, groups=1):
+        """A convolution; `bias` None: none; `groups` > 1: depthwise (one filter per channel)."""
         w = weight.detach().float().cpu().numpy()
-        b = bias.detach().float().cpu().numpy()
         oc, ic, kh, kw = w.shape
-        assert kh == kw
-        p = f"0={oc} 1={kw} 3={stride} 4={kw // 2 if pad is None else pad} 5=1 6={w.size}" + (" 9=1" if relu else "")
-        s.add("Convolution", name, [src], [dst], p)
-        s.bin += struct.pack("<I", 0) + w.astype("<f4").tobytes() + b.astype("<f4").tobytes()
+        assert kh == kw and (groups == 1 or (groups == oc and ic == 1)), (w.shape, groups)
+        p = f"0={oc} 1={kw} 3={stride} 4={kw // 2 if pad is None else pad} 5={int(bias is not None)} 6={w.size}" + (f" 7={groups}" if groups > 1 else "") + (" 9=1" if relu else "")
+        s.add("ConvolutionDepthWise" if groups > 1 else "Convolution", name, [src], [dst], p)
+        s.bin += struct.pack("<I", 0) + w.astype("<f4").tobytes() + (b"" if bias is None else bias.detach().float().cpu().numpy().astype("<f4").tobytes())
+
+    def raw(s, *tensors):
+        """Weights the runner reads as plain f32 (its own layers: no tag before them)."""
+        for t in tensors:
+            s.bin += t.detach().float().cpu().numpy().astype("<f4").tobytes()
 
     def seq(s, prefix, src, convs, last_relu=True):
         """Convolutions one after another ((module, stride) pairs), ReLU after each."""
@@ -69,10 +74,39 @@ class Graph:
 def unet2(g, u, first, src):
     """model.UNet2 with residual blocks, from its first convolution (`first`, over the
     reordered input and the memory; no ReLU after it) to its last features."""
+    def tr(n, x, blk):
+        """model.TrBlock: the runner's ChannelNorm (LayerNorm over each pixel's channels)
+        and ChannelAttention (Restormer's, on the q, k, v planes; one temperature per
+        head), then the gated depthwise feed-forward."""
+        c = blk.proj.out_channels
+        g.add("Split", n + "s", [x], [n + "x", n + "k"])
+        g.add("ChannelNorm", n + "n1", [n + "x"], [n + "n1"], f"0={c} 1={blk.n1.eps:e}")
+        g.raw(blk.n1.weight.flatten(), blk.n1.bias.flatten())
+        g.conv(n + "q", n + "n1", n + "q", blk.qkv.weight, None)
+        g.conv(n + "qd", n + "q", n + "qd", blk.qkv_dw.weight, None, groups=3 * c)
+        g.add("ChannelAttention", n + "at", [n + "qd"], [n + "at"], f"0={c} 1={blk.heads}")
+        g.raw(blk.temp.flatten())
+        g.conv(n + "pj", n + "at", n + "pj", blk.proj.weight, None)
+        g.add("BinaryOp", n + "+a", [n + "pj", n + "k"], [n + "m"], "0=0")
+        g.add("Split", n + "s2", [n + "m"], [n + "mx", n + "mk"])
+        g.add("ChannelNorm", n + "n2", [n + "mx"], [n + "n2"], f"0={c} 1={blk.n2.eps:e}")
+        g.raw(blk.n2.weight.flatten(), blk.n2.bias.flatten())
+        g.conv(n + "f1", n + "n2", n + "f1", blk.f1.weight, None)
+        g.conv(n + "fd", n + "f1", n + "fd", blk.f_dw.weight, None, groups=blk.f_dw.out_channels)
+        g.add("Slice", n + "sl", [n + "fd"], [n + "fa", n + "fb"], "1=0")
+        g.add("GELU", n + "g", [n + "fa"], [n + "ga"])
+        g.add("BinaryOp", n + "*", [n + "ga", n + "fb"], [n + "gm"], "0=2")
+        g.conv(n + "f2", n + "gm", n + "f2", blk.f2.weight, None)
+        g.add("BinaryOp", n + "+", [n + "f2", n + "mk"], [n], "0=0")
+        return n
+
     def stack(prefix, x, blocks):
         for i, blk in enumerate(blocks):
-            assert isinstance(blk, ResBlock), type(blk)  # the other blocks are not written yet
             n = f"{prefix}{i}"
+            if isinstance(blk, TrBlock):
+                x = tr(n, x, blk)
+                continue
+            assert isinstance(blk, ResBlock), type(blk)  # NAFNet blocks are not written
             g.add("Split", n + "s", [x], [n + "x", n + "k"])
             g.conv(n + "a", n + "x", n + "a", blk.a.weight, blk.a.bias, relu=True)
             g.conv(n + "b", n + "a", n + "b", blk.b.weight, blk.b.bias)

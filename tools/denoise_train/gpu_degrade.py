@@ -341,6 +341,104 @@ def aliasing(v, p, g, flow):
     return fill_field(v, first, False)
 
 
+def blur2(x, sx, sy):
+    """Gaussian blur with its own width along the lines (sx) and across them (sy)."""
+    sh = x.shape
+    y = x.reshape(-1, 1, sh[-2], sh[-1])
+    for s, dim in ((sx, 3), (sy, 2)):
+        if s <= 0.05:
+            continue
+        n = y.shape[dim]
+        rad = min(max(1, int(math.ceil(3 * s))), n - 1)
+        t = torch.arange(-rad, rad + 1, device=x.device, dtype=torch.float32)
+        k = torch.exp(-t * t / (2 * s * s))
+        k = k / k.sum()
+        if dim == 3:
+            y = F.conv2d(F.pad(y, (rad, rad, 0, 0), mode="reflect"), k.view(1, 1, 1, -1))
+        else:
+            y = F.conv2d(F.pad(y, (0, 0, rad, rad), mode="reflect"), k.view(1, 1, -1, 1))
+    return y.reshape(sh)
+
+
+def ring(y, period, damp):
+    """What a ringing filter adds along the lines: y through a damped cosine of that
+    period (px), damping in periods, no gain at zero frequency, gain 1 at its own."""
+    s = damp * period
+    rad = min(max(2, int(math.ceil(3 * s))), y.shape[-1] - 1)
+    t = torch.arange(-rad, rad + 1, device=y.device, dtype=torch.float32)
+    c = torch.cos(2 * math.pi * t / period)
+    k = c * torch.exp(-t * t / (2 * s * s))
+    k = k - k.mean()
+    k = k / (k * c).sum()
+    sh = y.shape
+    q = y.reshape(-1, 1, sh[-2], sh[-1])
+    return F.conv2d(F.pad(q, (rad, rad, 0, 0), mode="reflect"), k.view(1, 1, 1, -1)).reshape(sh)
+
+
+def sharpen(y, s):
+    if "ring" in s:
+        return y + s["a"] * ring(y, s["ring"], s["damp"])
+    return y + s["a"] * (y - blur2(y, s["sx"], s["sy"]))
+
+
+def shift(x, dx, dy):
+    """The picture moved by whole pixels (right and down positive), its edge repeated."""
+    if dx == 0 and dy == 0:
+        return x
+    sh = x.shape
+    y = x.reshape(-1, 1, sh[-2], sh[-1])
+    y = F.pad(y, (max(dx, 0), max(-dx, 0), max(dy, 0), max(-dy, 0)), mode="replicate")
+    y = y[:, :, max(-dy, 0) : max(-dy, 0) + sh[-2], max(-dx, 0) : max(-dx, 0) + sh[-1]]
+    return y.reshape(sh)
+
+
+def tv(v, p, g):
+    """An old television recording (recipes.tv_recipe), on display values (T, 3, H, W).
+    Returns the damaged clip and the target."""
+    T, _, H, W = v.shape
+    dev = v.device
+
+    def grade(x):  # the levels both share: saturation, contrast, lift, clipping
+        y = luma(x)
+        return (((y + (x - y) * p["sat"]) - 0.5) * p["contrast"] + 0.5 + p["lift"]).clamp(0, 1)
+
+    target = grade(blur2(v, p["sx"] * p["keep"], p["sy"] * p["keep"]))
+    x = blur2(v, p["sx"], p["sy"])
+    y = luma(x)
+    c = shift(blur2(x - y, p["csx"], p["csy"]), p["cdx"], p["cdy"]) * p["sat"]
+    if p["cnoise"]:
+        n = blur2(torch.randn((T, 3, H, W), device=dev, generator=g), p["csx"] * 0.7, 0.4)
+        n = n - luma(n)
+        c = c + p["cnoise"] * n / n.std().clamp_min(1e-6)
+    # The edge enhancement of the time: before the tape's noise, and (sgam > 1) in a more
+    # linear signal, before the camera's gamma: undershoots clip to black.
+    gam = p.get("sgam", 1.0)
+    if gam != 1.0:
+        y = y.clamp_min(0) ** gam
+    for s in p["sharp"]:
+        if not s["late"]:
+            y = sharpen(y, s)
+    if gam != 1.0:
+        y = y.clamp_min(0) ** (1 / gam)
+    if p["ghost"]:
+        y = (y + p["ghost"] * shift(y, p["gdx"], 0)) / (1 + p["ghost"])
+    if p["noise"]:
+        n = blur2(torch.randn((T, 1, H, W), device=dev, generator=g), p["nsx"], 0.0)
+        y = y + p["noise"] * n / n.std().clamp_min(1e-6)
+    if p["dropouts"]:
+        m = (torch.rand((T, 1, H, W), device=dev, generator=g) < p["dropouts"]).float()
+        m = F.max_pool2d(F.pad(m, (30, 0, 0, 0)), (1, 31), stride=1)  # a dash to the right of each
+        y = torch.where(m > 0, torch.ones_like(y), y)
+    for s in p["sharp"]:  # a later, digital one: the noise is sharpened with the picture
+        if s["late"]:
+            y = sharpen(y, s)
+    out = ((y + c - 0.5) * p["contrast"] + 0.5 + p["lift"]).clamp(0, 1)
+    if p["scale"]:
+        small = resize(out, (max(8, int(H * p["scale"])), max(8, int(W * p["scale"]))), "bilinear")
+        out = resize(small, (H, W), "bicubic" if p["cubic"] else "bilinear").clamp(0, 1)
+    return out, target
+
+
 def banding(v, p, g):
     q = 2 ** p["bits"] - 1
     return torch.round(v.clamp(0, 1) * q) / q
@@ -376,24 +474,41 @@ class GpuDegrader:
         self.g.manual_seed(seed)
         self.pool = None
         self.compress_workers = compress_workers
+        self.gen = 0  # counts pool resets: a batch sent to an older pool is not waited for
+        self.sent = 0  # clips sent to the current pool
 
     def _pool(self):
         if self.pool is None:
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
 
-            # Workers are replaced every 200 clips, so a slow leak in an encoder library
-            # cannot build up over a long run.
-            self.pool = ProcessPoolExecutor(self.compress_workers, mp_context=mp.get_context("spawn"), max_tasks_per_child=200)
+            self.pool = ProcessPoolExecutor(self.compress_workers, mp_context=mp.get_context("spawn"))
+            self.sent = 0
+        elif self.sent >= 200 * self.compress_workers:
+            # A fresh pool every 200 clips per worker, so a slow leak in an encoder
+            # library cannot build up over a long run. The old one finishes what it
+            # has and its workers exit. (Not max_tasks_per_child: the pool built with
+            # it stopped answering three times in one run, 16 Nov.)
+            self.pool.shutdown(wait=False)
+            self.pool = None
+            return self._pool()
+        self.sent += 1
         return self.pool
 
     def reset_pool(self):
         """After an encoder process died (the pool is then unusable): a fresh pool."""
         if self.pool is not None:
+            procs = list((getattr(self.pool, "_processes", None) or {}).values())
             try:
                 self.pool.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
+            self.gen += 1
+            for p in procs:  # a worker that hangs would stay, with its memory
+                try:
+                    p.kill()
+                except Exception:
+                    pass
             self.pool = None
 
     def close(self):
@@ -428,6 +543,11 @@ class GpuDegrader:
                     futures[i] = self._pool().submit(_compress_job, (u8, p))
                     v = vv
                     break
+                if name == "tv":
+                    # The target changes too (its levels, part of the softening).
+                    v, tgt = tv(v, p, self.g)
+                    clean[i] = dec(tgt)
+                    continue
                 if v is None:  # linear-light steps
                     x = {"sensor": sensor, "render": render, "fireflies": fireflies, "salt_pepper": salt_pepper, "hot_pixels": hot_pixels}[name](x, p, self.g)
                 else:
@@ -439,9 +559,11 @@ class GpuDegrader:
                 noisy[i] = dec(v)
             else:
                 noisy[i] = x
-        return {"clean": clean, "noisy": noisy, "futures": futures, "recipes": recipes}
+        return {"clean": clean, "noisy": noisy, "futures": futures, "recipes": recipes, "gen": self.gen}
 
     def ready(self, job):
+        if job.get("gen", self.gen) != self.gen:
+            return True  # its pool was reset: `finish` drops it
         return all(f.done() for f in job["futures"].values())
 
     @torch.no_grad()
@@ -449,8 +571,12 @@ class GpuDegrader:
         """Bring the compressed clips back; noise maps. Returns clean, noisy, sigma, labels."""
         noisy = job["noisy"]
         labels = [describe(r) for r in job["recipes"]]
+        if job.get("gen", self.gen) != self.gen and not all(f.done() for f in job["futures"].values()):
+            raise RuntimeError("its compression pool was reset")  # not waited for: skipped at once
         for i, f in job["futures"].items():
-            out, label = f.result()
+            # A time limit: a pool that has stopped answering must not stop the training
+            # (Feeder._skip then starts a new pool).
+            out, label = f.result(timeout=120)
             hdr = job["recipes"][i]["hdr"]
             dec = pq_eotf if hdr else srgb_eotf
             v = torch.from_numpy(out).to(self.device).float().permute(0, 3, 1, 2)
@@ -504,7 +630,7 @@ class Feeder:
                         self._skip(e, job["recipes"], failures)
                         continue
                     failures = 0
-                    item = {"clean": clean, "noisy": noisy, "sigma": sigma, "labels": labels, "kind": job["kind"], "origin": job["origin"]}
+                    item = {"clean": clean, "noisy": noisy, "sigma": sigma, "labels": labels, "kind": job["kind"], "origin": job["origin"], "recipes": job["recipes"]}
                     while not self.stopping:
                         try:
                             self.q.put(item, timeout=1)
@@ -523,10 +649,10 @@ class Feeder:
 
         print(f"feeder: batch skipped ({type(e).__name__}: {e}); recipes: {recipes}", flush=True)
         traceback.print_exc()
-        if isinstance(e, BrokenProcessPool):
+        if isinstance(e, (BrokenProcessPool, TimeoutError)):
             # An encoder crashed and took the pool down: start a new one. The other
             # batches waiting on the old pool fail too and are skipped as they come.
-            print("feeder: encoder pool broken, starting a new one", flush=True)
+            print("feeder: encoder pool broken or not answering, starting a new one", flush=True)
             self.degr.reset_pool()
         if failures >= 20:
             raise RuntimeError(f"20 batches in a row failed, last: {e}")

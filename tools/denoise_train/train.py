@@ -69,6 +69,23 @@ def energy_weights(noisy, clean, lo, hi):
     return w[:, None].expand(-1, noisy.shape[1]).reshape(-1)
 
 
+def tv_energy(w, recipes, frames):
+    """--tv-energy: for television clips (recipes.tv_recipe) the energy losses' weight
+    comes from the tape noise, not from the input's PSNR: their input is at about 25 dB
+    because of halos and levels, which say nothing about how well the texture can be
+    known. 1 without noise, down to 0.4 at the recipe's strongest noise (0.025).
+    w: (B * frames) from energy_weights; recipes: the batch's, one per clip."""
+    if w is None or recipes is None or len(recipes) * frames != w.numel():
+        return w
+    w = w.view(-1, frames).clone()
+    for i, r in enumerate(recipes):
+        if r.get("tv"):
+            p = dict(r["steps"])["tv"]
+            n = max(p["noise"], 0.5 * p["cnoise"])
+            w[i] = 1.0 - 0.6 * min(max((n - 0.008) / 0.017, 0.0), 1.0)
+    return w.reshape(-1)
+
+
 # Inputs this close to the clean frame are the "leave clean footage alone" samples:
 # their PSNR is near infinite, so they are kept out of the gain averages (one of them
 # moved the camera average by -0.6 dB) and reported on their own.
@@ -301,6 +318,27 @@ def with_stills(tensors, p, pan_share=0.3):
     return out
 
 
+def with_repeats(tensors, p):
+    """Repeated frames: with probability `p` a clip holds each of its frames for two
+    frames (70%: 30 fps content at 60) or for two and three in turn (30%: 24 fps at 60),
+    picture AND damage, starting anywhere in the cadence. The two copies of a frame have
+    different other neighbours; the output must not differ between them.
+    tensors: [noisy, clean, ...], each (B, T, ...); returned changed alike."""
+    B, Tn = tensors[0].shape[:2]
+    dev = tensors[0].device
+    pick = torch.rand(B, device=dev) < p
+    if not pick.any():
+        return tensors
+    t = torch.arange(Tn, device=dev)[None].expand(B, Tn)
+    two = (t + torch.randint(0, 2, (B, 1), device=dev)) // 2
+    q = t + torch.randint(0, 5, (B, 1), device=dev)
+    pull = (q // 5) * 2 + (q % 5 >= 2).long()
+    idx = torch.where(torch.rand(B, 1, device=dev) < 0.7, two, pull)
+    idx = torch.where(pick[:, None], idx - idx[:, :1], t)
+    bi = torch.arange(B, device=dev)[:, None]
+    return [x[bi, idx] for x in tensors]
+
+
 def single(model, cur):
     """The frame denoised alone: no neighbours, no previous output (all marked invalid)."""
     B = cur.shape[0]
@@ -346,7 +384,20 @@ PRE_MOTION = True  # sequence: the motion estimates of a whole clip in one call 
 RAW_MAX = 128  # ... at most this many pictures per call
 
 
-def sequence(model, n, true_sig, map_mode, noise_map, jitter=False, drop=0.0, clean=None, span=None, init=None):
+TEACHER = None  # --future: the frozen model that plays each clip backward
+FUTURE_NEXT = False  # --future-next: its result for the next frame, as the frame after
+
+
+@torch.no_grad()
+def backward_pass(teacher, n, true_sig, map_mode, noise_map):
+    """The clip played backward by `teacher` (as it is used: no dropped neighbours):
+    its result for every frame, in the clip's own order. (B, T, 3, H, W)."""
+    with torch.autocast("cuda", torch.bfloat16):
+        o, _ = sequence(teacher, n.flip(1), true_sig.flip(1), map_mode, noise_map, pre=True)
+    return o.flip(1).float().clamp(0, 1)
+
+
+def sequence(model, n, true_sig, map_mode, noise_map, jitter=False, drop=0.0, clean=None, span=None, init=None, future=None, pre=None):
     """Stage 2: the model run frame by frame over a clip, its previous output fed back
     (recurrence). n: (B, T, 3, H, W) PQ. At the clip's ends the missing neighbour is
     the frame itself, marked invalid; `drop` also drops a neighbour at random (cuts).
@@ -355,7 +406,12 @@ def sequence(model, n, true_sig, map_mode, noise_map, jitter=False, drop=0.0, cl
 
     span (t0, t1): only those frames are run (the outputs, flows and `extra` are
     theirs), from the state in `init` (what `sequence.carry` held after the frames
-    before; the caller detaches it): a clip in chunks, see --bptt."""
+    before; the caller detaches it): a clip in chunks, see --bptt.
+
+    future (B, T, 3, H, W): a backward pass's result for every frame (--future):
+    handed to the model in the frame-after's place, always there (also at the
+    clip's last frame). pre: the motion estimates in one call also when not
+    training."""
     B, T = n.shape[:2]
     dev = n.device
     prev = torch.zeros_like(n[:, 0])
@@ -380,15 +436,19 @@ def sequence(model, n, true_sig, map_mode, noise_map, jitter=False, drop=0.0, cl
         if drop > 0:
             vb = vb * (torch.rand(B, 1, 1, 1, device=dev) >= drop)
             va = va * (torch.rand(B, 1, 1, 1, device=dev) >= drop)
+        if future is not None and not FUTURE_NEXT:
+            va = torch.ones(B, 1, 1, 1, device=dev)
         vbs.append(vb)
         vas.append(va)
         befores.append(torch.where(vb > 0, n[:, max(t - 1, 0)], n[:, t]))
-        afters.append(torch.where(va > 0, n[:, min(t + 1, T - 1)], n[:, t]))
+        # --future-next: the frame after is the backward pass's result for it.
+        nxt = future.to(n.dtype) if future is not None and FUTURE_NEXT else n
+        afters.append(torch.where(va > 0, nxt[:, min(t + 1, T - 1)], n[:, t]))
     raw_all = None
     mo = getattr(model, "motion", None)
     # (In training only: validation keeps the per-frame calls, as the player runs it;
     # its many batch sizes made the one-call form several times slower there.)
-    if PRE_MOTION and model.training and mo is not None and getattr(mo, "mix", None) is not None and not getattr(model, "flow_prev", False) and getattr(model, "dis_flow", None) is None:
+    if PRE_MOTION and (model.training or pre) and mo is not None and getattr(mo, "mix", None) is not None and not getattr(model, "flow_prev", False) and getattr(model, "dis_flow", None) is None:
         N = B * (t1_ - t0_)
         cur_all = n[:, t0_:t1_].flatten(0, 1)
         a_all, b_all = torch.cat([cur_all, cur_all]), torch.cat([torch.stack(befores[t0_:t1_], 1).flatten(0, 1), torch.stack(afters[t0_:t1_], 1).flatten(0, 1)])
@@ -409,6 +469,8 @@ def sequence(model, n, true_sig, map_mode, noise_map, jitter=False, drop=0.0, cl
             model.flow_override = (dis_flows(src[:, t], src[:, max(t - 1, 0)]), dis_flows(src[:, t], src[:, min(t + 1, T - 1)]))
         # No frame before (clip start, or a cut): the previous output is another shot's.
         kw = {} if raw_all is None else {"raw": tuple(x[:, t - t0_] for x in raw_all)}
+        if future is not None and not FUTURE_NEXT:
+            kw["future"] = future[:, t]
         out, (fb, fa) = model(cur, before, after, torch.cat([vb, va], 1), prev, prev_valid * vb, st, state=h, acc=acc, fstate=fs, **kw)
         h, fs = model.last_state, model.last_fstate
         if has_acc:
@@ -489,7 +551,7 @@ class Run:
         os.makedirs(os.path.join(self.dir, "samples"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "ckpt"), exist_ok=True)
         self.cfg = {
-            "width": a.width, "blocks": a.blocks, "arch": a.arch, "motion_k": a.motion_k, "motion_w": a.motion_w, "motion_min": a.motion_min, "motion_iters": a.motion_iters, "motion_base": a.motion_base, "fuse": a.fuse, "fuse_mode": a.fuse_mode, "keep_cur": a.keep_cur, "mismatch": a.mismatch, "state": a.state, "state_lr": a.state_lr, "acc": a.acc, "acc_weight": a.acc_weight, "dis_flow": a.dis_flow, "flow_match": a.flow_match, "flow_prev": a.flow_prev, "flow_mix": a.flow_mix, "motion_warm": a.motion_warm, "motion_lr": a.motion_lr, "energy_psnr": a.energy_psnr, "stab_coarse": a.stab_coarse, "stab_peak": a.stab_peak, "coarse_weight": a.coarse_weight, "long_every": a.long_every, "long_frames": a.long_frames, "long_batch": a.long_batch, "long_low": a.long_low, "premerge_weight": a.premerge_weight, "cut_prob": a.cut_prob, "still_prob": a.still_prob, "still_pan": a.still_pan, "nb_share": a.nb_share, "long_nb": a.long_nb, "bptt": a.bptt, "occl_prob": a.occl_prob, "batch": a.batch, "frames": a.frames, "crop": a.crop,
+            "width": a.width, "blocks": a.blocks, "arch": a.arch, "motion_k": a.motion_k, "motion_w": a.motion_w, "motion_min": a.motion_min, "motion_iters": a.motion_iters, "motion_base": a.motion_base, "fuse": a.fuse, "fuse_mode": a.fuse_mode, "keep_cur": a.keep_cur, "mismatch": a.mismatch, "state": a.state, "state_lr": a.state_lr, "acc": a.acc, "acc_weight": a.acc_weight, "dis_flow": a.dis_flow, "flow_match": a.flow_match, "flow_prev": a.flow_prev, "flow_mix": a.flow_mix, "motion_warm": a.motion_warm, "motion_lr": a.motion_lr, "energy_psnr": a.energy_psnr, "stab_coarse": a.stab_coarse, "stab_peak": a.stab_peak, "coarse_weight": a.coarse_weight, "long_every": a.long_every, "long_frames": a.long_frames, "long_batch": a.long_batch, "long_low": a.long_low, "premerge_weight": a.premerge_weight, "cut_prob": a.cut_prob, "still_prob": a.still_prob, "still_pan": a.still_pan, "nb_share": a.nb_share, "long_nb": a.long_nb, "bptt": a.bptt, "future": a.future, "future_next": a.future_next, "tv_share": a.tv_share, "camera_share": a.camera_share, "tv_energy": a.tv_energy, "repeat_prob": a.repeat_prob, "kp": a.kp, "refine": a.refine, "occl_prob": a.occl_prob, "batch": a.batch, "frames": a.frames, "crop": a.crop,
             "lr": a.lr, "warmup": a.warmup, "steps": a.steps, "fft_weight": a.fft_weight, "stab_weight": a.stab_weight, "grad_weight": a.grad_weight, "warp": a.warp, "noise_map": a.noise_map, "map": a.map, "train_only": a.train_only, "est_weight": a.est_weight, "flow_weight": a.flow_weight, "detail_weight": a.detail_weight, "ema": a.ema, "seed": a.seed, "stage": a.stage,
         }
         p = os.path.join(self.dir, "config.json")
@@ -555,7 +617,7 @@ def latest_ckpt(run):
 
 
 @torch.no_grad()
-def play_scene(model, device, data="D:/denoise_data"):
+def play_scene(model, device, data="D:/denoise_data", teacher=None):
     """The held-out render scene played through as the player runs it (frame by frame,
     state carried), on a 960 x 544 part of the frame that holds the bright windows, a
     wall and the blackboard: what 10-frame crops do not show (large-scale error that
@@ -592,14 +654,28 @@ def play_scene(model, device, data="D:/denoise_data"):
     rec = {}
     for key, name in (("16", "16_random_seed.noisy"), ("64", "64_random_seed.noisy"), ("16s", "16_static_seed.noisy")):
         v = pad16(ld(name))
+        # With a teacher (--future): its backward pass first, handed to the model.
+        fut = None
+        if teacher is not None:
+            tthr, teacher.cut_thr = teacher.cut_thr, 0.026
+            fut, prev, pv = [None] * Tn, torch.zeros_like(v[:1]), 0 * one
+            for f in reversed(range(Tn)):
+                vb, va = float(f < Tn - 1), float(f > 0)
+                with torch.autocast("cuda", torch.bfloat16):
+                    o, _ = teacher(v[f : f + 1], v[min(f + 1, Tn - 1) : min(f + 1, Tn - 1) + 1], v[max(f - 1, 0) : max(f - 1, 0) + 1], torch.tensor([vb, va], device=device).view(1, 2, 1, 1), prev, pv * vb, one)
+                prev, pv = o.float(), one
+                fut[f] = prev.clamp(0, 1)
+            teacher.cut_thr = tthr
         prev, pv = torch.zeros_like(v[:1]), 0 * one
         ps, cs = [], []
         for f in range(Tn):
             cur = v[f : f + 1]
-            vb, va = float(f > 0), float(f < Tn - 1)
+            nx = fut is not None and FUTURE_NEXT
+            vb, va = float(f > 0), float(f < Tn - 1 or (fut is not None and not nx))
             valid = torch.tensor([vb, va], device=device).view(1, 2, 1, 1)
+            aft = (fut[f + 1] if nx else v[f + 1 : f + 2]) if f < Tn - 1 else cur
             with torch.autocast("cuda", torch.bfloat16):
-                o, _ = model(cur, v[f - 1 : f] if f > 0 else cur, v[f + 1 : f + 2] if f < Tn - 1 else cur, valid, prev, pv * vb, one)
+                o, _ = model(cur, v[f - 1 : f] if f > 0 else cur, aft, valid, prev, pv * vb, one, **({} if fut is None or nx else {"future": fut[f]}))
             o = o.float()
             prev, pv = o, one
             x = o[..., :H, :W].clamp(0, 1)
@@ -621,7 +697,7 @@ def play_scene(model, device, data="D:/denoise_data"):
 
 
 @torch.no_grad()
-def play_nb(model, device, data="D:/denoise_data"):
+def play_nb(model, device, data="D:/denoise_data", teacher=None):
     """The held-out sequences of the external render dataset (Noisebase: 64 frames,
     256 x 256, many scenes) played end to end as the player runs them, at 4 and at 16
     samples per pixel: play_nb4 / play_nb16 (PSNR, frames 8 on) and play_nb_drift (PSNR
@@ -648,14 +724,27 @@ def play_nb(model, device, data="D:/denoise_data"):
         i = spp.index(k)
         v = torch.stack([torch.from_numpy(np.asarray(np.load(os.path.join(bank, n + ".noisy.f16.npy"), mmap_mode="r")[:, i], np.float32)) for n in seqs])
         v = pq(v.permute(0, 1, 4, 2, 3).clamp_min(0).to(device))
+        fut = None
+        if teacher is not None:
+            tthr, teacher.cut_thr = teacher.cut_thr, 0.026
+            fut, prev, pv = [None] * Tn, torch.zeros_like(v[:, 0]), 0 * one
+            for f in reversed(range(Tn)):
+                vb, va = float(f < Tn - 1), float(f > 0)
+                with torch.autocast("cuda", torch.bfloat16):
+                    o, _ = teacher(v[:, f], v[:, min(f + 1, Tn - 1)], v[:, max(f - 1, 0)], torch.tensor([vb, va], device=device).view(1, 2, 1, 1).expand(B, 2, 1, 1), prev, pv * vb, one)
+                prev, pv = o.float(), one
+                fut[f] = prev.clamp(0, 1)
+            teacher.cut_thr = tthr
         prev, pv = torch.zeros_like(v[:, 0]), 0 * one
         ps = []
         for f in range(Tn):
             cur = v[:, f]
-            vb, va = float(f > 0), float(f < Tn - 1)
+            nx = fut is not None and FUTURE_NEXT
+            vb, va = float(f > 0), float(f < Tn - 1 or (fut is not None and not nx))
             valid = torch.tensor([vb, va], device=device).view(1, 2, 1, 1).expand(B, 2, 1, 1)
+            aft = fut[f + 1] if nx and f < Tn - 1 else v[:, min(f + 1, Tn - 1)]
             with torch.autocast("cuda", torch.bfloat16):
-                o, _ = model(cur, v[:, max(f - 1, 0)], v[:, min(f + 1, Tn - 1)], valid, prev, pv * vb, one)
+                o, _ = model(cur, v[:, max(f - 1, 0)], aft, valid, prev, pv * vb, one, **({} if fut is None or nx else {"future": fut[f]}))
             o = o.float()
             prev, pv = o, one
             ps.append(psnr(o.clamp(0, 1), clean[:, f]).mean().item())
@@ -795,8 +884,8 @@ def validate(model, val_batches, device, run, step):
                 rows.append(torch.cat([cur[j], out[j].clamp(0, 1), clean[j]], 2))
     rec = {"step": step, "time": time.time()}
     if STAGE == "recurrent":
-        rec.update(play_scene(model, device))
-        rec.update(play_nb(model, device))
+        rec.update(play_scene(model, device, teacher=TEACHER))
+        rec.update(play_nb(model, device, teacher=TEACHER))
     for k, (po, pi) in per.items():
         rec[f"psnr_{k}"] = float(np.mean(po))
         rec[f"psnr_in_{k}"] = float(np.mean(pi))
@@ -887,10 +976,22 @@ def main():
     ap.add_argument("--energy-psnr", help="LO,HI: the detail and spectrum losses count 0 for clips whose input is below LO dB, fully above HI (train.energy_weights); not given: always fully")
     ap.add_argument("--val-first", action="store_true", help="validate before the first step (the starting weights under this run's validation)")
     ap.add_argument("--occl-prob", type=float, default=0.0, help="stage 2: share of clips crossed by a fast soft-edged occluder (another clip seen through a moving ellipse)")
+    ap.add_argument("--tv-share", type=float, default=0.0, help="share of the camera clips damaged as an old television recording (recipes.tv_recipe: wide sharpening halos, smeared and shifted colour, tape noise); the target is the clean clip with part of the softening and no halos")
+    ap.add_argument("--gan-weight", type=float, default=0.0, help="recurrent stage: weight of the adversarial loss (gan.py: a critic trained beside the model to tell its output from clean frames; lets the model put plausible texture where the exact one cannot be known). Use with a raised --stab-weight: the critic sees single frames")
+    ap.add_argument("--gan-lr", type=float, default=1e-4, help="--gan-weight: the critic's learning rate")
+    ap.add_argument("--gan-start", type=int, default=300, help="--gan-weight: steps the critic trains alone before its loss reaches the model")
+    ap.add_argument("--gan-crop", type=int, default=128, help="--gan-weight: side of the window the critic sees each step")
+    ap.add_argument("--tv-energy", action="store_true", help="television clips: the detail and spectrum losses' weight comes from the tape noise (1 without, 0.4 at the strongest), not from --energy-psnr (train.tv_energy)")
+    ap.add_argument("--camera-share", type=float, help="share of the short training clips taken from camera footage (default 0.55, or what --nb-share leaves it); the other sources keep their proportion")
     ap.add_argument("--nb-share", type=float, help="share of the training clips taken from the external render dataset (Noisebase); not given: 0.15. Camera and our renders keep their proportion (55 : 30)")
     ap.add_argument("--long-nb", type=float, default=0.0, help="stage 2: share of the long clips taken from the external render dataset (64-frame sequences); the rest are our renders")
+    ap.add_argument("--kp", type=int, default=0, help="the pre-merge predicts a K x K kernel per picture and pixel instead of one weight (model.Fuse.set_kp); 0: off")
+    ap.add_argument("--refine", type=int, default=0, help="width of a small network that corrects the motion used for what the model carries along (model.StableDenoiser.refine); 0: off")
+    ap.add_argument("--future-next", action="store_true", help="stage 2, forward and backward, second design: as --future, but the model gets the backward result of the NEXT frame as its frame after (it has to move and merge it; with --future it learned to copy)")
+    ap.add_argument("--future", action="store_true", help="stage 2, forward and backward: a frozen copy of the starting weights plays each clip backward, and the model is given its result for each frame in the frame-after's place. The played validation tests run that way too (the batch validation does not)")
     ap.add_argument("--bptt", type=int, default=0, help="stage 2: clips longer than this many frames are run and backpropagated in chunks of that many (state carried, no gradient across): less memory, so larger batches of long clips. 0: whole clips")
     ap.add_argument("--still-pan", type=float, default=0.3, help="stage 2: share of slow pans among the still clips")
+    ap.add_argument("--repeat-prob", type=float, default=0.0, help="stage 2: share of clips that hold each frame for two frames, or two and three in turn (with_repeats): 30 or 24 fps content at 60")
     ap.add_argument("--still-prob", type=float, default=0.0, help="stage 2: share of clips that stop moving, picture and noise (with_stills)")
     ap.add_argument("--cut-prob", type=float, default=0.0, help="stage 2: share of clips with an unannounced scene cut (continues as another clip, flags left valid)")
     ap.add_argument("--motion-base", type=int, default=4, choices=[2, 4], help="motion stage: its finest level is the picture divided by this")
@@ -917,6 +1018,7 @@ def main():
     ap.add_argument("--init-weights", help="start from this checkpoint's weights only (new optimiser and schedule, step 0)")
     ap.add_argument("--noise-map", action="store_true", help="give the model the per-pixel noise strength (not blind)")
     ap.add_argument("--init", help="start from this checkpoint (weights, optimiser, step) in a new run")
+    ap.add_argument("--stall", type=int, default=900, help="seconds without a finished step (validation included) after which the run is taken for hung: the threads' tracebacks go to the error log, the status says crashed, the process exits; 0: off")
     ap.add_argument("--stop-at", type=int, help="stop (validate, checkpoint) at this step; the schedule still spans --steps")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--seed", type=int, default=0)
@@ -1024,6 +1126,10 @@ def main():
     dcfg = DataConfig(data=a.data, frames=a.frames, crop=a.crop, seed=a.seed + step, val_size=a.val_size)
     if a.nb_share is not None:
         dcfg.weights = {"camera": 0.55 / 0.85 * (1 - a.nb_share), "render": 0.30 / 0.85 * (1 - a.nb_share), "noisebase": a.nb_share}
+    if a.camera_share is not None:
+        rest = sum(v_ for k_, v_ in dcfg.weights.items() if k_ != "camera")
+        dcfg.weights = {k_: (a.camera_share if k_ == "camera" else v_ / rest * (1 - a.camera_share)) for k_, v_ in dcfg.weights.items()}
+    dcfg.tv_share = a.tv_share
     degr = GpuDegrader(device, compress_workers=a.compress_workers, seed=a.seed + step)
     vb = prepare_val(degr, val_batches(vcfg, a.val_size, 16, min(a.workers, 8)), device, seed=a.seed + 12345)
     loader = BatchLoader(dcfg, "train", a.batch, a.workers, seed=a.seed + step)
@@ -1039,6 +1145,15 @@ def main():
         a.long_feeder = Feeder(lload, ldeg, device, depth=4)
         extra = [a.long_feeder, lload, ldeg]
     print(f"model {params / 1e6:.2f} M parameters; {len(vb)} validation batches", flush=True)
+    if a.future or a.future_next:
+        import copy
+
+        global TEACHER, FUTURE_NEXT
+        FUTURE_NEXT = bool(a.future_next)
+        TEACHER = copy.deepcopy(ema.module).eval()
+        for p_ in TEACHER.parameters():
+            p_.requires_grad_(False)
+        print("forward and backward: the starting weights, frozen, play each clip backward", flush=True)
     try:
         train(a, run, model, ema, opt, sched, feeder, vb, device, step, best, params)
     except BaseException as e:
@@ -1046,6 +1161,10 @@ def main():
         run.write_status(state="crashed" if not isinstance(e, KeyboardInterrupt) else "stopped", error=f"{type(e).__name__}: {e}")
         raise
     finally:
+        import faulthandler
+
+        faulthandler.cancel_dump_traceback_later()
+        a.stall = 0
         feeder.close()
         loader.close()
         degr.close()
@@ -1054,6 +1173,14 @@ def main():
 
 
 def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, best, params):
+    gan = None
+    if a.gan_weight > 0:
+        from gan import Gan
+
+        assert a.stage == "recurrent" and not a.bptt, "--gan-weight: recurrent stage, without --bptt"
+        gan = Gan(device, a.gan_lr, a.gan_crop)
+        gan_from = step + a.gan_start
+        print(f"adversarial loss: weight {a.gan_weight}, critic {sum(p_.numel() for p_ in gan.d.parameters()) / 1e6:.2f} M parameters, from step {gan_from}", flush=True)
 
     def state():
         return {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step, "best": best, "config": run.cfg,
@@ -1062,6 +1189,38 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
     t_start, t_ckpt = time.time(), time.time()
     acc = {"loss": 0.0, "charb": 0.0, "fft": 0.0, "psnr": 0.0, "psnr_in": 0.0, "n": 0, "wait": 0.0, "gpu": 0.0, "kinds": {}}
     t_log = time.time()
+    # Watchdog (--stall): a step that never ends is a crash, not a silent wait.
+    import faulthandler, threading
+
+    beat = [time.time(), 0.0]
+
+    def alive():
+        beat[0] = time.time()
+        if a.stall and beat[0] - beat[1] > 30:
+            # The same from C, later: also when the hang holds the interpreter.
+            beat[1] = beat[0]
+            faulthandler.dump_traceback_later(a.stall + 300, exit=True, file=sys.stderr)
+
+    def watch():
+        while True:
+            time.sleep(20)
+            if a.stall and time.time() - beat[0] > a.stall:
+                print(f"stalled: no step ended for {a.stall} s (step {step}); the threads:", file=sys.stderr, flush=True)
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                sys.stderr.flush()
+                run.write_status(state="crashed", error=f"stalled at step {step}")
+                import multiprocessing
+
+                for c_ in multiprocessing.active_children():  # the data workers would stay, with their memory
+                    try:
+                        c_.kill()
+                    except Exception:
+                        pass
+                os._exit(3)
+
+    if a.stall:
+        alive()
+        threading.Thread(target=watch, daemon=True).start()
     run.write_status(state="running", step=step, params=params, gpu=torch.cuda.get_device_name(0), started=t_start)
     model.train()
     end = min(a.steps, a.stop_at or a.steps)
@@ -1069,6 +1228,7 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
         v0 = validate(ema.module, val_batches, device, run, 0)
         print("start: " + " ".join(f"{k} {v0[k]:.3f}" for k in ("psnr", "flicker", "flicker_c4", "flicker_c16", "flicker_peak", "fusion_gain", "psnr_first", "psnr_last", "long_gain", "occl_cost", "cut_first", "still_first", "still_last", "play16", "play64", "play16s", "play_low", "play_word", "play_word_s", "play_nb4", "play_nb16", "play_nb_drift") if v0.get(k) is not None), flush=True)
     while step < end:
+        alive()
         # Pause / stop files.
         if os.path.exists(os.path.join(run.dir, "stop")):
             save_ckpt(run, state(), f"step_{step}")
@@ -1082,6 +1242,7 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
             torch.cuda.empty_cache()
             while os.path.exists(os.path.join(run.dir, "pause")) and not os.path.exists(os.path.join(run.dir, "stop")):
                 time.sleep(2)
+                alive()
             run.write_status(state="running")
             t_log = time.time()
             continue
@@ -1125,6 +1286,8 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
             bn_, bc_, sg_, same = batch["noisy"], batch["clean"], batch["sigma"], None
             if a.still_prob > 0:
                 bn_, bc_, sg_ = with_stills([bn_, bc_, sg_], a.still_prob, a.still_pan)
+            if a.repeat_prob > 0:
+                bn_, bc_, sg_ = with_repeats([bn_, bc_, sg_], a.repeat_prob)
             n_, c_ = pq(bn_), pq(bc_)
             if a.occl_prob > 0:
                 (n_, c_, sg_), _ = with_occluders([n_, c_, sg_], a.occl_prob)
@@ -1139,6 +1302,8 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
                 # it as it was).
                 Tn_ = n_.shape[1]
                 ew_all = energy_weights(n_, c_, *a.energy_psnr).view(n_.shape[0], Tn_) if a.energy_psnr else None
+                if a.tv_energy and ew_all is not None:
+                    ew_all = tv_energy(ew_all.reshape(-1), batch.get("recipes"), Tn_).view(n_.shape[0], Tn_)
                 opt.zero_grad(set_to_none=True)
                 carry_, po_, parts_ = None, None, []
                 loss = lc = lf = torch.zeros((), device=device)
@@ -1193,12 +1358,15 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
             else:
                 batch_done_ = False
             if not batch_done_:
+              fut_ = backward_pass(TEACHER, n_, sg_, a.map, a.noise_map) if TEACHER is not None else None
               with torch.autocast("cuda", torch.bfloat16):
-                outs, flows = sequence(model, n_, sg_, a.map, a.noise_map, jitter=True, drop=0.05, clean=c_)
+                outs, flows = sequence(model, n_, sg_, a.map, a.noise_map, jitter=True, drop=0.05, clean=c_, future=fut_)
               outs = outs.float()
               o2, c2 = outs.flatten(0, 1), c_.flatten(0, 1)
               lc = charbonnier(o2, c2)
               ew = energy_weights(n_, c_, *a.energy_psnr) if a.energy_psnr else None
+              if a.tv_energy:
+                  ew = tv_energy(ew, batch.get("recipes"), n_.shape[1])
               lf = fft_loss(o2, c2, ew)
               loss = lc + a.fft_weight * lf
               if a.grad_weight > 0:
@@ -1207,6 +1375,12 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
                   loss = loss + a.detail_weight * detail_loss(o2, c2, weights=ew)
               ls, flick, _ = stability(outs, c_, model.motion)
               loss = loss + a.stab_weight * ls + a.stab_coarse * stability.extra["coarse"] + a.stab_peak * stability.extra["peak"]
+              if gan is not None:
+                  gan.pick(*outs.shape[-2:])
+                  if step >= gan_from:
+                      lg = gan.g_loss(outs)
+                      acc["gan_g"] = acc.get("gan_g", 0.0) + lg.item()
+                      loss = loss + a.gan_weight * lg
               if a.coarse_weight > 0:
                   loss = loss + a.coarse_weight * coarse_loss(o2, c2)
               if a.flow_weight > 0:
@@ -1251,6 +1425,9 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
             loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if gan is not None and STAGE == "recurrent":
+            dr_, df_ = gan.d_step(outs, c_)
+            acc["gan_dr"], acc["gan_df"] = acc.get("gan_dr", 0.0) + dr_, acc.get("gan_df", 0.0) + df_
         sched.step()
         ema.update_parameters(model)
         step += 1
@@ -1291,6 +1468,8 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
                 "data_wait": acc["wait"] / dt, "grad_norm": acc["gn"], "gpu_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
                 "gain": {kk: v[0] / max(v[2], 1) for kk, v in acc["kinds"].items()},
             }
+            if acc.get("gan_dr") is not None:
+                rec["gan_d_real"], rec["gan_d_fake"], rec["gan_g"] = acc["gan_dr"] / k, acc["gan_df"] / k, acc.get("gan_g", 0.0) / k
             run.log("metrics.jsonl", rec)
             left = (a.steps - step) / max(rec["steps_per_s"], 1e-6)
             run.write_status(state="running", step=step, steps_per_s=rec["steps_per_s"], eta_s=left, loss=rec["loss"], psnr_gain=rec["psnr"] - rec["psnr_in"], data_wait=rec["data_wait"])

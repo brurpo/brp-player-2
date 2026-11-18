@@ -1448,7 +1448,9 @@ void main() {
 /// afterwards (no atomics: the same result every run).
 const CA_GRAM: &str = r#"
 layout(local_size_x = 256) in;
-layout(push_constant) uniform P { F32 qkv; F32 part; int C, plane, hd, chunk, ih; } p;
+// A head of more than 32 channels is done as blocks of `hd` of its `stride` channels:
+// q from channel qoff of the head on, k from koff on, the sums written from `base` on.
+layout(push_constant) uniform P { F32 qkv; F32 part; int C, plane, hd, chunk, ih, stride, qoff, koff, base; } p;
 #define S 64
 #define SP (S + 1)
 #define HD_MAX 32
@@ -1459,14 +1461,14 @@ void main() {
     int items = p.hd * p.hd + 2 * p.hd;
     // Up to 5 items per invocation: hd <= 32 makes at most 1088.
     float acc[5] = float[5](0.0, 0.0, 0.0, 0.0, 0.0);
-    int qc = head * p.hd, p0 = ck * p.chunk, p1 = min(p0 + p.chunk, p.plane);
+    int qc = head * p.stride + p.qoff, kc = p.C + head * p.stride + p.koff, p0 = ck * p.chunk, p1 = min(p0 + p.chunk, p.plane);
     for (int s0 = p0; s0 < p1; s0 += S) {
         barrier();
         for (int e = t; e < p.hd * S; e += 256) {
             int d = e / S, j = e - d * S, px = s0 + j;
             bool in_ = px < p1;
             s_q[d * SP + j] = in_ ? ld(p.qkv, (qc + d) * p.plane + px, p.ih != 0) : 0.0;
-            s_k[d * SP + j] = in_ ? ld(p.qkv, (p.C + qc + d) * p.plane + px, p.ih != 0) : 0.0;
+            s_k[d * SP + j] = in_ ? ld(p.qkv, (kc + d) * p.plane + px, p.ih != 0) : 0.0;
         }
         barrier();
         for (int u = 0; u < 5; u++) {
@@ -1489,7 +1491,7 @@ void main() {
     int heads = int(gl_NumWorkGroups.y);
     for (int u = 0; u < 5; u++) {
         int it = t + u * 256;
-        if (it < items) p.part.v[(ck * heads + head) * items + it] = acc[u];
+        if (it < items) p.part.v[p.base + (ck * heads + head) * items + it] = acc[u];
     }
 }
 "#;
@@ -1507,13 +1509,13 @@ const CA_GRAM_COOP: &str = r#"
 #define CP 64
 #define ST (CP + 8)
 layout(local_size_x = SG * 4) in;
-layout(push_constant) uniform P { F32 qkv; F32 part; int C, plane, hd, chunk, ih; } p;
+layout(push_constant) uniform P { F32 qkv; F32 part; int C, plane, hd, chunk, ih, stride, qoff, koff, base; } p;
 shared float16_t s_x[64 * ST];
 shared float s_o[8 * 256];
 void main() {
     int lid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID);
     int ck = int(gl_WorkGroupID.x), head = int(gl_WorkGroupID.y);
-    int qc = head * p.hd, p0 = ck * p.chunk, p1 = min(p0 + p.chunk, p.plane);
+    int qc = head * p.stride + p.qoff, kc = p.C + head * p.stride + p.koff, p0 = ck * p.chunk, p1 = min(p0 + p.chunk, p.plane);
     // Tiles (row block, column block) of the 64 x 64 product; rows 0-31 q, 32-63 k.
     const ivec2 T[8] = ivec2[8](ivec2(0, 2), ivec2(0, 3), ivec2(1, 2), ivec2(1, 3), ivec2(0, 0), ivec2(1, 1), ivec2(2, 2), ivec2(3, 3));
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2];
@@ -1524,7 +1526,7 @@ void main() {
         for (int e = lid; e < 64 * CP; e += SG * 4) {
             int row = e / CP, j = e - row * CP, px = s0 + j, d = row & 31;
             float v = 0.0;
-            if (d < p.hd && px < p1) v = ld(p.qkv, ((row < 32 ? 0 : p.C) + qc + d) * p.plane + px, p.ih != 0);
+            if (d < p.hd && px < p1) v = ld(p.qkv, ((row < 32 ? qc : kc) + d) * p.plane + px, p.ih != 0);
             s_x[row * ST + j] = float16_t(v);
         }
         barrier();
@@ -1552,7 +1554,7 @@ void main() {
             int k = it - p.hd * p.hd, kq = k < p.hd ? 0 : 1, i = k - kq * p.hd;
             v = s_o[(4 + kq * 2 + (i >> 4)) * 256 + (i & 15) * 17];
         }
-        p.part.v[(ck * heads + head) * items + it] = v;
+        p.part.v[p.base + (ck * heads + head) * items + it] = v;
     }
 }
 "#;
@@ -1596,23 +1598,32 @@ void main() {
 /// temperature * q_i.k_j / (|q_i| |k_j|) (F.normalize: norms at least 1e-12).
 const CA_SOFTMAX: &str = r#"
 layout(local_size_x = 256) in;
-layout(push_constant) uniform P { F32 part; F32 temp; F32 attn; int hd, chunks, heads; } p;
+layout(push_constant) uniform P { F32 part; F32 temp; F32 attn; int hd, chunks, heads, nb; } p;
+#define HD_MAX 64
 // The chunks' sums, all items at once (consecutive threads, consecutive items).
-shared float s_g[32 * 32 + 64];
+shared float s_g[HD_MAX * HD_MAX + 2 * HD_MAX];
 void main() {
     int t = int(gl_LocalInvocationID.x), head = int(gl_WorkGroupID.x);
     int items = p.hd * p.hd + 2 * p.hd;
+    // The sums were made in nb x nb blocks of hs channels (CA_GRAM), each block's
+    // items laid out as a head of hs channels: q.k, then the q norms, then the k norms.
+    int hs = p.hd / p.nb, sub = hs * hs + 2 * hs, blk = p.chunks * p.heads * sub;
     for (int it = t; it < items; it += 256) {
+        int a, b, e;
+        if (it < p.hd * p.hd) { int i = it / p.hd, j = it - i * p.hd; a = i / hs; b = j / hs; e = (i - a * hs) * hs + (j - b * hs); }
+        else if (it < p.hd * p.hd + p.hd) { int i = it - p.hd * p.hd; a = i / hs; b = 0; e = hs * hs + (i - a * hs); }
+        else { int j = it - p.hd * p.hd - p.hd; a = 0; b = j / hs; e = hs * hs + hs + (j - b * hs); }
+        int at = (a * p.nb + b) * blk + head * sub + e;
         float s = 0.0;
-        for (int c = 0; c < p.chunks; c++) s += p.part.v[(c * p.heads + head) * items + it];
+        for (int c = 0; c < p.chunks; c++) s += p.part.v[at + c * p.heads * sub];
         s_g[it] = s;
     }
     barrier();
-    // Row i: its 30 scores, then their softmax.
+    // Row i: its scores, then their softmax.
     int i = t;
     if (i >= p.hd) return;
     float qn = max(sqrt(s_g[p.hd * p.hd + i]), 1e-12);
-    float v[32];
+    float v[HD_MAX];
     float mx = -1e30;
     for (int j = 0; j < p.hd; j++) {
         v[j] = s_g[i * p.hd + j] / (qn * max(sqrt(s_g[p.hd * p.hd + p.hd + j]), 1e-12)) * p.temp.v[head];
@@ -1635,7 +1646,10 @@ const CA_APPLY_COOP: &str = r#"
 #define TP 64
 #define VS (TP + 8)
 layout(local_size_x = SG * 4) in;
-layout(push_constant) uniform P { F32 qkv; F32 attn; F32 o; int C, plane, hd, ih, oh; } p;
+// A head of more than 32 channels in blocks: rows io.., columns jo.. of the head's
+// `stride` x `stride` attention times the v channels jo.., added to the output's
+// channels io.. when `add` is set (the second block of columns).
+layout(push_constant) uniform P { F32 qkv; F32 attn; F32 o; int C, plane, hd, ih, oh, stride, io, jo, add; } p;
 shared float16_t s_a[32 * 32];
 shared float16_t s_v[32 * VS];
 shared float s_o[32 * TP];
@@ -1644,11 +1658,11 @@ void main() {
     int p0 = int(gl_WorkGroupID.x) * TP, head = int(gl_WorkGroupID.y);
     for (int e = lid; e < 32 * 32; e += SG * 4) {
         int i = e / 32, j = e - i * 32;
-        s_a[e] = float16_t(i < p.hd && j < p.hd ? p.attn.v[(head * p.hd + i) * p.hd + j] : 0.0);
+        s_a[e] = float16_t(i < p.hd && j < p.hd ? p.attn.v[(head * p.stride + p.io + i) * p.stride + p.jo + j] : 0.0);
     }
     for (int e = lid; e < 32 * TP; e += SG * 4) {
         int d = e / TP, x = e - d * TP, px = p0 + x;
-        float v = d < p.hd && px < p.plane ? ld(p.qkv, (2 * p.C + head * p.hd + d) * p.plane + px, p.ih != 0) : 0.0;
+        float v = d < p.hd && px < p.plane ? ld(p.qkv, (2 * p.C + head * p.stride + p.jo + d) * p.plane + px, p.ih != 0) : 0.0;
         s_v[d * VS + x] = float16_t(v);
     }
     barrier();
@@ -1666,7 +1680,10 @@ void main() {
     barrier();
     for (int e = lid; e < p.hd * TP; e += SG * 4) {
         int i = e / TP, x = e - i * TP, px = p0 + x;
-        if (px < p.plane) st(p.o, (head * p.hd + i) * p.plane + px, p.oh != 0, s_o[i * TP + x]);
+        if (px < p.plane) {
+            int at = (head * p.stride + p.io + i) * p.plane + px;
+            st(p.o, at, p.oh != 0, s_o[i * TP + x] + (p.add != 0 ? ld(p.o, at, p.oh != 0) : 0.0));
+        }
     }
 }
 "#;
@@ -1674,21 +1691,25 @@ void main() {
 /// Step 3: out[head hd + i][px] = sum over j of attn[head][i][j] v[head hd + j][px].
 const CA_APPLY: &str = r#"
 layout(local_size_x = 256) in;
-layout(push_constant) uniform P { F32 qkv; F32 attn; F32 o; int C, plane, hd, ih, oh; } p;
+layout(push_constant) uniform P { F32 qkv; F32 attn; F32 o; int C, plane, hd, ih, oh, stride, io, jo, add; } p;
 #define HD_MAX 32
 shared float s_a[HD_MAX * HD_MAX];
 void main() {
     int t = int(gl_LocalInvocationID.x), head = int(gl_WorkGroupID.y);
     int px = int(gl_WorkGroupID.x) * 256 + t;
-    for (int e = t; e < p.hd * p.hd; e += 256) s_a[e] = p.attn.v[head * p.hd * p.hd + e];
+    for (int e = t; e < p.hd * p.hd; e += 256) {
+        int i = e / p.hd, j = e - i * p.hd;
+        s_a[e] = p.attn.v[(head * p.stride + p.io + i) * p.stride + p.jo + j];
+    }
     barrier();
     if (px >= p.plane) return;
     float v[HD_MAX];
-    for (int j = 0; j < HD_MAX; j++) v[j] = j < p.hd ? ld(p.qkv, (2 * p.C + head * p.hd + j) * p.plane + px, p.ih != 0) : 0.0;
+    for (int j = 0; j < HD_MAX; j++) v[j] = j < p.hd ? ld(p.qkv, (2 * p.C + head * p.stride + p.jo + j) * p.plane + px, p.ih != 0) : 0.0;
     for (int i = 0; i < p.hd; i++) {
         float s = 0.0;
         for (int j = 0; j < p.hd; j++) s += s_a[i * p.hd + j] * v[j];
-        st(p.o, (head * p.hd + i) * p.plane + px, p.oh != 0, s);
+        int at = (head * p.stride + p.io + i) * p.plane + px;
+        st(p.o, at, p.oh != 0, s + (p.add != 0 ? ld(p.o, at, p.oh != 0) : 0.0));
     }
 }
 "#;
@@ -3715,17 +3736,20 @@ impl Net {
                 let x = &ins[0];
                 let (c, heads) = (p.i(0, 0) as usize, p.i(1, 1) as usize);
                 let hd = c / heads;
-                if x.c != 3 * c || hd > 32 {
+                // The kernels take heads of up to 32 channels (their tiles); a larger
+                // head is done as 2 x 2 blocks of half its channels.
+                let nb = if hd > 32 { 2 } else { 1 };
+                if x.c != 3 * c || hd > 64 || hd % nb != 0 {
                     bail!("channel attention: {} input channels for {c}, {heads} heads", x.c);
                 }
+                let hs = hd / nb;
                 let plane = x.h * x.w;
                 // Chunks of 1024 pixels: enough workgroups to fill the GPU (4096: 25% slower).
                 let chunk = std::env::var("BRP_CA_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize);
                 let chunks = plane.div_ceil(chunk);
-                let items = hd * hd + 2 * hd;
-                let part = self.pool.get(&self.compute, (chunks * heads * items * 4) as u64)?;
+                let items = hs * hs + 2 * hs;
+                let part = self.pool.get(&self.compute, (nb * nb * chunks * heads * items * 4) as u64)?;
                 let attn = self.pool.get(&self.compute, (heads * hd * hd * 4) as u64)?;
-                let push = Push::new().t(x).ptr_at(&part, 0).i(c as i32).i(plane as i32).i(hd as i32).i(chunk as i32).i(x.half as i32);
                 let gram = if self.compute.ctx.coopmat && std::env::var_os("BRP_NN_NAIVE").is_none() {
                     let sg = self.compute.ctx.subgroup_size;
                     self.variant(4000, 0, || self.compute.kernel("nn_ca_gram_coop", &format!("{PRELUDE}#define SG {sg}\n{HALF}{ACT}{CA_GRAM_COOP}"), 0))?
@@ -3733,19 +3757,30 @@ impl Net {
                     k.ca_gram.clone()
                 };
                 rec.label = "ChannelAttention sums".into();
-                rec.dispatch(&gram, [chunks as u32, heads as u32, 1], &push)?;
+                for (a, b) in (0..nb).flat_map(|a| (0..nb).map(move |b| (a, b))) {
+                    let push = Push::new().t(x).ptr_at(&part, 0).i(c as i32).i(plane as i32).i(hs as i32).i(chunk as i32).i(x.half as i32);
+                    let push = push.i(hd as i32).i((a * hs) as i32).i((b * hs) as i32).i(((a * nb + b) * chunks * heads * items) as i32);
+                    rec.dispatch(&gram, [chunks as u32, heads as u32, 1], &push)?;
+                }
                 rec.label = "ChannelAttention softmax".into();
-                let push = Push::new().ptr_at(&part, 0).ptr_at(&self.weights, l.weight).ptr_at(&attn, 0).i(hd as i32).i(chunks as i32).i(heads as i32);
+                let push = Push::new().ptr_at(&part, 0).ptr_at(&self.weights, l.weight).ptr_at(&attn, 0).i(hd as i32).i(chunks as i32).i(heads as i32).i(nb as i32);
                 rec.dispatch(&k.ca_softmax, [heads as u32, 1, 1], &push)?;
                 let out = self.new_tensor_of(c, x.h, x.w, self.half)?;
                 rec.label = "ChannelAttention apply".into();
-                let push = Push::new().t(x).ptr_at(&attn, 0).t(&out).i(c as i32).i(plane as i32).i(hd as i32).i(x.half as i32).i(out.half as i32);
-                if self.compute.ctx.coopmat && std::env::var_os("BRP_NN_NAIVE").is_none() {
+                let apply = if self.compute.ctx.coopmat && std::env::var_os("BRP_NN_NAIVE").is_none() {
                     let sg = self.compute.ctx.subgroup_size;
-                    let kern = self.variant(4001, 0, || self.compute.kernel("nn_ca_apply_coop", &format!("{PRELUDE}#define SG {sg}\n{HALF}{ACT}{CA_APPLY_COOP}"), 0))?;
-                    rec.dispatch(&kern, [plane.div_ceil(64) as u32, heads as u32, 1], &push)?;
+                    Some(self.variant(4001, 0, || self.compute.kernel("nn_ca_apply_coop", &format!("{PRELUDE}#define SG {sg}\n{HALF}{ACT}{CA_APPLY_COOP}"), 0))?)
                 } else {
-                    rec.dispatch(&k.ca_apply, [plane.div_ceil(256) as u32, heads as u32, 1], &push)?;
+                    None
+                };
+                // Block (a, b) adds onto (a, 0)'s output: dispatches of a recording run in order.
+                for (a, b) in (0..nb).flat_map(|a| (0..nb).map(move |b| (a, b))) {
+                    let push = Push::new().t(x).ptr_at(&attn, 0).t(&out).i(c as i32).i(plane as i32).i(hs as i32).i(x.half as i32).i(out.half as i32);
+                    let push = push.i(hd as i32).i((a * hs) as i32).i((b * hs) as i32).i((b > 0) as i32);
+                    match &apply {
+                        Some(kern) => rec.dispatch(kern, [plane.div_ceil(64) as u32, heads as u32, 1], &push)?,
+                        None => rec.dispatch(&k.ca_apply, [plane.div_ceil(256) as u32, heads as u32, 1], &push)?,
+                    }
                 }
                 // Back to the pool: later dispatches of this recording run after these.
                 self.pool.put(part);
