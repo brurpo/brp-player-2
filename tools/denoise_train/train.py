@@ -533,7 +533,13 @@ def stability(outs, clean, motion, thr=0.03):
     w16 = (m16 > 0.5).float()
     rk = torch.sqrt(F.avg_pool2d((e * e).mean(1, keepdim=True) * m, 16) / m16.clamp_min(0.25) + 1e-8)
     peak = (rk * w16).sum() / w16.sum().clamp_min(1.0)
-    stability.extra = {"coarse": coarse, "peak": peak, "c4": lv[0], "c16": lv[1], "peak_levels": float(peak.detach()) * 255}
+    # The same change in the fine band alone (minus its 5 px mean): fine texture that is
+    # new every frame is a fraction of a level per pixel, and the loss above at its
+    # weight did not hold it against a critic that rewards texture (--stab-fine).
+    ef = e - F.avg_pool2d(F.pad(e, (2, 2, 2, 2), mode="reflect"), 5, 1)
+    fine = (torch.sqrt(ef * ef + 1e-8) * m).sum() / den
+    # "d_out" / "d_clean": the change itself where the motion is reliable, for the critic (gan.py, --gan-temporal).
+    stability.extra = {"coarse": coarse, "peak": peak, "fine": fine, "c4": lv[0], "c16": lv[1], "peak_levels": float(peak.detach()) * 255, "d_out": d_out * m, "d_clean": d_clean * m}
     return loss, float((e.detach().abs() * m).sum() / den) * 255, float(m.mean())
 
 
@@ -959,6 +965,7 @@ def main():
     ap.add_argument("--state", type=int, default=0, help="channels of the learned memory carried between frames (model.UNet.state; 0: none)")
     ap.add_argument("--state-lr", type=float, default=1.0, help="learning rate of the memory's own convolutions, as a multiple of --lr")
     ap.add_argument("--stab-coarse", type=float, default=0.0, help="stage 2: weight of the flicker loss over 4 and 16 px blocks")
+    ap.add_argument("--stab-fine", type=float, default=0.0, help="stage 2: weight of the flicker loss on the fine band alone (the change minus its 5 px mean): holds invented fine texture in place from frame to frame; for --gan-weight")
     ap.add_argument("--stab-peak", type=float, default=0.0, help="stage 2: weight of the flicker loss as RMS inside 16 px blocks (local flicker)")
     ap.add_argument("--coarse-weight", type=float, default=0.0, help="stage 2: weight of the loss on the error over 8 and 32 px blocks")
     ap.add_argument("--long-every", type=int, default=0, help="stage 2: every Nth step is a batch of long render clips (0: none)")
@@ -981,6 +988,7 @@ def main():
     ap.add_argument("--gan-lr", type=float, default=1e-4, help="--gan-weight: the critic's learning rate")
     ap.add_argument("--gan-start", type=int, default=300, help="--gan-weight: steps the critic trains alone before its loss reaches the model")
     ap.add_argument("--gan-crop", type=int, default=128, help="--gan-weight: side of the window the critic sees each step")
+    ap.add_argument("--gan-temporal", action="store_true", help="--gan-weight: the critic also sees how each frame differs from the one before along the clean frames' motion, so texture that is new every frame counts against the model (without it the critic sees single frames, and a run with it off left crawling texture in dark flat areas)")
     ap.add_argument("--tv-energy", action="store_true", help="television clips: the detail and spectrum losses' weight comes from the tape noise (1 without, 0.4 at the strongest), not from --energy-psnr (train.tv_energy)")
     ap.add_argument("--camera-share", type=float, help="share of the short training clips taken from camera footage (default 0.55, or what --nb-share leaves it); the other sources keep their proportion")
     ap.add_argument("--nb-share", type=float, help="share of the training clips taken from the external render dataset (Noisebase); not given: 0.15. Camera and our renders keep their proportion (55 : 30)")
@@ -1178,7 +1186,7 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
         from gan import Gan
 
         assert a.stage == "recurrent" and not a.bptt, "--gan-weight: recurrent stage, without --bptt"
-        gan = Gan(device, a.gan_lr, a.gan_crop)
+        gan = Gan(device, a.gan_lr, a.gan_crop, temporal=a.gan_temporal)
         gan_from = step + a.gan_start
         print(f"adversarial loss: weight {a.gan_weight}, critic {sum(p_.numel() for p_ in gan.d.parameters()) / 1e6:.2f} M parameters, from step {gan_from}", flush=True)
 
@@ -1340,7 +1348,7 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
                     if oe_.shape[1] > 1:
                         ls, fl_, _ = stability(oe_, ce_, model.motion)
                         wp_ = (oe_.shape[1] - 1) / (Tn_ - 1)
-                        l_ = l_ + wp_ * (a.stab_weight * ls + a.stab_coarse * stability.extra["coarse"] + a.stab_peak * stability.extra["peak"])
+                        l_ = l_ + wp_ * (a.stab_weight * ls + a.stab_coarse * stability.extra["coarse"] + a.stab_peak * stability.extra["peak"] + a.stab_fine * stability.extra["fine"])
                         flick += wp_ * fl_
                     l_.backward()
                     loss, lc, lf = loss + l_.detach(), lc + wf * lc_.detach(), lf + wf * lf_.detach()
@@ -1374,11 +1382,12 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
               if a.detail_weight > 0:
                   loss = loss + a.detail_weight * detail_loss(o2, c2, weights=ew)
               ls, flick, _ = stability(outs, c_, model.motion)
-              loss = loss + a.stab_weight * ls + a.stab_coarse * stability.extra["coarse"] + a.stab_peak * stability.extra["peak"]
+              loss = loss + a.stab_weight * ls + a.stab_coarse * stability.extra["coarse"] + a.stab_peak * stability.extra["peak"] + a.stab_fine * stability.extra["fine"]
+              acc["stab_fine"] = acc.get("stab_fine", 0.0) + float(stability.extra["fine"].detach())
               if gan is not None:
                   gan.pick(*outs.shape[-2:])
                   if step >= gan_from:
-                      lg = gan.g_loss(outs)
+                      lg = gan.g_loss(outs, stability.extra["d_out"])
                       acc["gan_g"] = acc.get("gan_g", 0.0) + lg.item()
                       loss = loss + a.gan_weight * lg
               if a.coarse_weight > 0:
@@ -1426,7 +1435,7 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if gan is not None and STAGE == "recurrent":
-            dr_, df_ = gan.d_step(outs, c_)
+            dr_, df_ = gan.d_step(outs, c_, stability.extra["d_out"].detach(), stability.extra["d_clean"])
             acc["gan_dr"], acc["gan_df"] = acc.get("gan_dr", 0.0) + dr_, acc.get("gan_df", 0.0) + df_
         sched.step()
         ema.update_parameters(model)
@@ -1468,6 +1477,8 @@ def train(a, run, model, ema, opt, sched, loader, val_batches, device, step, bes
                 "data_wait": acc["wait"] / dt, "grad_norm": acc["gn"], "gpu_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
                 "gain": {kk: v[0] / max(v[2], 1) for kk, v in acc["kinds"].items()},
             }
+            if acc.get("stab_fine") is not None:
+                rec["stab_fine"] = acc["stab_fine"] / k * 255  # levels
             if acc.get("gan_dr") is not None:
                 rec["gan_d_real"], rec["gan_d_fake"], rec["gan_g"] = acc["gan_dr"] / k, acc["gan_df"] / k, acc.get("gan_g", 0.0) / k
             run.log("metrics.jsonl", rec)

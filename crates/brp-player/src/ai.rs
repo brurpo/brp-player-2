@@ -173,7 +173,7 @@ impl AiKind {
                 p("Strength", "Beta: the model is still being trained, results will change in later versions. How much of the denoised picture is used (1: all of it; lower mixes the original back in). The network itself has nothing to set: it removes the noise, compression and other damage it finds", ParamKind::Float, 1.0, 0.0, 1.0),
                 p("Temporal", "On: each frame is merged with the frame before, the frame after and its own previous result, moved onto it along the motion: cleaner and steadier. Off: each frame alone (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
                 p("Scene cuts", "On: a neighbouring frame that does not match this one at all (another shot) is left out, and the result starts afresh there. Off: the network alone decides what to take from each frame (options: Off|On)", ParamKind::Int, 1.0, 0.0, 1.0),
-                p("Model", "Fast: the small network, about 0.04 s per 1080p frame on a fast card. Quality: a much larger network, cleaner, steadier and keeps more faint detail, about 0.2 s per 1080p frame. Quality 2 (test): a new network of that class with attention, being tested against Quality, about 0.23 s per 1080p frame. Old TV: for old digitised television recordings: also takes off the sharpening halos, the smeared and shifted colour and the tape noise, and leaves the picture a little softer than Quality would (options: Fast|Quality|Quality 2 (test)|Old TV)", ParamKind::Int, 0.0, 0.0, 3.0),
+                p("Model", "Fast: the small network, about 0.04 s per 1080p frame on a fast card. Quality: a much larger network, cleaner, steadier and keeps more faint detail, about 0.2 s per 1080p frame. Quality 2 (test): a new network of that class with attention, being tested against Quality, about 0.23 s per 1080p frame. Old TV: for old digitised television recordings: also takes off the sharpening halos, the smeared and shifted colour and the tape noise, and leaves the picture a little softer than Quality would. Quality 2 + detail (test): Quality 2 trained further to leave a little more fine texture that moves with the picture, such as the grain of rough surfaces, at the price of a little more noise left; same speed (options: Fast|Quality|Quality 2 (test)|Old TV|Quality 2 + detail (test))", ParamKind::Int, 0.0, 0.0, 4.0),
             ],
             AiKind::Deblur => vec![p(
                 "Strength",
@@ -359,10 +359,11 @@ fn learned_temporal(params: &[f64]) -> bool {
 
 /// Denoise (AI)'s models, by its Model parameter: folders of `models/`, each written
 /// by `tools/denoise_train/export_player.py`.
-const LEARNED_MODELS: [&str; 4] = ["brpdn", "brpdn_quality", "brpdn_hybrid", "brpdn_tv"];
+const LEARNED_MODELS: [&str; 5] = ["brpdn", "brpdn_quality", "brpdn_hybrid", "brpdn_tv", "brpdn_detail"];
 
 fn learned_model(params: &[f64]) -> usize {
-    // 0: Fast, 1: Quality, 2: Quality 2 (the network with attention), 3: Old TV.
+    // 0: Fast, 1: Quality, 2: Quality 2 (the network with attention), 3: Old TV,
+    // 4: Quality 2 + detail (Quality 2 trained on with a critic and a steadiness loss).
     // Anything else is Fast.
     let m = params.get(3).map_or(0, |v| v.round() as i64);
     usize::try_from(m).ok().filter(|m| *m < LEARNED_MODELS.len()).unwrap_or(0)
