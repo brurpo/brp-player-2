@@ -49,6 +49,8 @@ pub enum Action {
     SetLayer(String),
     /// Show a file in the system's file browser.
     Reveal(String),
+    /// Save the frame on screen as a picture (asks where).
+    SaveFrame,
     /// An update was installed: start the new version and close this one.
     RestartForUpdate,
 }
@@ -150,6 +152,8 @@ pub struct UiState {
     area: [f32; 4],
     scrub_resume: Option<bool>,
     pending_click: Option<Instant>,
+    /// The frame on screen being saved or copied (right-click menu, Ctrl+S / Ctrl+C).
+    pub grab: Option<crate::frame_grab::Grab>,
     last_pointer: Option<egui::Pos2>,
     tl: Timeline,
     toast: Option<(String, Instant)>,
@@ -197,6 +201,7 @@ impl UiState {
             area: [0.0; 4],
             scrub_resume: None,
             pending_click: None,
+            grab: None,
             last_pointer: None,
             tl: Timeline::default(),
             toast: None,
@@ -826,6 +831,7 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState) -> Vec<Action>
     ctx.set_cursor_icon(if show_controls { egui::CursorIcon::Default } else { egui::CursorIcon::None });
 
     keyboard(ctx, p, s, &mut actions);
+    poll_grab(ctx, s);
     s.export.poll(p, ctx);
     let screen = ctx.content_rect();
     if !overlay && !s.maximized {
@@ -852,8 +858,15 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState) -> Vec<Action>
                 }
                 ui.set_opacity(fade);
                 // Empty parts of the bar move the window (double-click: maximise).
-                let drag = ui.interact(Rect::from_min_max(screen.min, pos2(screen.max.x, bar.bottom())), Id::new("titlebar"), Sense::click_and_drag());
-                if !overlay {
+                let bar_id = Id::new("titlebar");
+                let drag = ui.interact(Rect::from_min_max(screen.min, pos2(screen.max.x, bar.bottom())), bar_id, Sense::click_and_drag());
+                // Only where no button or chip takes the click: egui finds click and
+                // drag targets separately, so a press on a button (click only) also
+                // reached the bar's drag below it, and the system's window drag then
+                // swallowed the release (the click lost, the window moved or
+                // un-maximised; a double-click on a button maximised).
+                let bar_takes_click = ui.ctx().viewport(|v| v.hits.click.is_none_or(|w| w.id == bar_id));
+                if !overlay && bar_takes_click {
                     if drag.double_clicked() {
                         actions.push(Action::ToggleMaximize);
                     } else if drag.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
@@ -988,8 +1001,14 @@ pub fn draw(root: &mut egui::Ui, p: &mut Player, s: &mut UiState) -> Vec<Action>
             if resp.double_clicked() || resp.clicked() {
                 actions.push(Action::Open);
             }
+            resp.context_menu(|ui| {
+                if ui.button(l.t("open")).clicked() {
+                    actions.push(Action::Open);
+                }
+            });
             return;
         }
+        viewer_menu(&resp, p, s, &mut actions);
         // Single click = play/pause (delayed so a double click can cancel it).
         if resp.double_clicked() {
             s.pending_click = None;
@@ -1187,9 +1206,17 @@ fn keyboard(ctx: &egui::Context, p: &mut Player, s: &mut UiState, actions: &mut 
     }
     let l = s.lang;
     let mut msg: Option<String> = None;
+    let mut copy_frame = false;
     ctx.input(|i| {
         if i.modifiers.command && i.key_pressed(Key::Z) && !i.modifiers.shift {
             p.fx.undo();
+        }
+        // The frame on screen: Ctrl+S saves it, Ctrl+C copies it.
+        if i.modifiers.command && i.key_pressed(Key::S) {
+            actions.push(Action::SaveFrame);
+        }
+        if i.modifiers.command && (i.key_pressed(Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+            copy_frame = true;
         }
         if i.modifiers.command && (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift)) {
             p.fx.redo();
@@ -1280,6 +1307,107 @@ fn keyboard(ctx: &egui::Context, p: &mut Player, s: &mut UiState, actions: &mut 
     });
     if let Some(m) = msg {
         s.toast(m);
+    }
+    if copy_frame {
+        grab_frame(p, s, crate::frame_grab::GrabTo::Clipboard);
+    }
+}
+
+/// The picture's right-click menu: playback, the frame on screen (save, copy), the
+/// view, effects and the panels.
+fn viewer_menu(resp: &egui::Response, p: &mut Player, s: &mut UiState, actions: &mut Vec<Action>) {
+    let l = s.lang;
+    resp.context_menu(|ui| {
+        ui.set_min_width(230.0);
+        let item = |ui: &mut egui::Ui, text: &str, key: &str| ui.add(egui::Button::new(text).shortcut_text(key));
+        if item(ui, l.t(if p.playing { "menu_pause" } else { "menu_play" }), "Space").clicked() {
+            p.toggle();
+            ui.close();
+        }
+        ui.separator();
+        let busy = s.grab.is_some();
+        if ui.add_enabled(!busy, egui::Button::new(l.t("menu_save_frame")).shortcut_text("Ctrl+S")).clicked() {
+            actions.push(Action::SaveFrame);
+            ui.close();
+        }
+        if ui.add_enabled(!busy, egui::Button::new(l.t("menu_copy_frame")).shortcut_text("Ctrl+C")).clicked() {
+            grab_frame(p, s, crate::frame_grab::GrabTo::Clipboard);
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, l.t("menu_fit"), "R").clicked() {
+            p.reset_view();
+            ui.close();
+        }
+        if item(ui, l.t("menu_one_to_one"), "G").clicked() {
+            p.toggle_one_to_one();
+            ui.close();
+        }
+        if item(ui, l.t(if s.fullscreen { "menu_exit_fullscreen" } else { "menu_fullscreen" }), if s.fullscreen { "Esc" } else { "F" }).clicked() {
+            actions.push(if s.fullscreen { Action::ExitFullscreen } else { Action::ToggleFullscreen });
+            ui.close();
+        }
+        ui.separator();
+        let fx_on = !p.fx.bypass;
+        if ui.add(egui::Checkbox::new(&mut fx_on.clone(), l.t("menu_effects_on"))).clicked() {
+            p.fx.set_bypass(fx_on);
+            s.toast(l.t(if p.fx.bypass { "fx_all_off" } else { "fx_all_on" }));
+            ui.close();
+        }
+        for (k, key) in [(PopupKind::Effects, "menu_effects"), (PopupKind::Color, "menu_color"), (PopupKind::Export, "menu_export"), (PopupKind::Info, "menu_info")] {
+            if ui.button(l.t(key)).clicked() {
+                s.set_shown(k, true);
+                ui.close();
+            }
+        }
+        ui.separator();
+        if item(ui, l.t("open"), "Ctrl+O").clicked() {
+            actions.push(Action::Open);
+            ui.close();
+        }
+    });
+}
+
+/// Start saving or copying the frame on screen (one at a time); `poll_grab` reports.
+pub fn grab_frame(p: &Player, s: &mut UiState, to: crate::frame_grab::GrabTo) {
+    let l = s.lang;
+    if p.source.is_none() {
+        return;
+    }
+    if s.grab.is_some() {
+        s.toast(l.t("frame_busy"));
+        return;
+    }
+    let copy = matches!(to, crate::frame_grab::GrabTo::Clipboard);
+    match crate::frame_grab::Grab::start(p, s, to) {
+        Ok(g) => {
+            s.grab = Some(g);
+            s.toast(l.t(if copy { "frame_copying" } else { "frame_saving" }));
+        }
+        Err(e) => s.toast(format!("{}: {e:#}", l.t("frame_failed"))),
+    }
+}
+
+/// The frame being saved or copied: a message once it is done.
+fn poll_grab(ctx: &egui::Context, s: &mut UiState) {
+    let Some(g) = s.grab.as_mut() else { return };
+    let l = s.lang;
+    match g.poll() {
+        None => ctx.request_repaint_after(Duration::from_millis(100)),
+        Some(r) => {
+            s.grab = None;
+            match r {
+                Ok(crate::frame_grab::GrabDone::Saved(path)) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    s.toast(format!("{} {name}", l.t("frame_saved")));
+                }
+                Ok(crate::frame_grab::GrabDone::Copied(w, h)) => s.toast(format!("{} ({w}×{h})", l.t("frame_copied"))),
+                Err(e) => {
+                    log::warn!("frame grab: {e:#}");
+                    s.toast(format!("{}: {e:#}", l.t("frame_failed")));
+                }
+            }
+        }
     }
 }
 

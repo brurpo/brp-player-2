@@ -6,6 +6,7 @@ mod color_ui;
 mod effects;
 mod export;
 mod export_ui;
+mod frame_grab;
 mod i18n;
 mod icons;
 mod instance;
@@ -567,6 +568,22 @@ impl Win {
                     }
                 }
                 Action::Reveal(path) => reveal(&path),
+                Action::SaveFrame => {
+                    // Next to the video: <name>_<frame>.png.
+                    let Some(src) = self.player.source.as_ref() else { continue };
+                    let path = std::path::PathBuf::from(&src.info.path);
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "frame".into());
+                    let mut d = rfd::FileDialog::new().set_title(self.ui.lang.t("save_frame")).add_filter("PNG", &["png"]).set_file_name(format!("{stem}_{:06}.png", self.player.current));
+                    if let Some(dir) = path.parent().filter(|d| d.is_dir()) {
+                        d = d.set_directory(dir);
+                    }
+                    if let Some(mut to) = d.save_file() {
+                        if to.extension().is_none() {
+                            to.set_extension("png");
+                        }
+                        ui::grab_frame(&self.player, &mut self.ui, frame_grab::GrabTo::File(to));
+                    }
+                }
             }
         }
         let _ = el;
